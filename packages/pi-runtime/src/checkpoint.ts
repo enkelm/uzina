@@ -1,17 +1,22 @@
 import type { Context, JsonValue } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import type {
-  ConversationId,
-  ConversationRecord,
-  Cursor,
-  DocumentCreate,
-  DocumentRecord,
-  EntryRecord,
-  Page,
-  Storage,
-  StorageWrite,
-  SubmissionRecord,
-  TaskRecord,
+import {
+  ROOT_CONVERSATION_ID,
+  type ConversationId,
+  type ConversationRecord,
+  type Cursor,
+  type DocumentCreate,
+  type DocumentId,
+  type DocumentRecord,
+  type EntryId,
+  type EntryRecord,
+  type Page,
+  type Storage,
+  type StorageWrite,
+  type SubmissionId,
+  type SubmissionRecord,
+  type TaskId,
+  type TaskRecord,
 } from "@earendil-works/pi-durable";
 
 const CHECKPOINT_FORMAT = "uzina.pi-managed-work";
@@ -164,6 +169,11 @@ export async function exportManagedWorkCheckpoint(
   if (root.parent || root.owner) {
     throw new UnsupportedCheckpointState(
       "Checkpoint root must be an ownerless, non-fork conversation",
+    );
+  }
+  if (root.id !== ROOT_CONVERSATION_ID) {
+    throw new UnsupportedCheckpointState(
+      "Checkpoint root must use the reserved root conversation ID",
     );
   }
 
@@ -350,6 +360,11 @@ function documentCreate(record: DocumentRecord): DocumentCreate {
 }
 
 function validateCheckpointGraph(checkpoint: ManagedWorkCheckpoint): void {
+  if (checkpoint.rootConversationId !== ROOT_CONVERSATION_ID) {
+    throw new UnsupportedCheckpointState(
+      "Checkpoint root must use the reserved root conversation ID",
+    );
+  }
   const conversations = new Map(
     checkpoint.conversations.map((record) => [record.id, record]),
   );
@@ -433,33 +448,40 @@ function validateCheckpointGraph(checkpoint: ManagedWorkCheckpoint): void {
   }
 }
 
-async function assertEmptyStorage(
+/**
+ * `mintId` proves the global ID space has no prior allocation above reserved ID 1;
+ * inspect ID 1 separately because it is not returned by the allocator.
+ */
+async function assertFreshStorage(
   storage: Storage,
   context: Context,
 ): Promise<void> {
-  const [conversations, tasks, submissions, sessionDocuments] =
-    await Promise.all([
-      storage.scanConversations({ order: "ascending" }, 1, undefined, context),
-      storage.scanTasks({}, 1, undefined, context),
-      storage.scanSubmissions({}, 1, undefined, context),
-      storage.scanDocuments(
-        { scope: { kind: "session" }, at: "current" },
-        1,
-        undefined,
-        context,
-      ),
-    ]);
-  if (
-    conversations.items.length ||
-    tasks.items.length ||
-    submissions.items.length ||
-    sessionDocuments.items.length
-  ) {
-    throw new Error("Checkpoint import requires an empty destination storage");
+  const firstMintedId = await storage.mintId<ConversationId>();
+  if (firstMintedId !== Number(ROOT_CONVERSATION_ID) + 1) {
+    throw new Error(
+      "Checkpoint import requires a fresh, never-used destination storage",
+    );
+  }
+
+  const reservedId = Number(ROOT_CONVERSATION_ID);
+  const [conversation, entry, task, submission, document] = await Promise.all([
+    storage.conversation(ROOT_CONVERSATION_ID, context),
+    storage.entry(reservedId as EntryId, context),
+    storage.task(reservedId as TaskId, context),
+    storage.submission(reservedId as SubmissionId, context),
+    storage.document(reservedId as DocumentId, "current", context),
+  ]);
+  if (conversation || entry || task || submission || document) {
+    throw new Error(
+      "Checkpoint import requires a fresh, never-used destination storage",
+    );
   }
 }
 
-/** Import logical records into an empty, inactive destination without opening or resuming a Harness. */
+/**
+ * Import logical records into a fresh, exclusively held destination without opening or resuming a Harness.
+ * Once the freshness guard runs, do not retry on that storage instance: it consumes its initial minted ID.
+ */
 export async function importManagedWorkCheckpoint(
   storage: Storage,
   value: unknown,
@@ -471,7 +493,7 @@ export async function importManagedWorkCheckpoint(
     throw new Error("Managed-work checkpoint checksum mismatch");
   }
   validateCheckpointGraph(value);
-  await assertEmptyStorage(storage, context);
+  await assertFreshStorage(storage, context);
 
   const writes: StorageWrite[] = [
     ...value.conversations.map((record) => ({

@@ -146,6 +146,33 @@ describe("persistent execution daemon", () => {
     });
   });
 
+  test.skipIf(process.platform === "win32")(
+    "kills a timed-out command's child process group before a descendant can mutate the workspace",
+    async () => {
+      const { workspace, daemon } = fixture();
+      const marker = join(workspace, "late-child-marker.txt");
+      const child = `await Bun.sleep(150); require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'late')`;
+      const result = await daemon.executeJob(
+        job({
+          jobId: "job:timeout-descendant",
+          operation: "argv-command",
+          argv: [
+            process.execPath,
+            "-e",
+            `Bun.spawn({ cmd: [${JSON.stringify(process.execPath)}, "-e", ${JSON.stringify(child)}], stdin: "ignore", stdout: "ignore", stderr: "ignore" }); await Bun.sleep(10000)`,
+          ],
+          timeoutMs: 50,
+          maxOutputBytes: 64,
+        }),
+      );
+
+      expect(result.status).toBe("uncertain");
+      expect(result.errorCode).toBe("command_timed_out");
+      await Bun.sleep(250);
+      expect(() => readFileSync(marker, "utf8")).toThrow();
+    },
+  );
+
   test("bounds file reads and rejects writes above the maximum byte size", async () => {
     const { workspace, daemon } = fixture();
     writeFileSync(join(workspace, "large.bin"), Buffer.alloc(8, 65));

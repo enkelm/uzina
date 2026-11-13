@@ -15,7 +15,10 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { createWriteStream } from "node:fs";
+import { Transform, Writable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { devNull, tmpdir } from "node:os";
 import {
   basename,
@@ -341,17 +344,19 @@ export async function captureWorkspaceCheckpoint(
   let stagedPatchBytes: Uint8Array;
   try {
     const bundlePath = join(temporaryDirectory, "workspace.bundle");
-    gitText(root, ["bundle", "create", bundlePath, "--all", "HEAD"]);
+    await runGitToFileBounded(
+      root,
+      ["bundle", "create", "-", "--all", "HEAD"],
+      bundlePath,
+      limits.maxCheckpointBytes,
+      "Git bundle generation exceeded the configured checkpoint byte limit",
+    );
     bundleBytes = await readFile(bundlePath);
-    if (bundleBytes.byteLength > limits.maxCheckpointBytes) {
-      throw new Error(
-        "Git bundle exceeds the configured checkpoint byte limit",
-      );
-    }
-    stagedPatchBytes = buildStagedPatch(
+    stagedPatchBytes = await buildStagedPatch(
       root,
       stagedPaths,
-      limits.maxCheckpointBytes,
+      limits.maxCheckpointBytes - bundleBytes.byteLength,
+      join(temporaryDirectory, "staged.patch"),
     );
   } finally {
     await rm(temporaryDirectory, { recursive: true, force: true });
@@ -1456,10 +1461,12 @@ function isExcluded(path: string, globs: string[]): boolean {
 
 function globCouldMatchDescendant(glob: string, directory: string): boolean {
   if (globExpression(glob).test(directory)) return true;
+  const wildcardIndex = glob.search(/[?*]/);
+  const literalPrefix = wildcardIndex < 0 ? glob : glob.slice(0, wildcardIndex);
   return (
-    glob.startsWith(`${directory}/`) ||
-    glob.startsWith("**/") ||
-    glob.includes("**")
+    literalPrefix.length === 0 ||
+    literalPrefix.startsWith(`${directory}/`) ||
+    directory.startsWith(literalPrefix)
   );
 }
 
@@ -1567,49 +1574,120 @@ function rejectUnsupportedIndex(root: string): void {
   }
 }
 
-function buildStagedPatch(
+async function buildStagedPatch(
   root: string,
   paths: string[],
   maxBytes: number,
-): Buffer {
-  const chunks: string[][] = [];
+  patchPath: string,
+): Promise<Buffer> {
+  if (paths.length === 0) return Buffer.alloc(0);
+  await writeFile(patchPath, new Uint8Array(), { flag: "wx" });
+  let totalBytes = 0;
   let current: string[] = [];
   let argumentBytes = 0;
+  const flush = async () => {
+    if (current.length === 0) return;
+    totalBytes += await runGitOutputBounded(
+      root,
+      [
+        "diff",
+        "--cached",
+        "--binary",
+        "--full-index",
+        "--no-renames",
+        "--no-ext-diff",
+        "--no-textconv",
+        "HEAD",
+        "--",
+        ...current.map((path) => `:(literal)${path}`),
+      ],
+      maxBytes - totalBytes,
+      "Staged Git changes exceed the remaining checkpoint byte limit",
+      createWriteStream(patchPath, { flags: "a" }),
+    );
+    current = [];
+    argumentBytes = 0;
+  };
   for (const path of paths) {
     const encodedSize = Buffer.byteLength(path, "utf8") + 12;
     if (current.length > 0 && argumentBytes + encodedSize > 64 * 1024) {
-      chunks.push(current);
-      current = [];
-      argumentBytes = 0;
+      await flush();
     }
     current.push(path);
     argumentBytes += encodedSize;
   }
-  if (current.length > 0) chunks.push(current);
-  const patches = chunks.map((chunk) =>
-    Buffer.from(
-      execFileSync(
-        "git",
-        [
-          "diff",
-          "--cached",
-          "--binary",
-          "--full-index",
-          "--no-renames",
-          "--no-ext-diff",
-          "--no-textconv",
-          "HEAD",
-          "--",
-          ...chunk.map((path) => `:(literal)${path}`),
-        ],
-        { cwd: root, maxBuffer: maxBytes },
-      ),
-    ),
+  await flush();
+  return readFile(patchPath);
+}
+
+async function runGitToFileBounded(
+  cwd: string,
+  args: string[],
+  destination: string,
+  maxBytes: number,
+  limitError: string,
+): Promise<number> {
+  return runGitOutputBounded(
+    cwd,
+    args,
+    maxBytes,
+    limitError,
+    createWriteStream(destination, { flags: "wx" }),
   );
-  const result = Buffer.concat(patches);
-  if (result.byteLength > maxBytes)
-    throw new Error("Staged Git changes exceed the checkpoint byte limit");
-  return result;
+}
+
+async function runGitOutputBounded(
+  cwd: string,
+  args: string[],
+  maxBytes: number,
+  limitError: string,
+  destination: Writable,
+): Promise<number> {
+  const child = spawn("git", args, {
+    cwd,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let totalBytes = 0;
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => {
+    if (stderr.length < 8192) stderr += chunk.slice(0, 8192 - stderr.length);
+  });
+  const closed = new Promise<number | null>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code) => resolve(code));
+  });
+  const limiter = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      if (bytes.byteLength > maxBytes - totalBytes) {
+        child.kill();
+        callback(new Error(limitError));
+        return;
+      }
+      totalBytes += bytes.byteLength;
+      callback(null, bytes);
+    },
+  });
+  try {
+    const [, exitCode] = await Promise.all([
+      pipeline(child.stdout, limiter, destination),
+      closed,
+    ]);
+    if (exitCode !== 0) {
+      const detail = stderr.trim();
+      throw new Error(
+        detail
+          ? `Git command failed: ${detail}`
+          : `Git command failed with exit code ${String(exitCode)}`,
+      );
+    }
+    return totalBytes;
+  } catch (error) {
+    child.kill();
+    await closed.catch(() => undefined);
+    throw error;
+  }
 }
 
 function restoreGitRawText(cwd: string, args: string[]): string {

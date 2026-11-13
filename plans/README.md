@@ -44,6 +44,12 @@ Early feasibility: Pi Durable/chord 1.4.0 supplies public storage records and a 
 
 Slices 1, 2, 3, and the workspace portion of 8 have been copied into the main workspace for review. These are foundation modules, not completed user-facing slices. No slice-4 Factory-to-Pi-to-node execution bridge or ownership transfer is implemented. See `plans/integration-contracts.md`, `packages/pi-runtime/README.md`, `packages/checkpoints/README.md`, and `packages/core/README.md` for public interfaces, profiles, and remaining integration boundaries.
 
+### Reviewed correction integration
+
+Three isolated correction sets have been integrated without taking their plan-document deletions: command timeout process-group cleanup, checkpoint wildcard traversal and bounded Git output generation, and managed-runtime checkpoint root/fresh-store validation. Behavior-focused regression coverage now exercises descendant termination, wildcard directory matches, bundle and staged-patch size bounds, non-reserved checkpoint roots, and orphan scoped documents in an import destination. These corrections are integrated evidence, not acceptance of their parent slices; independent review remains pending, slices 1, 2, and 8 remain pending review, and slice 4 remains not started.
+
+The supported managed-runtime checkpoint profile remains `quiescent-current-documents-no-forks-v1`: export is limited to the unowned, parentless reserved `ROOT_CONVERSATION_ID` (1); tasks must be terminal and receipts settled; fork/history-dependent conversations and session-scoped documents are unsupported; document export preserves current values, not revision history. Import requires a genuinely fresh, exclusively held destination. The public-storage freshness guard requires the first `mintId()` result to be 2 and checks all record kinds at reserved ID 1; it rejects stores that cannot prove freshness, including stores with orphan allocated IDs. Storage exposes no public atomic transaction combining this proof with import, so no concurrent writer is permitted during the operation. The guard consumes the initial minted ID, so do not retry on the same storage instance after the guard has run, including after a later import failure. See `packages/pi-runtime/README.md` for the complete limits and behavior.
+
 Operator blockers: `bunx wrangler whoami` reported `You are not authenticated` (exit 0); laptop B is not established. There is no production Cloudflare binding/deployment evidence, no live model call, and no node-to-controller execution proof.
 
 Integration validation in the main checkout:
@@ -53,7 +59,7 @@ Integration validation in the main checkout:
 - `bun run format` — passed; formatted the integrated sources and docs.
 - `bun run check` — passed; all selected TypeScript, JSON, and README files conform to Prettier.
 - `bun run typecheck` — passed (`tsc --noEmit`).
-- `bun run test` — passed: 61 tests across 11 files, 420 assertions, including Bun SQLite persistence/execution/Factory/workspace checkpoint tests and the Miniflare workerd Durable Object eviction/recovery test.
+- `bun run test` — passed after correction integration: 68 tests across 11 files, 432 assertions, including descendant process-group termination, bounded Git output and wildcard traversal, managed-checkpoint root/fresh-store validation, Bun SQLite persistence/execution/Factory/workspace checkpoint tests, and the Miniflare workerd Durable Object eviction/recovery test.
 - `bun run build` — passed: Bun daemon bundle (13 modules, 115.68 KiB) and Wrangler dry-run Worker bundle (126.46 KiB upload, 21.00 KiB gzip). Wrangler printed `No bindings found`; this does not validate ManagedWork or Factory Durable Object bindings or deployment.
 - `git diff --check` — passed.
 

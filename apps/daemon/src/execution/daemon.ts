@@ -123,6 +123,95 @@ function errorCode(error: unknown): string {
   return "execution_failed";
 }
 
+const COMMAND_TERMINATION_WAIT_MS = 1_000;
+
+function isNoSuchProcess(error: unknown): boolean {
+  return (
+    error !== null &&
+    typeof error === "object" &&
+    "code" in error &&
+    (error as { code?: unknown }).code === "ESRCH"
+  );
+}
+
+async function waitForCommandExit(
+  child: ReturnType<typeof Bun.spawn>,
+): Promise<number | undefined> {
+  return Promise.race([
+    child.exited,
+    Bun.sleep(COMMAND_TERMINATION_WAIT_MS).then(() => undefined),
+  ]);
+}
+
+async function waitForCommandGroupExit(
+  processGroupId: number,
+): Promise<boolean> {
+  const deadline = Date.now() + COMMAND_TERMINATION_WAIT_MS;
+  while (true) {
+    try {
+      globalThis.process.kill(-processGroupId, 0);
+    } catch (error) {
+      return isNoSuchProcess(error);
+    }
+    if (Date.now() >= deadline) return false;
+    await Bun.sleep(10);
+  }
+}
+
+async function cancelCommandOutputReaders(
+  readers: ReadableStreamDefaultReader<Uint8Array>[],
+): Promise<void> {
+  await Promise.all(
+    readers.map(async (reader) => {
+      try {
+        await reader.cancel();
+      } catch {
+        // Output streams may already have closed.
+      }
+    }),
+  );
+}
+
+async function terminateCommandProcessTree(
+  child: ReturnType<typeof Bun.spawn>,
+  readers: ReadableStreamDefaultReader<Uint8Array>[],
+): Promise<number | undefined> {
+  if (globalThis.process.platform === "win32") {
+    try {
+      child.kill(9);
+    } catch {
+      // The process may already have exited.
+    }
+    const exitCode = await waitForCommandExit(child);
+    await cancelCommandOutputReaders(readers);
+    return exitCode;
+  }
+
+  let groupSignalAccepted = false;
+  try {
+    globalThis.process.kill(-child.pid, "SIGKILL");
+    groupSignalAccepted = true;
+  } catch (error) {
+    // ESRCH proves the group is already gone; other failures do not.
+    groupSignalAccepted = isNoSuchProcess(error);
+  }
+  if (!groupSignalAccepted) {
+    try {
+      child.kill(9);
+    } catch {
+      // The process may already have exited.
+    }
+  }
+
+  const exitCode = await waitForCommandExit(child);
+  const processGroupExitObserved =
+    groupSignalAccepted && (await waitForCommandGroupExit(child.pid));
+  const terminationObserved =
+    groupSignalAccepted && exitCode !== undefined && processGroupExitObserved;
+  if (!terminationObserved) await cancelCommandOutputReaders(readers);
+  return exitCode;
+}
+
 export class ExecutionDaemon {
   readonly #db: Database;
   readonly #nodeId: string;
@@ -676,6 +765,7 @@ export class ExecutionDaemon {
         stdin: "ignore",
         stdout: "pipe",
         stderr: "pipe",
+        detached: globalThis.process.platform !== "win32",
       });
     } catch {
       throw new ExecutionError("command_start_failed");
@@ -683,11 +773,15 @@ export class ExecutionDaemon {
 
     let captured = 0;
     let outputTruncated = false;
+    const readers: ReadableStreamDefaultReader<Uint8Array>[] = [];
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
     const collect = async (
       stream: ReadableStream<Uint8Array>,
+      chunks: Buffer[],
     ): Promise<Buffer> => {
       const reader = stream.getReader();
-      const chunks: Buffer[] = [];
+      readers.push(reader);
       try {
         while (true) {
           const part = await reader.read();
@@ -707,51 +801,74 @@ export class ExecutionDaemon {
       return Buffer.concat(chunks);
     };
 
+    let cleanupPromise: Promise<number | undefined> | undefined;
+    const cleanup = () => {
+      cleanupPromise ??= terminateCommandProcessTree(process, readers).catch(
+        async () => {
+          await cancelCommandOutputReaders(readers);
+          return undefined;
+        },
+      );
+      return cleanupPromise;
+    };
+
     const stdoutStream = process.stdout;
     const stderrStream = process.stderr;
     if (
       !(stdoutStream instanceof ReadableStream) ||
       !(stderrStream instanceof ReadableStream)
     ) {
-      try {
-        process.kill(9);
-      } catch {
-        // The process may already have exited; the receipt remains uncertain either way.
-      }
-      await process.exited;
+      await cleanup();
       throw new UncertainEffectError("command_output_unavailable");
     }
     let timedOut = false;
+    let resolveTimedOut!: (exitCode: number | undefined) => void;
+    const timeoutCleanup = new Promise<number | undefined>((resolve) => {
+      resolveTimedOut = resolve;
+    });
     const timeout = setTimeout(() => {
       timedOut = true;
-      try {
-        process.kill(9);
-      } catch {
-        // The still-awaited exit below decides whether completion is known.
-      }
+      void cleanup().then(resolveTimedOut, () => resolveTimedOut(undefined));
     }, job.timeoutMs);
     try {
-      const [stdout, stderr, exitCode] = await Promise.all([
-        collect(stdoutStream),
-        collect(stderrStream),
+      const completed = Promise.all([
+        collect(stdoutStream, stdoutChunks),
+        collect(stderrStream, stderrChunks),
         process.exited,
-      ]);
-      const result = {
-        operation: job.operation,
+      ]).then(([stdout, stderr, exitCode]) => ({
+        kind: "completed" as const,
+        stdout,
+        stderr,
         exitCode,
-        stdout: stdout.toString("utf8"),
-        stderr: stderr.toString("utf8"),
+      }));
+      const outcome = await Promise.race([
+        completed,
+        timeoutCleanup.then((exitCode) => ({
+          kind: "timed-out" as const,
+          exitCode,
+        })),
+      ]);
+      if (outcome.kind === "timed-out") {
+        return {
+          operation: job.operation,
+          exitCode: outcome.exitCode ?? null,
+          stdout: Buffer.concat(stdoutChunks).toString("utf8"),
+          stderr: Buffer.concat(stderrChunks).toString("utf8"),
+          outputTruncated,
+          timedOut: true,
+        } satisfies ExecutionResult;
+      }
+      if (timedOut) await cleanup();
+      return {
+        operation: job.operation,
+        exitCode: outcome.exitCode,
+        stdout: outcome.stdout.toString("utf8"),
+        stderr: outcome.stderr.toString("utf8"),
         outputTruncated,
         timedOut,
       } satisfies ExecutionResult;
-      return result;
     } catch {
-      try {
-        process.kill(9);
-      } catch {
-        // The still-awaited exit below decides whether termination is known.
-      }
-      await process.exited;
+      await cleanup();
       throw new UncertainEffectError("command_output_failed_after_start");
     } finally {
       clearTimeout(timeout);

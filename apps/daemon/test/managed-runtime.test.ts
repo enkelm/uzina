@@ -6,6 +6,9 @@ import {
   createRegistry,
   defineTask,
   Harness,
+  ROOT_CONVERSATION_ID,
+  type ConversationId,
+  type DocumentId,
 } from "@earendil-works/pi-durable";
 import { ManagedPiWork } from "@uzina/pi-runtime";
 import {
@@ -24,6 +27,36 @@ function deferred<T>() {
     resolve = done;
   });
   return { promise, resolve };
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    const encoded = JSON.stringify(value);
+    if (encoded === undefined) throw new Error("Expected JSON value");
+    return encoded;
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => canonicalJson(entry)).join(",")}]`;
+  }
+  const object = value as Record<string, unknown>;
+  return `{${Object.keys(object)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(object[key])}`)
+    .join(",")}}`;
+}
+
+async function resignCheckpoint(
+  checkpoint: Awaited<ReturnType<typeof exportManagedWorkCheckpoint>>,
+) {
+  const { sha256: _previousHash, ...body } = checkpoint;
+  const bytes = new TextEncoder().encode(canonicalJson(body));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return {
+    ...body,
+    sha256: [...new Uint8Array(digest)]
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join(""),
+  };
 }
 
 describe("local managed Pi runtime", () => {
@@ -150,6 +183,138 @@ describe("local managed Pi runtime", () => {
       });
     } finally {
       await harness.close(BACKGROUND_CONTEXT).catch(() => {});
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a non-reserved ownerless conversation as an export root", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "uzina-checkpoint-root-id-"),
+    );
+    const storage = await openBunSqliteStorage(
+      join(directory, "non-root.sqlite"),
+    );
+    try {
+      await storage.commit(
+        [{ type: "conversation", value: { id: 2 as ConversationId } }],
+        BACKGROUND_CONTEXT,
+      );
+      await expect(
+        exportManagedWorkCheckpoint(storage, 2 as ConversationId),
+      ).rejects.toBeInstanceOf(UnsupportedCheckpointState);
+    } finally {
+      await storage.close(BACKGROUND_CONTEXT);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a non-reserved root in a validly checksummed import", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "uzina-checkpoint-import-root-id-"),
+    );
+    const sourceStorage = await openBunSqliteStorage(
+      join(directory, "source.sqlite"),
+    );
+    const destinationStorage = await openBunSqliteStorage(
+      join(directory, "destination.sqlite"),
+    );
+    try {
+      await sourceStorage.commit(
+        [{ type: "conversation", value: { id: ROOT_CONVERSATION_ID } }],
+        BACKGROUND_CONTEXT,
+      );
+      const checkpoint = await exportManagedWorkCheckpoint(
+        sourceStorage,
+        ROOT_CONVERSATION_ID,
+      );
+      const nonRootCheckpoint = structuredClone(checkpoint);
+      nonRootCheckpoint.rootConversationId = 2 as ConversationId;
+      nonRootCheckpoint.conversations[0] = {
+        ...nonRootCheckpoint.conversations[0]!,
+        id: 2 as ConversationId,
+      };
+      const resignedCheckpoint = await resignCheckpoint(nonRootCheckpoint);
+
+      await expect(
+        importManagedWorkCheckpoint(destinationStorage, resignedCheckpoint),
+      ).rejects.toBeInstanceOf(UnsupportedCheckpointState);
+      expect(
+        await destinationStorage.conversation(
+          2 as ConversationId,
+          BACKGROUND_CONTEXT,
+        ),
+      ).toBeUndefined();
+    } finally {
+      await Promise.all([
+        sourceStorage.close(BACKGROUND_CONTEXT),
+        destinationStorage.close(BACKGROUND_CONTEXT),
+      ]);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects an orphan scoped document in the checkpoint destination", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "uzina-checkpoint-scoped-document-"),
+    );
+    const sourceStorage = await openBunSqliteStorage(
+      join(directory, "source.sqlite"),
+    );
+    const destinationStorage = await openBunSqliteStorage(
+      join(directory, "destination.sqlite"),
+    );
+    try {
+      await sourceStorage.commit(
+        [{ type: "conversation", value: { id: ROOT_CONVERSATION_ID } }],
+        BACKGROUND_CONTEXT,
+      );
+      const checkpoint = await exportManagedWorkCheckpoint(
+        sourceStorage,
+        ROOT_CONVERSATION_ID,
+      );
+
+      const documentId = await destinationStorage.mintId<DocumentId>();
+      await destinationStorage.commit(
+        [
+          {
+            type: "document.create",
+            record: {
+              id: documentId,
+              kind: "orphan.checkpoint-test",
+              scope: {
+                kind: "conversation",
+                conversationId: 88 as ConversationId,
+              },
+              history: "latest",
+              fork: "current",
+            },
+            content: { kind: "base", version: 1, value: { retained: true } },
+          },
+        ],
+        BACKGROUND_CONTEXT,
+      );
+
+      await expect(
+        importManagedWorkCheckpoint(destinationStorage, checkpoint),
+      ).rejects.toThrow();
+      expect(
+        await destinationStorage.conversation(
+          ROOT_CONVERSATION_ID,
+          BACKGROUND_CONTEXT,
+        ),
+      ).toBeUndefined();
+      expect(
+        await destinationStorage.document(
+          documentId,
+          "current",
+          BACKGROUND_CONTEXT,
+        ),
+      ).toMatchObject({ value: { retained: true } });
+    } finally {
+      await Promise.all([
+        sourceStorage.close(BACKGROUND_CONTEXT),
+        destinationStorage.close(BACKGROUND_CONTEXT),
+      ]);
       await rm(directory, { recursive: true, force: true });
     }
   });

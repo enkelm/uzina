@@ -295,6 +295,81 @@ describe("workspace checkpoints", () => {
     }
   });
 
+  test("includes descendants matched through wildcard directory segments", async () => {
+    const root = await temporaryDirectory();
+    try {
+      const { source } = await makeLinkedDirtyRepository(root);
+      await mkdir(join(source, "src"));
+      await writeFile(join(source, "src", "keep.txt"), "selected by wildcard");
+      await writeFile(join(source, "src", "drop.txt"), "not selected");
+      const captured = await captureWorkspaceCheckpoint({
+        workspacePath: source,
+        transport: new FileBlobTransport(join(root, "blobs")),
+        includeGlobs: ["*/keep.txt"],
+      });
+      expect(
+        captured.manifest.workspace.entries.map((entry) => entry.path),
+      ).toEqual(["src/keep.txt"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("bounds Git bundle generation to the configured checkpoint size", async () => {
+    const root = await temporaryDirectory();
+    try {
+      const source = join(root, "repo");
+      await mkdir(source);
+      git(source, "init", "--initial-branch=main", "--quiet");
+      git(source, "config", "user.name", "Checkpoint Test");
+      git(source, "config", "user.email", "checkpoint@example.invalid");
+      await writeFile(join(source, "base.txt"), "base");
+      git(source, "add", "base.txt");
+      git(source, "commit", "-m", "initial");
+      await expect(
+        captureWorkspaceCheckpoint({
+          workspacePath: source,
+          transport: new FileBlobTransport(join(root, "blobs")),
+          limits: { maxCheckpointBytes: 1 },
+        }),
+      ).rejects.toThrow(
+        "Git bundle generation exceeded the configured checkpoint byte limit",
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("bounds staged patch accumulation across Git path chunks", async () => {
+    const root = await temporaryDirectory();
+    try {
+      const source = join(root, "repo");
+      await mkdir(source);
+      git(source, "init", "--initial-branch=main", "--quiet");
+      git(source, "config", "user.name", "Checkpoint Test");
+      git(source, "config", "user.email", "checkpoint@example.invalid");
+      await writeFile(join(source, "base.txt"), "base");
+      git(source, "add", "base.txt");
+      git(source, "commit", "-m", "initial");
+      for (let index = 0; index < 1800; index += 1) {
+        const name = `file-${String(index).padStart(4, "0")}-${"x".repeat(60)}.txt`;
+        await writeFile(join(source, name), "");
+      }
+      git(source, "add", "--all");
+      await expect(
+        captureWorkspaceCheckpoint({
+          workspacePath: source,
+          transport: new FileBlobTransport(join(root, "blobs")),
+          limits: { maxCheckpointBytes: 256 * 1024 },
+        }),
+      ).rejects.toThrow(
+        "Staged Git changes exceed the remaining checkpoint byte limit",
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("refuses symlink escapes while capturing and omits policy-selected resources", async () => {
     const root = await temporaryDirectory();
     try {
