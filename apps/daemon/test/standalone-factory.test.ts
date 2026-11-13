@@ -59,6 +59,7 @@ async function scenario(options: {
   modelProvider: string;
   modelId: string;
   directoryPrefix: string;
+  deferExecutor?: boolean;
 }) {
   const directory = await mkdtemp(join(tmpdir(), options.directoryPrefix));
   const workspaceDirectory = join(directory, "workspace");
@@ -152,32 +153,36 @@ async function scenario(options: {
     workspaceId: workspace.value.workspaceId,
     directory: workspaceDirectory,
   };
-  execution = new ExecutionDaemon({
-    databasePath: join(directory, "executor.sqlite"),
-    nodeId: node.value.node.nodeId,
-    nodeCredential: node.value.credential,
-    workspaces: [mapping],
-    daemonVersion: "slice-4b-test",
-  });
-  abort = new AbortController();
-  runningLoop = new ExecutionLoop({
-    daemon: execution,
-    controller: new HttpExecutionControllerConnector({
-      controllerUrl: fixture.baseUrl,
+  const startExecution = async () => {
+    if (execution) return;
+    execution = new ExecutionDaemon({
+      databasePath: join(directory, "executor.sqlite"),
       nodeId: node.value.node.nodeId,
-      credential: node.value.credential,
-    }),
-    pollIntervalMs: 20,
-    heartbeatIntervalMs: 500,
-  }).run(abort.signal);
-  await until(async () => {
-    const nodes = await call<{ nodes: Array<{ availability: string }> }>(
-      fixture.baseUrl,
-      "/v1/nodes",
-      { credential: owner },
-    );
-    return nodes.value.nodes[0]?.availability === "online";
-  });
+      nodeCredential: node.value.credential,
+      workspaces: [mapping],
+      daemonVersion: "slice-4b-test",
+    });
+    abort = new AbortController();
+    runningLoop = new ExecutionLoop({
+      daemon: execution,
+      controller: new HttpExecutionControllerConnector({
+        controllerUrl: fixture.baseUrl,
+        nodeId: node.value.node.nodeId,
+        credential: node.value.credential,
+      }),
+      pollIntervalMs: 20,
+      heartbeatIntervalMs: 500,
+    }).run(abort.signal);
+    await until(async () => {
+      const nodes = await call<{ nodes: Array<{ availability: string }> }>(
+        fixture.baseUrl,
+        "/v1/nodes",
+        { credential: owner },
+      );
+      return nodes.value.nodes[0]?.availability === "online";
+    });
+  };
+  if (!options.deferExecutor) await startExecution();
   const thread = await call<{ threadId: string }>(
     fixture.baseUrl,
     "/v1/threads",
@@ -197,8 +202,10 @@ async function scenario(options: {
   return Object.assign(fixture, {
     owner,
     nodeId: node.value.node.nodeId,
+    nodeCredential: node.value.credential,
     workspaceId: workspace.value.workspaceId,
     threadId: thread.value.threadId,
+    startExecution,
   });
 }
 
@@ -438,6 +445,200 @@ describe("standalone local Factory managed Pi composition", () => {
     expect(JSON.stringify(context.value.runtime)).toContain(
       "deterministic provider failure",
     );
+  });
+
+  test("reports node-side argv truncation when returned stdout exactly meets the limit", async () => {
+    const provider = deterministicToolModels({
+      toolName: "remote_run_command",
+      arguments: {
+        argv: [process.execPath, "-e", 'process.stdout.write("ABCDEFGHIJK")'],
+        timeoutMs: 5_000,
+        maxOutputBytes: 8,
+      },
+      answer: "The bounded command completed.",
+    });
+    const local = await scenario({
+      models: provider.models,
+      modelProvider: "uzina-test",
+      modelId: "fixed-model",
+      directoryPrefix: "uzina-standalone-truncated-output-",
+    });
+    const input = {
+      requestId: "request:truncated-output",
+      text: "Run the bounded command and report its output.",
+    };
+    const accepted = await call<{ dispatchStatus: string }>(
+      local.baseUrl,
+      `/v1/threads/${local.threadId}/inputs`,
+      { credential: local.owner, body: input },
+    );
+    expect(accepted.value.dispatchStatus).toBe("queued");
+
+    await until(async () => {
+      const receipt = await call<{ dispatchStatus: string }>(
+        local.baseUrl,
+        `/v1/commands/${input.requestId}`,
+        { credential: local.owner },
+      );
+      return receipt.value.dispatchStatus === "completed";
+    });
+    const receipt = await call<{
+      executionEffects: Array<{
+        result?: {
+          operation?: string;
+          stdout?: string;
+          outputTruncated?: boolean;
+        };
+      }>;
+    }>(local.baseUrl, `/v1/commands/${input.requestId}`, {
+      credential: local.owner,
+    });
+    expect(
+      receipt.value.executionEffects.find(
+        (effect) => effect.result?.operation === "argv-command",
+      )?.result,
+    ).toMatchObject({ stdout: "ABCDEFGH", outputTruncated: true });
+
+    const context = await call<{
+      runtime: {
+        entries: Array<{
+          model?: Array<{
+            content?: Array<{ type: string; text?: string }>;
+          }>;
+        }>;
+      };
+    }>(local.baseUrl, `/v1/threads/${local.threadId}/context`, {
+      credential: local.owner,
+    });
+    const toolText = context.value.runtime.entries
+      .flatMap((entry) => entry.model ?? [])
+      .flatMap((message) => message.content ?? [])
+      .find(
+        (part) => part.type === "text" && part.text?.includes("truncated"),
+      )?.text;
+    expect(JSON.parse(toolText ?? "null")).toMatchObject({
+      stdout: "ABCDEFGH",
+      truncated: true,
+    });
+  });
+
+  test("reopens and drains a persisted accepted input without another input request", async () => {
+    const outputPath = "startup-recovered.txt";
+    const provider = deterministicToolModels({
+      toolName: "remote_run_command",
+      arguments: {
+        argv: [
+          process.execPath,
+          "-e",
+          `require("node:fs").writeFileSync(${JSON.stringify(outputPath)}, "startup recovered")`,
+        ],
+        timeoutMs: 5_000,
+        maxOutputBytes: 64,
+      },
+      answer: "The startup command completed.",
+    });
+    const local = await scenario({
+      models: provider.models,
+      modelProvider: "uzina-test",
+      modelId: "fixed-model",
+      directoryPrefix: "uzina-standalone-startup-drain-",
+    });
+    const input = {
+      requestId: "request:startup-drain",
+      text: "Run the startup recovery command.",
+    };
+    const session = await local.host.factory.authenticate(local.owner);
+    const accepted = await local.host.factory.submitInput(
+      session,
+      local.threadId,
+      input.requestId,
+      input.text,
+    );
+    expect(accepted.dispatchStatus).toBe("queued");
+
+    await local.reopenFactory();
+    let startupReceipt: { dispatchStatus: string } | undefined;
+    const startupDeadline = Date.now() + 1_000;
+    while (Date.now() < startupDeadline) {
+      startupReceipt = (
+        await call<{ dispatchStatus: string }>(
+          local.baseUrl,
+          `/v1/commands/${input.requestId}`,
+          { credential: local.owner },
+        )
+      ).value;
+      if (startupReceipt.dispatchStatus !== "queued") break;
+      await Bun.sleep(10);
+    }
+    expect(startupReceipt?.dispatchStatus).toBe("running");
+    await local.startExecution();
+    await until(async () => {
+      const receipt = await call<{ dispatchStatus: string }>(
+        local.baseUrl,
+        `/v1/commands/${input.requestId}`,
+        { credential: local.owner },
+      );
+      return receipt.value.dispatchStatus === "completed";
+    });
+    expect(
+      await readFile(join(local.workspaceDirectory, outputPath), "utf8"),
+    ).toBe("startup recovered");
+
+    await local.reopenFactory();
+    const context = await call<{ runtime: unknown }>(
+      local.baseUrl,
+      `/v1/threads/${local.threadId}/context`,
+      { credential: local.owner },
+    );
+    expect(JSON.stringify(context.value.runtime)).toContain(
+      "The startup command completed.",
+    );
+  });
+
+  test("wakes unavailable accepted work when its node registers after host startup", async () => {
+    const provider = deterministicToolModels({
+      toolName: "remote_write_file",
+      arguments: {
+        path: "node-recovered.txt",
+        content: "node came online",
+      },
+      answer: "The node recovered the accepted input.",
+    });
+    const local = await scenario({
+      models: provider.models,
+      modelProvider: "uzina-test",
+      modelId: "fixed-model",
+      directoryPrefix: "uzina-standalone-node-wake-",
+      deferExecutor: true,
+    });
+    const input = {
+      requestId: "request:node-wake",
+      text: "Write the result after the executor comes online.",
+    };
+    const session = await local.host.factory.authenticate(local.owner);
+    const accepted = await local.host.factory.submitInput(
+      session,
+      local.threadId,
+      input.requestId,
+      input.text,
+    );
+    expect(accepted.dispatchStatus).toBe("unavailable");
+
+    await local.startExecution();
+    await until(async () => {
+      const receipt = await call<{ dispatchStatus: string }>(
+        local.baseUrl,
+        `/v1/commands/${input.requestId}`,
+        { credential: local.owner },
+      );
+      return receipt.value.dispatchStatus === "completed";
+    });
+    expect(
+      await readFile(
+        join(local.workspaceDirectory, "node-recovered.txt"),
+        "utf8",
+      ),
+    ).toBe("node came online");
   });
 
   test("a timed-out command keeps its actual partial cwd effect and uncertain receipt after reopen", async () => {

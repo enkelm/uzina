@@ -1456,6 +1456,86 @@ export class FactoryService {
     this.settleManagedInput(row.request_id, "uncertain", detail);
   }
 
+  /** Requeues unavailable accepted inputs only after their explicitly assigned node is live. */
+  requeueAvailableManagedInputs(): number {
+    if (
+      this.database.all(
+        "SELECT singleton FROM factory_meta WHERE singleton = 1",
+      ).length === 0
+    ) {
+      return 0;
+    }
+    return this.database.transaction(() => {
+      const generation = this.#ownershipGeneration();
+      const rows = this.database.all<
+        IntentRow & {
+          node_name: string;
+          node_availability: string;
+          node_last_seen_at: string | null;
+        }
+      >(
+        `SELECT intents.job_id, intents.request_id, intents.actor_json, intents.project_id,
+           intents.thread_id, intents.node_id, intents.workspace_id,
+           intents.ownership_generation, intents.payload_json, intents.payload_hash,
+           intents.status, intents.outcome, intents.created_at, intents.updated_at,
+           nodes.name AS node_name, nodes.availability AS node_availability,
+           nodes.last_seen_at AS node_last_seen_at
+         FROM dispatch_intents AS intents
+         JOIN nodes ON nodes.node_id = intents.node_id
+         WHERE intents.status = 'unavailable' AND intents.ownership_generation = ?`,
+        [generation],
+      );
+      let requeued = 0;
+      for (const row of rows) {
+        if (
+          !this.#isNodeOnline({
+            node_id: row.node_id,
+            name: row.node_name,
+            availability: row.node_availability,
+            last_seen_at: row.node_last_seen_at,
+          })
+        ) {
+          continue;
+        }
+        this.database.exec(
+          "UPDATE dispatch_intents SET status = 'queued', outcome = NULL, updated_at = ? WHERE job_id = ? AND status = 'unavailable'",
+          [now(), row.job_id],
+        );
+        requeued += 1;
+      }
+      return requeued;
+    });
+  }
+
+  /** Records terminal evidence if the standalone managed-input drain itself fails. */
+  failManagedDispatchDrain(detail: string): void {
+    if (!detail.trim() || detail.length > 4_000) {
+      throw new FactoryError(400, "invalid_settlement_detail");
+    }
+    const timestamp = now();
+    this.database.transaction(() => {
+      const rows = this.database.all<IntentRow>(
+        "SELECT job_id, request_id, actor_json, project_id, thread_id, node_id, workspace_id, ownership_generation, payload_json, payload_hash, status, outcome, created_at, updated_at FROM dispatch_intents WHERE status IN ('queued', 'running')",
+      );
+      for (const row of rows) {
+        const status = row.status === "running" ? "uncertain" : "failed";
+        this.database.exec(
+          "UPDATE dispatch_intents SET status = ?, outcome = ?, updated_at = ? WHERE job_id = ? AND status = ?",
+          [status, detail, timestamp, row.job_id, row.status],
+        );
+        this.#event(
+          `dispatch.${status}`,
+          parseActor(row.actor_json),
+          row.project_id,
+          row.thread_id,
+          row.request_id,
+          { jobId: row.job_id, detail },
+          timestamp,
+        );
+      }
+    });
+  }
+
   /** Dispatches one durable intent through the injected managed-runtime boundary. */
   async dispatchNext(
     adapter: RuntimeDispatchAdapter,

@@ -22,6 +22,7 @@ export type RemoteCommandResult = {
   stdout: string;
   stderr: string;
   exitCode: number;
+  outputTruncated: boolean;
 };
 
 export type RemoteToolIdentity = {
@@ -212,7 +213,10 @@ function createRemoteTools(executor: RemoteToolExecutor): ToolRegistration[] {
         stdout,
         stderr,
         exitCode: result.exitCode,
-        truncated: stdout !== result.stdout || stderr !== result.stderr,
+        truncated:
+          result.outputTruncated ||
+          stdout !== result.stdout ||
+          stderr !== result.stderr,
       };
       return {
         output: [{ type: "text", text: outputText(value) }],

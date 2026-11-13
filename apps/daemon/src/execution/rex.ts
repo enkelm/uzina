@@ -168,14 +168,25 @@ export class RexProcessManager {
         row.block_id,
         "process",
       ]);
-      if (typeof process.running !== "boolean") {
+      // Rex exposes either a running flag or the current child process object.
+      const running =
+        typeof process.running === "boolean"
+          ? process.running
+          : process.child === null
+            ? false
+            : process.child &&
+                typeof process.child === "object" &&
+                !Array.isArray(process.child)
+              ? true
+              : undefined;
+      if (typeof running !== "boolean") {
         throw new RexCliError("invalid_rex_process_state");
       }
       const exitCode =
         typeof process.last_exit === "number" || process.last_exit === null
           ? process.last_exit
           : undefined;
-      const status = process.running ? "running" : "exited";
+      const status = running ? "running" : "exited";
       this.#update(processId, {
         status,
         exitCode,

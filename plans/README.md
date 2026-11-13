@@ -134,6 +134,24 @@ Final integration validation in this checkout:
 
 No production secrets were read, no paid provider request or deployment/push was made, no actual second laptop was tested, and no existing Rex session was changed. The Cloudflare model profile is intentionally OpenAI API-key/Responses only; Worker OAuth and ambient file/environment discovery are unsupported. Independent reviewer approval remains pending.
 
+### Slice 4b review follow-up
+
+The slice4b review identified two P2 defects, both now corrected. The node execution receipt's `outputTruncated` bit is carried through `RemoteCommandResult` into the `remote_run_command` structured `truncated` result; the regression uses the real local Factory/Pi/HTTP executor path and an argv process whose captured stdout is exactly the output limit while the daemon receipt confirms additional output was truncated. The standalone host now requests a managed-input drain on startup and after successful node registration/heartbeat. It requeues only previously unavailable inputs whose persisted placement generation remains current and whose assigned node is live. Drain wakes are coalesced across an active/finalizing drain; unexpected drain errors are logged and accepted queued/running intents are durably settled as failed/uncertain rather than silently abandoned. Reopen coverage commits an accepted input directly through the real persistent Core service, observes startup dispatch before any new input or node liveness request, finishes it through a bounded real executor, then reopens and reads persisted Pi context. A separate local HTTP test accepts work while its node is offline and verifies node registration wakes and completes it. Core tests verify queued failures and active uncertain outcomes remain explicit. Before the repairs were restored, the truncation regression failed with the real execution receipt at `stdout: "ABCDEFGH", outputTruncated: true` but Pi structured output at `truncated: false`; disabling the startup drain left the reopened receipt `queued` instead of the expected `running`. Both regressions pass with the fixes enabled.
+
+The narrow Rex integration from the separately verified worktree was copied unchanged in its two approved files: inspection recognizes Rex's structured `child` field, and `rex-lifecycle.integration.test.ts` is gated by `UZINA_REX_LIFECYCLE_INTEGRATION=1` with random owned IDs and cleanup verification. The normal suite skips it. This run did not opt in or contact the Rex server; the supplied handoff reports the prior opt-in completed on Baldur with its created resource cleaned up.
+
+Post-correction validation in this checkout:
+
+- `bun install --frozen-lockfile` — passed; checked 149 installs across 228 packages with no changes.
+- `bun run format` — passed.
+- `bun run check` — passed.
+- `bun run typecheck` — passed (`tsc --noEmit`).
+- `bun run test` — passed: 93 tests, 1 opt-in Rex test skipped, 622 assertions across 18 files. Local standalone recovery, node-liveness, output-truncation, and drain-failure regressions passed; existing workerd tests passed.
+- `bun run build` — passed: daemon bundle (1,382 modules, 4.93 MB) and Wrangler dry-run (1,854.29 KiB upload, 332.63 KiB gzip), with the Factory and ManagedWork bindings. This validates the build only, not deployment.
+- `git diff --check` — passed.
+
+Independent reviewer approval remains pending. This evidence does not claim all slices complete, production Cloudflare behavior, paid inference, or actual second-laptop operation; no deployment, push, or paid call was made.
+
 ## Workflow
 
 1. Scaffold and review slice 0.

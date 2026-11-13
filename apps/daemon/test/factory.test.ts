@@ -328,6 +328,63 @@ describe("persistent Factory behavior over Bun SQLite", () => {
     ).toBeNull();
   });
 
+  test("an unexpected managed-input drain failure settles accepted queued and active intents", async () => {
+    const fixture = await provisionFixture(true);
+    const queued = await fixture.factory.submitInput(
+      fixture.owner,
+      fixture.thread.threadId,
+      "request:drain-failure-queued",
+      "Keep this accepted input visible",
+    );
+    fixture.factory.failManagedDispatchDrain("Standalone drain failed");
+    expect(
+      fixture.factory.getReceipt(fixture.owner, queued.requestId),
+    ).toMatchObject({
+      jobId: queued.jobId,
+      dispatchStatus: "failed",
+      outcome: "Standalone drain failed",
+    });
+
+    const active = await fixture.factory.submitInput(
+      fixture.owner,
+      fixture.thread.threadId,
+      "request:drain-failure-active",
+      "Do not replay this active input",
+    );
+    let enteredDispatch!: () => void;
+    let finishDispatch!: () => void;
+    const dispatchEntered = new Promise<void>((resolve) => {
+      enteredDispatch = resolve;
+    });
+    const dispatchCanFinish = new Promise<void>((resolve) => {
+      finishDispatch = resolve;
+    });
+    const dispatch = fixture.factory.dispatchNext({
+      async dispatch() {
+        enteredDispatch();
+        await dispatchCanFinish;
+        return { status: "completed" };
+      },
+    });
+    await dispatchEntered;
+    fixture.factory.failManagedDispatchDrain(
+      "Active drain outcome is uncertain",
+    );
+    expect(
+      fixture.factory.getReceipt(fixture.owner, active.requestId),
+    ).toMatchObject({
+      jobId: active.jobId,
+      dispatchStatus: "uncertain",
+      outcome: "Active drain outcome is uncertain",
+    });
+    finishDispatch();
+    await dispatch;
+    expect(
+      fixture.factory.getReceipt(fixture.owner, active.requestId)
+        .dispatchStatus,
+    ).toBe("uncertain");
+  });
+
   test("an expired queued managed effect is fenced before the node can claim it", async () => {
     const fixture = await provisionFixture(true);
     const accepted = await fixture.factory.submitInput(

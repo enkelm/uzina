@@ -161,6 +161,7 @@ export function createManagedRemoteToolExecutor(
         stdout: result.stdout,
         stderr: result.stderr,
         exitCode: result.exitCode,
+        outputTruncated: result.outputTruncated,
       };
     },
   };

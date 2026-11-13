@@ -65,6 +65,7 @@ export async function createStandaloneFactoryServer(
   const work = new Map<string, ManagedPiWork>();
   const opening = new Map<string, Promise<ManagedPiWork>>();
   let dispatching: Promise<void> | undefined;
+  let drainRequested = false;
 
   const openWork = async (threadId: string): Promise<ManagedPiWork> => {
     const current = work.get(threadId);
@@ -164,12 +165,35 @@ export async function createStandaloneFactoryServer(
     }
   };
   const startDrain = () => {
+    drainRequested = true;
     if (dispatching) return;
-    dispatching = drain()
-      .catch(() => {})
-      .finally(() => {
-        dispatching = undefined;
-      });
+    dispatching = (async () => {
+      try {
+        while (drainRequested) {
+          drainRequested = false;
+          factory.requeueAvailableManagedInputs();
+          await drain();
+        }
+      } catch (error) {
+        const detail = (
+          error instanceof Error
+            ? `Standalone managed-input drain failed: ${error.message}`
+            : "Standalone managed-input drain failed without a known error"
+        ).slice(0, 4_000);
+        try {
+          factory.failManagedDispatchDrain(detail);
+        } catch (settlementError) {
+          console.error(
+            "Could not persist the standalone managed-input drain failure",
+            settlementError,
+          );
+        }
+        console.error("Standalone managed-input drain failed", error);
+      }
+    })().finally(() => {
+      dispatching = undefined;
+      if (drainRequested) startDrain();
+    });
   };
 
   const server = Bun.serve({
@@ -177,9 +201,17 @@ export async function createStandaloneFactoryServer(
     hostname: options.hostname ?? "127.0.0.1",
     async fetch(request) {
       const response = await handler(request);
+      const path = new URL(request.url).pathname;
+      if (
+        response.ok &&
+        request.method === "POST" &&
+        /^\/v1\/nodes\/[^/]+\/(?:register|heartbeat)$/.test(path)
+      ) {
+        startDrain();
+      }
       if (
         request.method === "POST" &&
-        /^\/v1\/threads\/[^/]+\/inputs$/.test(new URL(request.url).pathname) &&
+        /^\/v1\/threads\/[^/]+\/inputs$/.test(path) &&
         response.status === 202
       ) {
         const receipt = (await response.clone().json()) as {
@@ -191,13 +223,15 @@ export async function createStandaloneFactoryServer(
     },
   });
 
+  startDrain();
+
   return {
     server,
     factory,
     database,
     async close(force = true) {
       server.stop(force);
-      await dispatching?.catch(() => {});
+      while (dispatching) await dispatching.catch(() => {});
       await Promise.all(
         [...opening.values()].map((pending) =>
           pending.then(
