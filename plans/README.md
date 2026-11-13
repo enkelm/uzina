@@ -4,19 +4,19 @@ Implement the scope in `SPEC.md` through the slices below. A slice is complete o
 
 ## Slice ledger
 
-| Slice | Outcome                                                                                    | Dependencies                           | Status                        |
-| ----- | ------------------------------------------------------------------------------------------ | -------------------------------------- | ----------------------------- |
-| 0     | Bun workspace foundation, initial validated contracts, repeatable checks                   | None                                   | Complete                      |
-| 1     | Persistent Pi Durable under Bun and Cloudflare; early managed-checkpoint feasibility proof | 0                                      | In progress                   |
-| 2     | Authenticated execution daemon, explicit workspace jobs, Rex lifecycle                     | 0                                      | In progress                   |
-| 3     | Owner-authenticated Factory commands, durable receipts, committed events                   | 0                                      | In progress                   |
-| 4     | Cloud-managed Pi executes a bounded tool on a selected laptop                              | 1, 2, 3                                | Not started                   |
-| 5     | Minimal operational PWA with retained request identities and reconnect handling            | 3, 4                                   | Not started                   |
-| 6     | Persistent invitations, scoped roles, revocation, subscription enforcement                 | 3                                      | Not started                   |
-| 7     | MCP tools and private Factory assistant using ordinary authorized operations               | 1, 3, 4                                | Not started                   |
-| 8     | Coherent workspace and managed-runtime checkpoints; validated inactive restore             | 1, 2; workspace work can start after 0 | Workspace portion in progress |
-| 9     | Safely relocate workspace execution between nodes                                          | 4, 8                                   | Not started                   |
-| 10    | Transfer supported managed work from cloud to standalone local execution                   | 8, 9                                   | Not started                   |
+| Slice | Outcome                                                                                    | Dependencies                           | Status                                          |
+| ----- | ------------------------------------------------------------------------------------------ | -------------------------------------- | ----------------------------------------------- |
+| 0     | Bun workspace foundation, initial validated contracts, repeatable checks                   | None                                   | Complete                                        |
+| 1     | Persistent Pi Durable under Bun and Cloudflare; early managed-checkpoint feasibility proof | 0                                      | Integrated; pending review                      |
+| 2     | Authenticated execution daemon, explicit workspace jobs, Rex lifecycle                     | 0                                      | Integrated; pending review                      |
+| 3     | Owner-authenticated Factory commands, durable receipts, committed events                   | 0                                      | Integrated; pending review                      |
+| 4     | Cloud-managed Pi executes a bounded tool on a selected laptop                              | 1, 2, 3                                | Not started                                     |
+| 5     | Minimal operational PWA with retained request identities and reconnect handling            | 3, 4                                   | Not started                                     |
+| 6     | Persistent invitations, scoped roles, revocation, subscription enforcement                 | 3                                      | Not started                                     |
+| 7     | MCP tools and private Factory assistant using ordinary authorized operations               | 1, 3, 4                                | Not started                                     |
+| 8     | Coherent workspace and managed-runtime checkpoints; validated inactive restore             | 1, 2; workspace work can start after 0 | Workspace foundation integrated; pending review |
+| 9     | Safely relocate workspace execution between nodes                                          | 4, 8                                   | Not started                                     |
+| 10    | Transfer supported managed work from cloud to standalone local execution                   | 8, 9                                   | Not started                                     |
 
 ## Execution rules
 
@@ -39,6 +39,23 @@ Slice 0 adds a Bun 1.4.4 workspace, frozen lockfile, validated shared schemas, H
 Foundation review: the parent independently reran frozen install, formatting check, typecheck, all 8 tests, and both builds successfully. Parallel implementation agreements are recorded in `plans/integration-contracts.md`.
 
 Early feasibility: Pi Durable/chord 1.4.0 supplies public storage records and a Cloudflare SQLite adapter, but no first-party Bun driver or complete managed-work checkpoint exporter. Runtime and checkpoint lanes must prove these missing pieces or explicitly report unsupported states.
+
+## Integration checkpoint
+
+Slices 1, 2, 3, and the workspace portion of 8 have been copied into the main workspace for review. These are foundation modules, not completed user-facing slices. No slice-4 Factory-to-Pi-to-node execution bridge or ownership transfer is implemented. See `plans/integration-contracts.md`, `packages/pi-runtime/README.md`, `packages/checkpoints/README.md`, and `packages/core/README.md` for public interfaces, profiles, and remaining integration boundaries.
+
+Operator blockers: `bunx wrangler whoami` reported `You are not authenticated` (exit 0); laptop B is not established. There is no production Cloudflare binding/deployment evidence, no live model call, and no node-to-controller execution proof.
+
+Integration validation in the main checkout:
+
+- `bun install` — passed; reconciled workspace dependencies and saved `bun.lock` (96 packages installed).
+- `bun install --frozen-lockfile` — passed; checked 149 installs across 228 packages with no changes.
+- `bun run format` — passed; formatted the integrated sources and docs.
+- `bun run check` — passed; all selected TypeScript, JSON, and README files conform to Prettier.
+- `bun run typecheck` — passed (`tsc --noEmit`).
+- `bun run test` — passed: 61 tests across 11 files, 420 assertions, including Bun SQLite persistence/execution/Factory/workspace checkpoint tests and the Miniflare workerd Durable Object eviction/recovery test.
+- `bun run build` — passed: Bun daemon bundle (13 modules, 115.68 KiB) and Wrangler dry-run Worker bundle (126.46 KiB upload, 21.00 KiB gzip). Wrangler printed `No bindings found`; this does not validate ManagedWork or Factory Durable Object bindings or deployment.
+- `git diff --check` — passed.
 
 ## Workflow
 

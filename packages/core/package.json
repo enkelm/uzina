@@ -1,0 +1,15 @@
+{
+  "name": "@uzina/core",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./http": "./src/http.ts",
+    "./database": "./src/database.ts"
+  },
+  "dependencies": {
+    "@uzina/contracts": "workspace:*",
+    "zod": "^3.25.76"
+  }
+}

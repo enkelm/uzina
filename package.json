@@ -8,8 +8,8 @@
     "apps/*"
   ],
   "scripts": {
-    "format": "prettier --write \"README.md\" \"GLOSSARY.md\" \"plans/README.md\" \"package.json\" \"tsconfig.json\" \"apps/**/*.ts\" \"apps/**/package.json\" \"packages/**/*.ts\" \"packages/**/package.json\" \"packages/**/tsconfig*.json\"",
-    "check": "prettier --check \"README.md\" \"GLOSSARY.md\" \"plans/README.md\" \"package.json\" \"tsconfig.json\" \"apps/**/*.ts\" \"apps/**/package.json\" \"packages/**/*.ts\" \"packages/**/package.json\" \"packages/**/tsconfig*.json\"",
+    "format": "prettier --write \"README.md\" \"GLOSSARY.md\" \"plans/README.md\" \"packages/**/README.md\" \"package.json\" \"tsconfig.json\" \"apps/**/*.ts\" \"apps/**/package.json\" \"packages/**/*.ts\" \"packages/**/package.json\" \"packages/**/tsconfig*.json\"",
+    "check": "prettier --check \"README.md\" \"GLOSSARY.md\" \"plans/README.md\" \"packages/**/README.md\" \"package.json\" \"tsconfig.json\" \"apps/**/*.ts\" \"apps/**/package.json\" \"packages/**/*.ts\" \"packages/**/package.json\" \"packages/**/tsconfig*.json\"",
     "typecheck": "tsc --noEmit",
     "test": "bun test packages apps",
     "build": "bun run build:daemon && bun run build:cloudflare",

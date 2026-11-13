@@ -1,6 +1,6 @@
 # Uzina
 
-Slice 0 establishes a Bun workspace, validated shared contracts, and minimal Bun and Cloudflare HTTP entrypoints. The entrypoints expose `GET /health` and `POST /identity`; the identity route validates a versioned actor declaration and is not authentication or proof of caller identity.
+The Bun workspace has integrated the initial managed Pi runtime, execution-daemon, Factory Core, and workspace-checkpoint foundations. These are pending review and remain separate modules; the root daemon and Cloudflare entry points are still the slice-0 health/identity applications. `GET /health` and `POST /identity` do not provide authentication or prove caller identity.
 
 ## Local verification
 
@@ -24,6 +24,15 @@ bun run build
 - Execution targets name both a node and workspace; admissions and outcomes carry an ownership generation.
 - Capability descriptions state whether reattachment, native resume, managed checkpoint recovery, steering, or stopping is supported.
 
+## Integrated foundation seams (not yet composed)
+
+- `@uzina/pi-runtime` and `@uzina/pi-runtime/checkpoint` provide a Bun-compatible Pi Durable facade and the supported `quiescent-current-documents-no-forks-v1` managed-work checkpoint profile. Cloudflare Miniflare/workerd coverage exercises its Durable Object alarm/recovery adapter.
+- `@uzina/core` and `@uzina/contracts/factory` provide owner-authenticated Factory operations, persistent receipts/events, and an injected managed-runtime dispatch seam. Local Bun SQLite and a Cloudflare Durable Object adapter exist.
+- `@uzina/contracts/execution` and `apps/daemon/src/execution` provide explicit node/workspace job schemas, a persistent local execution daemon, an outbound HTTP connector, and Rex process lifecycle handling.
+- `@uzina/checkpoints` captures and validates workspace Git/filesystem state and restores an inactive checkout.
+
+The package READMEs describe public seams and restrictions. These modules are not yet composed into root application entry points. Factory node routes and the execution connector currently use incompatible register/heartbeat/claim/report payloads; the Factory queue also carries managed Pi input rather than executor operations. Bridging those is an explicit slice 4 integration task, not a completed feature. The Worker dry-run does not bind or deploy models or Factory/ManagedWork Durable Objects. Wrangler local-compatible runtime and Miniflare coverage do not establish production deployment, and no second-laptop proof is claimed.
+
 ## Constraints not implemented yet
 
-Authentication, authorization, persistence, command deduplication, dispatch, effect completion, node registration, workspace access, and ownership fencing remain unwritten. Health and identity do not imply those behaviors. The automated Worker test exercises the entrypoint directly; Wrangler's local-compatible runtime is a development tool, not evidence of production Cloudflare Durable Object behavior or deployment. Pi Durable compatibility, managed execution, transfer, and actual cloud/laptop deployment remain later work.
+The integrated foundations do not make authentication, authorization, durable behavior, dispatch, effect completion, node registration, workspace access, or ownership fencing available through the root applications. Health and identity do not imply those behaviors. The root Worker test exercises the slice-0 entrypoint directly. Actual Cloudflare Durable Object deployment, managed execution across nodes, checkpoint transfer ownership, and actual cloud/laptop deployment remain later work.

@@ -1,0 +1,28 @@
+# Workspace checkpoints (format version 1)
+
+This leaf package captures and restores the **workspace** portion of a checkpoint. It does not serialize, interpret, or prove that a transcript is a managed Pi checkpoint. The opaque `runtimeArtifact` slot is versioned and integrity checked; lane A supplies its bytes, media type, format version, and compatibility requirements. Named attachments use the same content-addressed transport and are returned as opaque bytes at restore.
+
+## Public API
+
+- `captureWorkspaceCheckpoint({ workspacePath, transport, includeGlobs?, excludeGlobs?, limits?, runtimeArtifact?, attachments? })` returns `{ manifest, manifestReference }`.
+- `loadWorkspaceCheckpoint(manifestReference, transport)` loads and verifies the content-addressed JSON manifest.
+- `validateWorkspaceCheckpoint(manifest, transport, options?)` validates format, compatibility, paths, bounds, and every referenced blob before a destination is considered.
+- `previewWorkspaceCheckpoint(manifest, transport, options?)` returns the validation result and a summary containing selected file count/bytes, Git HEAD/branch, declared policy, omissions, and opaque artifact/attachment names. Pass `destinationPath` in preview options to include the empty-destination check.
+- `restoreWorkspaceCheckpoint({ manifest, transport, destinationPath, ...options })` restores into a nonexistent or empty destination and returns the opaque runtime artifact and attachment bytes without activating anything or running commands.
+- `BlobTransport` is the pluggable content-addressed interface (`putBlob`/`getBlob`). `FileBlobTransport` implements it in a local directory using SHA-256 filenames.
+
+A blob transport must store immutable bytes under their lowercase SHA-256 digest and reject unavailable/corrupt objects. Cloud blob adapters should implement that interface and enforce their own request/response streaming limits. `FileBlobTransport` storage must be outside the captured workspace to avoid recursively capturing its own blobs. The manifest is itself stored as a blob; consumers persist its returned `manifestReference`.
+
+For a runtime artifact, the destination must explicitly provide `supportedRuntimeFormats` and every supported `supportedRuntimeRequirements` string. This package does not treat an arbitrary artifact or transcript as executable/runtime state.
+
+## Captured filesystem and Git shape
+
+The workspace root must be the root of a non-shallow, non-empty Git checkout. Regular working files, selected untracked files, internal relative symlinks, binary bytes, and the executable bit are represented as logical relative-path entries. File permission bits other than executable are not preserved. Paths are portable UTF-8 relative paths; absolute paths, `.git`, traversal, Windows-reserved names, alternate separators, non-UTF-8 names, and symlinks escaping the root or traversing another captured symlink are rejected. Nested repositories, submodules, unresolved merge conflicts, sparse/split indexes, intent-to-add, assume-unchanged, and skip-worktree index states are refused.
+
+A Git bundle stores commits/history reachable from all Git refs plus the current HEAD; a binary staged patch stores selected index changes relative to HEAD. Restoring applies that patch to the index, then materializes the selected working tree. This preserves ordinary staged and unstaged differences, staged deletions/additions, and selected untracked files. The restore is a normal inactive checkout, not a linked-worktree registration; source worktree administrative files, absolute worktree paths, remotes, reflogs, Git configuration, hooks, and machine-local Git state are not copied. Bundle restoration uses argv-based Git commands with system/global config disabled, an empty hook template, and no shell interpolation.
+
+The manifest declares `includeGlobs` (null means all paths) and `excludeGlobs`; default exclusions omit `.env`/`.env.*`, credential/auth filenames, `.pi/agent/**`, `.ssh/**`, and `node_modules/**`. Each excluded, out-of-scope, or over-file-limit path is reported in `workspace.omissions`. Glob syntax supports `*`, `?`, and `**` over slash-separated relative paths. The workspace is never swept beyond its selected checkout. Still, **arbitrary selected files and attachments may contain secrets**. In addition, preserving Git history necessarily preserves content reachable through its refs, including old committed content: this format cannot both retain those refs/history and redact secrets previously committed there. Inspect scope and history before publishing a bundle.
+
+Hard bounds are 100,000 workspace files, 200,000 traversed paths, 10,000 omission records, 64 MiB per workspace file, 32 MiB per runtime artifact or attachment, 512 MiB total checkpoint data, and 16 MiB serialized manifest. Callers may lower but not raise capture limits. A selected file exceeding its per-file bound is omitted and reported; aggregate/resource-count overflow refuses capture. Git bundles and staged patches count toward total size.
+
+Before destination effects, restore validates supported format/capabilities/Git/runtime requirements, bounds, duplicate/conflicting paths, traversal and symlink targets, every content hash/size, the Git HEAD and staged path set, and that the destination is nonexistent or empty. It prepares a sibling staging checkout and only then replaces the empty destination. A restore is left inactive; ownership fencing/transfer and runtime activation belong to higher-level orchestration.

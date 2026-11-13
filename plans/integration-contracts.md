@@ -43,6 +43,21 @@ The inspected Pi Durable/chord version is 1.4.0. Pin compatible runtime packages
 
 Pi Durable exposes record scans and `commit` rather than a complete export/import operation. Public records include conversation/task/entry/submission/document state; document historical semantics and global IDs are important limitations. First prove a versioned supported checkpoint profile into an empty inactive store, including canonical model context and request deduplication. Explicitly refuse unsupported histories, active tasks, unknown definitions, or conflicting destination IDs rather than claiming that transcript copying is a move. Preserve owned descendants and supported task checkpoints where the public storage contract can prove correctness. Report an upstream blocker if required history cannot be represented safely.
 
+## Integrated foundations: slice 4 remains unconnected
+
+The initial four foundations are now composed into the Bun workspace without composing their business paths into the root Worker/daemon. They expose independent package seams; their implementation status is pending review. In particular, the Factory and execution lanes use incompatible protocols on the same reserved node routes:
+
+| Operation | Factory Core route payload | Execution connector payload |
+| --- | --- | --- |
+| register | `{}` | version, authenticated node ID, daemon version, workspace generation/state reports, capability set |
+| heartbeat | `{}` | version, node ID, timestamp, workspace reports, capability set |
+| claim | `{}` -> `FactoryQueueJob \| null` | version/node ID -> `ExecutionJob \| null` |
+| report | workspace ID, generation, terminal status, optional detail | job/node/target/generation, status, payload SHA-256, completion time, and result/error/reconciliation evidence |
+
+`FactoryQueueJob.input` is `{ kind: "managed-input", text }`; it is not an execution operation. Execution jobs are `read-file`, `write-file`, or bounded `argv-command`. They happen to use `contractVersion: 1` but are not wire-compatible. `HttpExecutionControllerConnector` validates against `@uzina/contracts/execution`; Factory's own node routes validate the Factory shapes. Do not silently make the connector call Factory routes or treat Factory queue claims as executable tool jobs.
+
+Slice 4 must explicitly implement the controller-side node API matching the execution schemas and authenticate node credentials before any report/claim effects; bridge managed Pi's remote tool executor to the execution connector with bounded, explicit node/workspace targets; and separately connect Factory `ManagedRuntimeDispatch` to managed Pi's stable submission IDs, receipts, and status. Add end-to-end proof of that wiring and its authorization/generation checks before claiming connected execution. Root startup currently remains slice 0, and neither root entry point activates these modules. See `packages/core/README.md` for public path names and per-route detail.
+
 ## Validation and handoff
 
 - Each lane runs its focused tests and typechecking with actual storage/platform adapters where applicable.
