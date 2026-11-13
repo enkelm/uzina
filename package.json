@@ -1,0 +1,27 @@
+{
+  "name": "uzina",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.4.4",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "format": "prettier --write \"README.md\" \"GLOSSARY.md\" \"plans/README.md\" \"package.json\" \"tsconfig.json\" \"apps/**/*.ts\" \"apps/**/package.json\" \"packages/**/*.ts\" \"packages/**/package.json\" \"packages/**/tsconfig*.json\"",
+    "check": "prettier --check \"README.md\" \"GLOSSARY.md\" \"plans/README.md\" \"package.json\" \"tsconfig.json\" \"apps/**/*.ts\" \"apps/**/package.json\" \"packages/**/*.ts\" \"packages/**/package.json\" \"packages/**/tsconfig*.json\"",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test packages apps",
+    "build": "bun run build:daemon && bun run build:cloudflare",
+    "build:daemon": "bun build apps/daemon/src/index.ts --target=bun --outdir=build/daemon",
+    "build:cloudflare": "wrangler deploy --dry-run --config apps/cloudflare/wrangler.toml --outdir build/cloudflare",
+    "dev:daemon": "bun --watch apps/daemon/src/index.ts",
+    "dev:cloudflare": "wrangler dev --local --ip 127.0.0.1 --config apps/cloudflare/wrangler.toml"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.21",
+    "prettier": "^3.6.2",
+    "typescript": "^5.9.2",
+    "wrangler": "^4.34.0"
+  }
+}

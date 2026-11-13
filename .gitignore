@@ -1,0 +1,26 @@
+# Dependencies and generated output
+node_modules/
+build/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Local tooling state
+.pi/subagents/
+.wrangler/
+.wrangler-state/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# OS/editor noise
+.DS_Store
