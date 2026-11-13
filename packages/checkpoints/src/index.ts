@@ -1969,3 +1969,24 @@ async function lstatIfPresent(path: string) {
     throw error;
   }
 }
+
+export { R2BlobTransport } from "./r2";
+export type { ImmutableR2Bucket } from "./r2";
+export {
+  captureManagedWorkBundle,
+  validateManagedWorkBundle,
+  restoreManagedWorkBundle,
+  MANAGED_WORK_ARTIFACT_MEDIA_TYPE,
+  MANAGED_WORK_BUNDLE_FORMAT,
+  MANAGED_WORK_BUNDLE_VERSION,
+  MANAGED_WORK_PROFILE,
+} from "./managed-work";
+export type {
+  CapturedManagedWorkBundle,
+  ManagedWorkBundleManifest,
+  ManagedWorkBundleCaptureOptions,
+  ManagedWorkRestoreStorage,
+  PreparedManagedWorkRestoreReceipt,
+  RestoreManagedWorkBundleOptions,
+  RestoredManagedWorkBundle,
+} from "./managed-work";

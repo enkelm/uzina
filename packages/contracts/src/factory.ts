@@ -49,7 +49,49 @@ export const createThreadRequestSchema = z
     projectId: identifier,
     title: displayName,
     target: factoryTargetSchema,
+    ownerPrivate: z.boolean().optional(),
   })
+  .strict();
+export const accessRoleSchema = z.enum(["owner", "guest", "viewer"]);
+export const participantRoleSchema = z.enum(["guest", "viewer"]);
+export const accessGrantSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("project"), resourceId: identifier }).strict(),
+  z.object({ type: z.literal("thread"), resourceId: identifier }).strict(),
+]);
+const distinctGrants = <T extends z.ZodTypeAny>(schema: T) =>
+  z.array(schema).superRefine((grants, context) => {
+    const seen = new Set<string>();
+    grants.forEach((grant, index) => {
+      const value = grant as { type: string; resourceId: string };
+      const key = `${value.type}:${value.resourceId}`;
+      if (seen.has(key)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [index],
+          message: "Grant targets must be unique",
+        });
+      }
+      seen.add(key);
+    });
+  });
+export const invitationCreateRequestSchema = z
+  .object({
+    role: participantRoleSchema,
+    grants: distinctGrants(accessGrantSchema),
+    expiresAt: z.string().datetime(),
+  })
+  .strict();
+export const invitationRedeemRequestSchema = z
+  .object({ code: z.string().min(1).max(256), displayName })
+  .strict();
+export const participantAccessRequestSchema = z
+  .object({
+    role: participantRoleSchema,
+    grants: distinctGrants(accessGrantSchema),
+  })
+  .strict();
+export const discussionPostRequestSchema = z
+  .object({ text: z.string().trim().min(1).max(20_000) })
   .strict();
 export const submitInputRequestSchema = z
   .object({
@@ -89,7 +131,42 @@ export const factoryThreadSchema = z.object({
   projectId: identifier,
   title: displayName,
   target: factoryTargetSchema,
+  ownerPrivate: z.boolean().default(false),
   ownershipGeneration: z.number().int().nonnegative().safe(),
+  createdAt: z.string().datetime(),
+});
+export const factoryParticipantSchema = z.object({
+  userId: identifier,
+  displayName,
+  role: accessRoleSchema,
+  revokedAt: z.string().datetime().nullable(),
+  grants: z.array(accessGrantSchema),
+  createdAt: z.string().datetime(),
+});
+export const factoryInvitationSchema = z.object({
+  invitationId: identifier,
+  role: participantRoleSchema,
+  grants: z.array(accessGrantSchema),
+  expiresAt: z.string().datetime(),
+  redeemedAt: z.string().datetime().nullable(),
+  redeemedBy: identifier.nullable(),
+  revokedAt: z.string().datetime().nullable(),
+  createdAt: z.string().datetime(),
+});
+export const invitationRedemptionResponseSchema = z.object({
+  contractVersion: z.literal(CONTRACT_VERSION),
+  participant: factoryParticipantSchema,
+  credentialId: identifier,
+  credentialName: displayName,
+  credential: z.string().min(1),
+  actor: factoryActorSchema,
+});
+export const discussionEntrySchema = z.object({
+  discussionId: identifier,
+  threadId: identifier,
+  actor: factoryActorSchema,
+  displayName,
+  text: z.string(),
   createdAt: z.string().datetime(),
 });
 
@@ -129,6 +206,7 @@ export const factoryQueueJobSchema = z.object({
 });
 export const factoryEventSchema = z.object({
   ...versioned,
+  // Owner cursors use the durable sequence; participant cursors are scope-local and generation-bound.
   cursor: z.number().int().positive().safe(),
   type: z.enum([
     "factory.bootstrapped",
@@ -147,6 +225,12 @@ export const factoryEventSchema = z.object({
     "dispatch.failed",
     "dispatch.uncertain",
     "credential.revoked",
+    "invitation.created",
+    "invitation.revoked",
+    "invitation.redeemed",
+    "participant.access_changed",
+    "participant.revoked",
+    "discussion.posted",
     "execution.accepted",
     "execution.completed",
     "execution.failed",
@@ -173,6 +257,11 @@ export type FactoryProject = z.infer<typeof factoryProjectSchema>;
 export type FactoryNode = z.infer<typeof factoryNodeSchema>;
 export type FactoryWorkspace = z.infer<typeof factoryWorkspaceSchema>;
 export type FactoryThread = z.infer<typeof factoryThreadSchema>;
+export type AccessGrant = z.infer<typeof accessGrantSchema>;
+export type ParticipantRole = z.infer<typeof participantRoleSchema>;
+export type FactoryParticipant = z.infer<typeof factoryParticipantSchema>;
+export type FactoryInvitation = z.infer<typeof factoryInvitationSchema>;
+export type DiscussionEntry = z.infer<typeof discussionEntrySchema>;
 export type FactoryDispatchStatus = z.infer<typeof factoryDispatchStatusSchema>;
 export type FactoryCommandReceipt = z.infer<typeof factoryCommandReceiptSchema>;
 export type FactoryQueueJob = z.infer<typeof factoryQueueJobSchema>;

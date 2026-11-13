@@ -46,12 +46,12 @@ Tool results are correlated from the immutable node receipt into the Pi tool-res
 
 ## Logical checkpoint support
 
-`@uzina/pi-runtime/checkpoint` exports `exportManagedWorkCheckpoint()` and `importManagedWorkCheckpoint()` for the versioned profile `quiescent-current-documents-no-forks-v1`:
+`@uzina/pi-runtime/checkpoint` exports `exportManagedWorkCheckpoint()`, `validateManagedWorkCheckpoint()`, and `importManagedWorkCheckpoint()` for the versioned profile `quiescent-current-documents-no-forks-v1`. `ManagedPiWork.exportCheckpoint()` reads this supported logical profile from its public `Storage` without opening or resuming a task. The composite `@uzina/checkpoints` API places that exported artifact and the workspace packer in one validated bundle.
 
 - Export is limited to the upstream reserved `ROOT_CONVERSATION_ID` (1), which is unowned and has no parent, and its owned conversation/task closure. Other ownerless conversations are not managed roots. Task records must be terminal, submission receipts settled, and no session-scoped document may be present.
 - Export refuses active, sleeping, parked, or otherwise uncertain tasks and rejects conversations that are forked or have parent-history dependencies.
 - The profile copies canonical conversation entries, settled request receipts, terminal task records, and current values of conversation/task documents through Pi Durable's public storage API. It is not a byte-for-byte database export and does not preserve prior document revisions or provide arbitrary historical `asOf` reconstruction.
-- Import verifies the version/checksum and rejects checkpoints whose root is not the reserved ID. It requires an exclusively held, genuinely fresh destination; no concurrent writer may use it between validation and import. Import does not activate work or transfer ownership. Workspace files, credentials, deployment bindings, and execution authority are not included.
+- Import verifies the version/checksum and record graph and rejects checkpoints whose root is not the reserved ID. It requires an exclusively held, genuinely fresh destination; no concurrent writer may use it between validation and import. Composite restore imports into an owned temporary raw Storage and never constructs a Harness, calls models/tools, or activates work. Import does not transfer ownership. Factory provenance is carried separately as an opaque attachment; users, bearer keys, provider credentials/settings, deployment bindings, and execution authority are not imported.
 
 Pi Durable `1.4.0` has no full public storage exporter/importer, so broader checkpoint semantics remain unsupported until upstream exposes the needed logical history/fork records. Keep broader profiles fail-closed rather than copying SQLite internals.
 

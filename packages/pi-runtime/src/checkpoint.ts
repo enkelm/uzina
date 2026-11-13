@@ -452,6 +452,18 @@ function validateCheckpointGraph(checkpoint: ManagedWorkCheckpoint): void {
  * `mintId` proves the global ID space has no prior allocation above reserved ID 1;
  * inspect ID 1 separately because it is not returned by the allocator.
  */
+export async function validateManagedWorkCheckpoint(
+  value: unknown,
+): Promise<ManagedWorkCheckpoint> {
+  assertCheckpoint(value);
+  const { sha256, ...body } = value;
+  if ((await checksum(body)) !== sha256) {
+    throw new Error("Managed-work checkpoint checksum mismatch");
+  }
+  validateCheckpointGraph(value);
+  return value;
+}
+
 async function assertFreshStorage(
   storage: Storage,
   context: Context,
@@ -487,29 +499,27 @@ export async function importManagedWorkCheckpoint(
   value: unknown,
   context: Context = BACKGROUND_CONTEXT,
 ): Promise<{ rootConversationId: ConversationId; imported: number }> {
-  assertCheckpoint(value);
-  const { sha256, ...body } = value;
-  if ((await checksum(body)) !== sha256) {
-    throw new Error("Managed-work checkpoint checksum mismatch");
-  }
-  validateCheckpointGraph(value);
+  const checkpoint = await validateManagedWorkCheckpoint(value);
   await assertFreshStorage(storage, context);
 
   const writes: StorageWrite[] = [
-    ...value.conversations.map((record) => ({
+    ...checkpoint.conversations.map((record) => ({
       type: "conversation" as const,
       value: record,
     })),
-    ...value.entries.map((record) => ({
+    ...checkpoint.entries.map((record) => ({
       type: "entry" as const,
       value: record,
     })),
-    ...value.tasks.map((record) => ({ type: "task" as const, value: record })),
-    ...value.submissions.map((record) => ({
+    ...checkpoint.tasks.map((record) => ({
+      type: "task" as const,
+      value: record,
+    })),
+    ...checkpoint.submissions.map((record) => ({
       type: "submission" as const,
       value: record,
     })),
-    ...value.documents.map((document) => ({
+    ...checkpoint.documents.map((document) => ({
       type: "document.create" as const,
       record: documentCreate(document.record),
       content: {
@@ -521,7 +531,7 @@ export async function importManagedWorkCheckpoint(
   ];
   await storage.commit(writes, context);
   return {
-    rootConversationId: value.rootConversationId,
+    rootConversationId: checkpoint.rootConversationId,
     imported: writes.length,
   };
 }

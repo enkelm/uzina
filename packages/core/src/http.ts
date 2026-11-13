@@ -4,6 +4,10 @@ import {
   createProjectRequestSchema,
   createThreadRequestSchema,
   createWorkspaceRequestSchema,
+  discussionPostRequestSchema,
+  invitationCreateRequestSchema,
+  invitationRedeemRequestSchema,
+  participantAccessRequestSchema,
   provisionCredentialRequestSchema,
   provisionNodeRequestSchema,
   submitInputRequestSchema,
@@ -97,6 +101,19 @@ export function createFactoryHttpHandler(
         const result = await factory.bootstrap(secret, input.name);
         return json({ contractVersion: CONTRACT_VERSION, ...result }, 201);
       }
+      if (
+        request.method === "POST" &&
+        url.pathname === "/v1/invitations/redeem"
+      ) {
+        const input = await body(request, invitationRedeemRequestSchema);
+        return json(
+          {
+            contractVersion: CONTRACT_VERSION,
+            ...(await factory.redeemInvitation(input.code, input.displayName)),
+          },
+          201,
+        );
+      }
 
       const credential = bearer(request);
       if (!credential)
@@ -112,6 +129,7 @@ export function createFactoryHttpHandler(
         return json({
           contractVersion: CONTRACT_VERSION,
           actor: session.actor,
+          participant: factory.currentParticipant(session),
         });
       if (request.method === "GET" && path === "/v1/projects")
         return json({
@@ -184,7 +202,7 @@ export function createFactoryHttpHandler(
       );
       if (request.method === "GET" && managedQueryMatch) {
         const threadId = decodeURIComponent(managedQueryMatch[1]!);
-        const thread = factory.getAuthorizedThread(session, threadId);
+        factory.getAuthorizedThread(session, threadId);
         if (!managedWork) {
           throw new FactoryError(503, "managed_runtime_unavailable");
         }
@@ -192,7 +210,12 @@ export function createFactoryHttpHandler(
           managedQueryMatch[2] === "context"
             ? await managedWork.context(threadId)
             : await managedWork.status(threadId);
-        return json({ contractVersion: CONTRACT_VERSION, thread, runtime });
+        const currentThread = factory.getAuthorizedThread(session, threadId);
+        return json({
+          contractVersion: CONTRACT_VERSION,
+          thread: currentThread,
+          runtime,
+        });
       }
       const inputMatch = path.match(/^\/v1\/threads\/([^/]+)\/inputs$/);
       if (request.method === "POST" && inputMatch) {
@@ -204,6 +227,29 @@ export function createFactoryHttpHandler(
           input.text,
         );
         return json(receipt, 202);
+      }
+      const discussionMatch = path.match(
+        /^\/v1\/threads\/([^/]+)\/discussion$/,
+      );
+      if (request.method === "GET" && discussionMatch) {
+        return json({
+          contractVersion: CONTRACT_VERSION,
+          discussion: factory.listDiscussion(
+            session,
+            decodeURIComponent(discussionMatch[1]!),
+          ),
+        });
+      }
+      if (request.method === "POST" && discussionMatch) {
+        const input = await body(request, discussionPostRequestSchema);
+        return json(
+          factory.postDiscussion(
+            session,
+            decodeURIComponent(discussionMatch[1]!),
+            input.text,
+          ),
+          201,
+        );
       }
       const receiptMatch = path.match(/^\/v1\/commands\/([^/]+)$/);
       if (request.method === "GET" && receiptMatch) {
@@ -219,6 +265,55 @@ export function createFactoryHttpHandler(
             numberParameter(url.searchParams.get("limit"), 100),
           ),
         );
+      }
+      if (request.method === "GET" && path === "/v1/people")
+        return json({
+          contractVersion: CONTRACT_VERSION,
+          participants: factory.listParticipants(session),
+        });
+      if (request.method === "GET" && path === "/v1/invitations")
+        return json({
+          contractVersion: CONTRACT_VERSION,
+          invitations: factory.listInvitations(session),
+        });
+      if (request.method === "POST" && path === "/v1/invitations") {
+        const input = await body(request, invitationCreateRequestSchema);
+        const created = await factory.createInvitation(session, input);
+        return json({ contractVersion: CONTRACT_VERSION, ...created }, 201);
+      }
+      const invitationRevokeMatch = path.match(
+        /^\/v1\/invitations\/([^/]+)\/revoke$/,
+      );
+      if (request.method === "POST" && invitationRevokeMatch) {
+        factory.revokeInvitation(
+          session,
+          decodeURIComponent(invitationRevokeMatch[1]!),
+        );
+        return json({ contractVersion: CONTRACT_VERSION, status: "revoked" });
+      }
+      const participantAccessMatch = path.match(
+        /^\/v1\/people\/([^/]+)\/access$/,
+      );
+      if (request.method === "PUT" && participantAccessMatch) {
+        const input = await body(request, participantAccessRequestSchema);
+        return json(
+          factory.setParticipantAccess(
+            session,
+            decodeURIComponent(participantAccessMatch[1]!),
+            input.role,
+            input.grants,
+          ),
+        );
+      }
+      const participantRevokeMatch = path.match(
+        /^\/v1\/people\/([^/]+)\/revoke$/,
+      );
+      if (request.method === "POST" && participantRevokeMatch) {
+        factory.revokeParticipant(
+          session,
+          decodeURIComponent(participantRevokeMatch[1]!),
+        );
+        return json({ contractVersion: CONTRACT_VERSION, status: "revoked" });
       }
       if (request.method === "GET" && path === "/v1/credentials")
         return json({

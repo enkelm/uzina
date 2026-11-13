@@ -1,5 +1,11 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync } from "node:fs";
+import { realpath } from "node:fs/promises";
+import {
+  captureManagedWorkBundle,
+  type BlobTransport,
+  type CapturedManagedWorkBundle,
+} from "@uzina/checkpoints";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -17,6 +23,11 @@ export interface StandaloneFactoryServer {
   server: ReturnType<typeof Bun.serve>;
   factory: FactoryService;
   database: BunFactoryDatabase;
+  captureManagedWorkCheckpoint(input: {
+    credential: string;
+    threadId: string;
+    transport: BlobTransport;
+  }): Promise<CapturedManagedWorkBundle & { captureId: string }>;
   close(force?: boolean): Promise<void>;
 }
 
@@ -29,6 +40,18 @@ export type StandaloneFactoryOptions = {
   modelId: string;
   port?: number;
   hostname?: string;
+  /** Trusted local mappings; capture refuses ambiguous physical workspace aliases. */
+  workspaceDirectories?: Readonly<Record<string, string>>;
+  /** Must durably quiesce the selected local/remote writer and supported Rex activity. */
+  workspaceCaptureQuiescence?: {
+    acquire(
+      workspaceId: string,
+      captureId: string,
+    ): Promise<{
+      workspacePath: string;
+      release(): void | Promise<void>;
+    }>;
+  };
 };
 
 function stableFilePart(value: string): string {
@@ -66,8 +89,14 @@ export async function createStandaloneFactoryServer(
   const opening = new Map<string, Promise<ManagedPiWork>>();
   let dispatching: Promise<void> | undefined;
   let drainRequested = false;
+  let activeCaptures = 0;
+  let closing = false;
+  const captureWaiters: Array<() => void> = [];
 
-  const openWork = async (threadId: string): Promise<ManagedPiWork> => {
+  const openWork = async (
+    threadId: string,
+    resume = true,
+  ): Promise<ManagedPiWork> => {
     const current = work.get(threadId);
     if (current) return current;
     const inFlight = opening.get(threadId);
@@ -99,7 +128,9 @@ export async function createStandaloneFactoryServer(
         }),
       });
       try {
-        await opened.resume();
+        if (resume && !factory.isManagedWorkCapturing(threadId)) {
+          await opened.resume();
+        }
         work.set(threadId, opened);
         return opened;
       } catch (error) {
@@ -229,8 +260,109 @@ export async function createStandaloneFactoryServer(
     server,
     factory,
     database,
+    async captureManagedWorkCheckpoint({ credential, threadId, transport }) {
+      if (closing) throw new Error("Standalone Factory is closing");
+      activeCaptures += 1;
+      try {
+        const session = await factory.authenticate(credential);
+        const { captureId, thread } = factory.beginManagedWorkCapture(
+          session,
+          threadId,
+        );
+        let managed: ManagedPiWork | undefined;
+        let releaseWorkspace: (() => void | Promise<void>) | undefined;
+        try {
+          const workspacePath =
+            options.workspaceDirectories?.[thread.target.workspaceId];
+          if (!workspacePath) {
+            throw new Error(
+              `No trusted local directory is configured for workspace ${thread.target.workspaceId}`,
+            );
+          }
+          const physicalWorkspace = await realpath(workspacePath);
+          for (const [workspaceId, mappedPath] of Object.entries(
+            options.workspaceDirectories ?? {},
+          )) {
+            if (
+              workspaceId !== thread.target.workspaceId &&
+              (await realpath(mappedPath)) === physicalWorkspace
+            ) {
+              throw new Error(
+                `Workspace ${thread.target.workspaceId} shares a local directory with ${workspaceId}`,
+              );
+            }
+          }
+          if (!options.workspaceCaptureQuiescence) {
+            throw new Error(
+              "No trusted workspace-writer/Rex quiescence adapter is configured",
+            );
+          }
+          const workspaceLease =
+            await options.workspaceCaptureQuiescence.acquire(
+              thread.target.workspaceId,
+              captureId,
+            );
+          releaseWorkspace = workspaceLease.release;
+          if (
+            (await realpath(workspaceLease.workspacePath)) !== physicalWorkspace
+          ) {
+            throw new Error(
+              "Capture workspace directory does not match the configured execution-node workspace",
+            );
+          }
+          managed = await openWork(threadId, false);
+          const provenance = factory.getManagedWorkCaptureProvenance(
+            session,
+            threadId,
+            captureId,
+          );
+          const captured = await captureManagedWorkBundle({
+            managedWork: await managed.exportCheckpoint(),
+            compatibilityRequirements: [
+              `model:${options.modelProvider}/${options.modelId}`,
+              "tool:remote_read_file:v1",
+              "tool:remote_write_file:v1",
+              "tool:remote_run_command:v1",
+            ],
+            workspacePath,
+            transport,
+            attachments: [
+              {
+                name: "factory-provenance.json",
+                mediaType: "application/json",
+                bytes: new TextEncoder().encode(JSON.stringify(provenance)),
+              },
+            ],
+          });
+          return { ...captured, captureId };
+        } finally {
+          try {
+            await releaseWorkspace?.();
+          } finally {
+            try {
+              factory.endManagedWorkCapture(session, captureId);
+            } finally {
+              if (managed) await managed.resume();
+            }
+          }
+        }
+      } finally {
+        activeCaptures -= 1;
+        if (activeCaptures === 0) {
+          for (const resolveCapture of captureWaiters.splice(0)) {
+            resolveCapture();
+          }
+        }
+      }
+    },
     async close(force = true) {
+      closing = true;
       server.stop(force);
+      while (activeCaptures > 0) {
+        await new Promise<void>((resolveCapture) =>
+          captureWaiters.push(resolveCapture),
+        );
+      }
       while (dispatching) await dispatching.catch(() => {});
       await Promise.all(
         [...opening.values()].map((pending) =>

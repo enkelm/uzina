@@ -32,6 +32,7 @@ interface RexManagerOptions {
   executable: string;
   resolveWorkspace(workspaceId: string): string;
   assertWorkspaceActive(workspaceId: string, generation: number): void;
+  assertWorkspaceAdmission?(workspaceId: string): void;
 }
 
 function safeErrorCode(error: unknown): string {
@@ -52,6 +53,8 @@ export class RexProcessManager {
   readonly #executable: string;
   readonly #resolveWorkspace: RexManagerOptions["resolveWorkspace"];
   readonly #assertWorkspaceActive: RexManagerOptions["assertWorkspaceActive"];
+  readonly #assertWorkspaceAdmission:
+    RexManagerOptions["assertWorkspaceAdmission"] | undefined;
 
   constructor(options: RexManagerOptions) {
     this.#db = options.database;
@@ -59,6 +62,7 @@ export class RexProcessManager {
     this.#executable = options.executable;
     this.#resolveWorkspace = options.resolveWorkspace;
     this.#assertWorkspaceActive = options.assertWorkspaceActive;
+    this.#assertWorkspaceAdmission = options.assertWorkspaceAdmission;
   }
 
   async launch(input: unknown): Promise<ExecutionRexProcessReceipt> {
@@ -87,6 +91,7 @@ export class RexProcessManager {
         request.target.workspaceId,
         request.ownershipGeneration,
       );
+      this.#assertWorkspaceAdmission?.(request.target.workspaceId);
       const now = new Date().toISOString();
       this.#db
         .query(

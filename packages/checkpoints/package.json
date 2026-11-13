@@ -9,5 +9,9 @@
   "scripts": {
     "test": "bun test src",
     "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@earendil-works/pi-durable": "1.4.0",
+    "@uzina/pi-runtime": "workspace:*"
   }
 }

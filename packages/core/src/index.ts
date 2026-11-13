@@ -1,4 +1,6 @@
 export { FactoryError, FactoryService } from "./factory";
+export { FactoryAccessPolicy } from "./access";
+export type { StoredAccessPrincipal } from "./access";
 export type {
   BootstrapResult,
   DispatchIntent,

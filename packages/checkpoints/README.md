@@ -1,6 +1,6 @@
 # Workspace checkpoints (format version 1)
 
-This leaf package captures and restores the **workspace** portion of a checkpoint. It does not serialize, interpret, or prove that a transcript is a managed Pi checkpoint. The opaque `runtimeArtifact` slot is versioned and integrity checked; lane A supplies its bytes, media type, format version, and compatibility requirements. Named attachments use the same content-addressed transport and are returned as opaque bytes at restore.
+The base `captureWorkspaceCheckpoint` API captures and restores the **workspace** portion of a checkpoint; it does not infer managed state from a transcript or serialize Pi storage. Its opaque `runtimeArtifact` slot is versioned and integrity checked, and named attachments use the same content-addressed transport. The composed managed-work API below adds a separately validated public Pi logical profile.
 
 ## Public API
 
@@ -14,6 +14,14 @@ This leaf package captures and restores the **workspace** portion of a checkpoin
 A blob transport must store immutable bytes under their lowercase SHA-256 digest and reject unavailable/corrupt objects. Cloud blob adapters should implement that interface and enforce their own request/response streaming limits. `FileBlobTransport` storage must be outside the captured workspace to avoid recursively capturing its own blobs. The manifest is itself stored as a blob; consumers persist its returned `manifestReference`.
 
 For a runtime artifact, the destination must explicitly provide `supportedRuntimeFormats` and every supported `supportedRuntimeRequirements` string. This package does not treat an arbitrary artifact or transcript as executable/runtime state.
+
+## Coherent managed-work bundle
+
+`captureManagedWorkBundle({ managedWork, workspacePath, transport, attachments?, compatibilityRequirements? })` composes an already-exported public Pi logical checkpoint with the existing workspace packer. It returns a content-addressed outer manifest using `uzina-coherent-managed-work-checkpoint` version 1. The outer manifest pins `quiescent-current-documents-no-forks-v1`, embeds the complete workspace manifest (Git bundle, staged index patch, selected files/binaries, omissions, integrity hashes), stores the Pi checkpoint as the versioned runtime artifact, and stores named opaque attachments such as Factory command/effect provenance. `validateManagedWorkBundle(reference, transport, { supportedRuntimeRequirements })` verifies the outer checksum, every resource/hash/path, compatibility, Pi checkpoint checksum/graph/profile, and requirements before restore. The Pi runtime requirement is `pi-durable:1.4.0`; composition callers must additionally declare the selected model and tool requirements, which destinations must explicitly support.
+
+`restoreManagedWorkBundle({ manifestReference, transport, destinationPath, supportedRuntimeRequirements, openStorage })` accepts only a missing or empty inactive destination. It stages the workspace and a fresh raw Pi storage under a sibling temporary root, imports logical Pi records without constructing a Harness, writes attachments and a stable `prepared-inactive` receipt, then places the complete root with one directory rename. The prepared root contains `workspace/`, `managed-work.sqlite`, `.uzina/attachments/`, and `.uzina/prepared-restore.json`. Repeating the same bundle restore returns the same receipt without importing again. It never calls a model/tool or starts a scheduler. Callers must explicitly activate only after separate authorization; the receipt is preparation evidence, not ownership transfer.
+
+The local `FileBlobTransport` remains the supported offline file transport. `R2BlobTransport` is a small structural adapter for R2-compatible `put/get` APIs; it writes by SHA-256 name with an `If-None-Match: *` precondition, verifies duplicate content, and checks every read. The adapter has a real Miniflare R2/workerd test. No production Worker R2 binding, remote capture RPC, source/destination orchestration, Cloudflare-to-laptop capture, or execution-ownership transfer is implemented by this increment.
 
 ## Captured filesystem and Git shape
 

@@ -286,6 +286,11 @@ export class ExecutionDaemon {
       );
       CREATE INDEX IF NOT EXISTS execution_jobs_workspace_status
         ON execution_jobs(workspace_id, status);
+      CREATE TABLE IF NOT EXISTS execution_workspace_captures (
+        workspace_id TEXT PRIMARY KEY,
+        capture_id TEXT NOT NULL UNIQUE,
+        started_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS execution_rex_processes (
         process_id TEXT PRIMARY KEY,
         payload_sha256 TEXT NOT NULL,
@@ -370,6 +375,8 @@ export class ExecutionDaemon {
         resolveWorkspace: (workspaceId) => this.#workspaceRoot(workspaceId),
         assertWorkspaceActive: (workspaceId, generation) =>
           this.#assertWorkspaceActive(workspaceId, generation),
+        assertWorkspaceAdmission: (workspaceId) =>
+          this.#assertWorkspaceAdmission(workspaceId),
       });
     } catch (error) {
       this.#db.close();
@@ -440,6 +447,7 @@ export class ExecutionDaemon {
       }
       const workspace = this.#workspaceRow(job.target.workspaceId);
       this.#assertActiveRow(workspace, job.ownershipGeneration);
+      this.#assertWorkspaceAdmission(job.target.workspaceId);
       const acceptedAt = new Date().toISOString();
       try {
         this.#preflightJob(job);
@@ -497,6 +505,7 @@ export class ExecutionDaemon {
         this.#workspaceRow(job.target.workspaceId),
         job.ownershipGeneration,
       );
+      this.#assertWorkspaceAdmission(job.target.workspaceId);
       this.#db
         .query(
           "UPDATE execution_jobs SET status = 'running', started_at = ? WHERE job_id = ? AND status = 'queued'",
@@ -633,6 +642,50 @@ export class ExecutionDaemon {
     });
   }
 
+  workspaceDirectory(workspaceId: string): string {
+    this.#assertOpen();
+    return this.#workspaceRoot(workspaceId);
+  }
+
+  /** Durable local-node half of capture quiescence; Core admission is fenced separately. */
+  beginWorkspaceCapture(workspaceId: string, captureId: string): void {
+    this.#assertOpen();
+    if (!captureId.trim() || captureId.length > 256) {
+      throw new ExecutionError("invalid_workspace_capture_id");
+    }
+    this.#transaction(() => {
+      const workspace = this.#workspaceRow(workspaceId);
+      if (!workspace) throw new ExecutionError("workspace_not_found");
+      this.#assertActiveRow(workspace, workspace.ownership_generation);
+      if (
+        this.#db
+          .query<{ status: string }, [string]>(
+            "SELECT status FROM execution_jobs WHERE workspace_id = ? AND status IN ('queued', 'running', 'uncertain') LIMIT 1",
+          )
+          .get(workspaceId)
+      ) {
+        throw new ExecutionError("workspace_has_unsettled_effects");
+      }
+      if (this.rex.hasBlockingProcesses(workspaceId)) {
+        throw new ExecutionError("workspace_has_running_rex_processes");
+      }
+      this.#assertWorkspaceAdmission(workspaceId);
+      this.#db
+        .query(
+          "INSERT INTO execution_workspace_captures(workspace_id, capture_id, started_at) VALUES (?, ?, ?)",
+        )
+        .run(workspaceId, captureId, new Date().toISOString());
+    });
+  }
+
+  /** Owner-host adapter releases the local writer fence after capture settles. */
+  endWorkspaceCapture(captureId: string): void {
+    this.#assertOpen();
+    this.#db
+      .query("DELETE FROM execution_workspace_captures WHERE capture_id = ?")
+      .run(captureId);
+  }
+
   fenceWorkspace(
     workspaceId: string,
     expectedGeneration: number,
@@ -640,6 +693,7 @@ export class ExecutionDaemon {
   ): ExecutionWorkspaceReport {
     this.#assertOpen();
     return this.#transaction(() => {
+      this.#assertWorkspaceAdmission(workspaceId);
       const workspace = this.#workspaceRow(workspaceId);
       if (!workspace) throw new ExecutionError("workspace_not_found");
       if (
@@ -688,6 +742,7 @@ export class ExecutionDaemon {
   ): ExecutionWorkspaceReport {
     this.#assertOpen();
     return this.#transaction(() => {
+      this.#assertWorkspaceAdmission(workspaceId);
       const workspace = this.#workspaceRow(workspaceId);
       if (!workspace) throw new ExecutionError("workspace_not_found");
       if (workspace.ownership_generation !== generation) {
@@ -1069,6 +1124,18 @@ export class ExecutionDaemon {
         )
         .get(workspaceId) ?? undefined
     );
+  }
+
+  #assertWorkspaceAdmission(workspaceId: string): void {
+    if (
+      this.#db
+        .query<{ capture_id: string }, [string]>(
+          "SELECT capture_id FROM execution_workspace_captures WHERE workspace_id = ?",
+        )
+        .get(workspaceId)
+    ) {
+      throw new ExecutionError("workspace_capture_active");
+    }
   }
 
   #assertWorkspaceActive(workspaceId: string, generation: number): void {

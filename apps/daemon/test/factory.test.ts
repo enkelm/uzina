@@ -301,6 +301,104 @@ describe("persistent Factory behavior over Bun SQLite", () => {
     expect(revokedNode.status).toBe(401);
   });
 
+  test("a downgraded guest cannot dispatch a previously queued input or admit later Pi execution", async () => {
+    const fixture = await provisionFixture(true);
+    const invite = await fixture.factory.createInvitation(fixture.owner, {
+      role: "guest",
+      grants: [{ type: "thread", resourceId: fixture.thread.threadId }],
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    const redemption = await fixture.factory.redeemInvitation(
+      invite.code,
+      "Revoked before dispatch",
+    );
+    const guest = await fixture.factory.authenticate(redemption.credential);
+    const accepted = await fixture.factory.submitInput(
+      guest,
+      fixture.thread.threadId,
+      "request:guest-revoked-before-dispatch",
+      "The guest was initially permitted to steer this thread",
+    );
+    expect(accepted.dispatchStatus).toBe("queued");
+
+    fixture.factory.setParticipantAccess(
+      fixture.owner,
+      redemption.participant.userId,
+      "viewer",
+      [{ type: "thread", resourceId: fixture.thread.threadId }],
+    );
+    let externalDispatchCalled = false;
+    const settled = await fixture.factory.dispatchNext({
+      async dispatch() {
+        externalDispatchCalled = true;
+        return { status: "dispatched" };
+      },
+    });
+    expect(externalDispatchCalled).toBe(false);
+    expect(settled).toMatchObject({
+      requestId: accepted.requestId,
+      dispatchStatus: "failed",
+      outcome: "The actor no longer has permission to steer this thread",
+    });
+    expect(
+      fixture.factory.database.all<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM execution_jobs WHERE request_id = ?",
+        [accepted.requestId],
+      )[0]?.count,
+    ).toBe(0);
+
+    const secondInvite = await fixture.factory.createInvitation(fixture.owner, {
+      role: "guest",
+      grants: [{ type: "thread", resourceId: fixture.thread.threadId }],
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    const secondRedemption = await fixture.factory.redeemInvitation(
+      secondInvite.code,
+      "Revoked during Pi work",
+    );
+    const secondGuest = await fixture.factory.authenticate(
+      secondRedemption.credential,
+    );
+    const secondAccepted = await fixture.factory.submitInput(
+      secondGuest,
+      fixture.thread.threadId,
+      "request:guest-revoked-during-pi",
+      "A later Pi tool must be denied after downgrade",
+    );
+    await fixture.factory.dispatchNext({
+      async dispatch(input) {
+        fixture.factory.setParticipantAccess(
+          fixture.owner,
+          secondRedemption.participant.userId,
+          "viewer",
+          [{ type: "thread", resourceId: fixture.thread.threadId }],
+        );
+        await expect(
+          fixture.factory.enqueueManagedRemoteExecution(
+            input.threadId,
+            "task:guest-revoked-during-pi",
+            "call:guest-revoked-during-pi",
+            {
+              operation: "write-file",
+              path: "must-not-run.txt",
+              contentBase64: Buffer.from("no effect").toString("base64"),
+            },
+          ),
+        ).rejects.toMatchObject({ status: 403, code: "forbidden" });
+        return {
+          status: "failed",
+          detail: "Access changed before tool admission",
+        };
+      },
+    });
+    expect(
+      fixture.factory.database.all<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM execution_jobs WHERE request_id = ?",
+        [secondAccepted.requestId],
+      )[0]?.count,
+    ).toBe(0);
+  });
+
   test("managed inputs remain in their runtime queue and are never exposed as node execution jobs", async () => {
     const fixture = await provisionFixture(true);
     const accepted = await fixture.factory.submitInput(

@@ -5,7 +5,10 @@ import { Miniflare } from "miniflare";
 import { describe, expect, test } from "bun:test";
 
 type WorkerdId = { toString(): string };
-type WorkerdNamespace = { idFromName(name: string): WorkerdId };
+type WorkerdNamespace = {
+  idFromName(name: string): WorkerdId;
+  get(id: WorkerdId): { fetch(request: Request): Promise<Response> };
+};
 
 const bootstrapSecret = "workerd-factory-bootstrap-fixture";
 
@@ -43,12 +46,14 @@ describe("Cloudflare Factory in Miniflare workerd", () => {
         credential?: string;
         bootstrap?: boolean;
         body?: unknown;
+        method?: "GET" | "POST" | "PUT";
       } = {},
     ): Promise<{ response: { status: number }; value: T }> => {
       const response = await miniflare.dispatchFetch(
         `http://uzina.test${path}`,
         {
-          method: options.body === undefined ? "GET" : "POST",
+          method:
+            options.method ?? (options.body === undefined ? "GET" : "POST"),
           headers: {
             ...(options.credential
               ? {
@@ -178,6 +183,212 @@ describe("Cloudflare Factory in Miniflare workerd", () => {
             event.requestId === "request:workerd",
         ),
       ).toHaveLength(1);
+    } finally {
+      await miniflare.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("workerd persists scoped viewer discussion and rechecks access after Durable Object eviction", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "uzina-access-workerd-"));
+    const build = await Bun.build({
+      entrypoints: [join(import.meta.dir, "factory-workerd-entry.ts")],
+      outdir: directory,
+      target: "browser",
+      packages: "bundle",
+      external: ["cloudflare:workers"],
+      sourcemap: "none",
+    });
+    if (!build.success) {
+      throw new AggregateError(
+        build.logs.map((log) => log.message),
+        "Could not bundle the scoped-access workerd test Worker",
+      );
+    }
+    const miniflare = new Miniflare({
+      name: "worker",
+      script: await build.outputs[0]!.text(),
+      modules: true,
+      compatibilityDate: "2026-05-01",
+      bindings: { UZINA_BOOTSTRAP_SECRET: bootstrapSecret },
+      durableObjects: {
+        FACTORY: { className: "TestFactory", useSQLite: true },
+        MANAGED_WORK: { className: "TestManagedWork", useSQLite: true },
+      },
+    });
+    const request = async <T>(
+      path: string,
+      options: {
+        credential?: string;
+        bootstrap?: boolean;
+        body?: unknown;
+        method?: "GET" | "POST" | "PUT";
+      } = {},
+    ): Promise<{ response: { status: number }; value: T }> => {
+      const response = await miniflare.dispatchFetch(
+        `http://uzina.test${path}`,
+        {
+          method:
+            options.method ?? (options.body === undefined ? "GET" : "POST"),
+          headers: {
+            ...(options.credential
+              ? {
+                  authorization: `${options.bootstrap ? "Bootstrap" : "Bearer"} ${options.credential}`,
+                }
+              : {}),
+            ...(options.body === undefined
+              ? {}
+              : { "content-type": "application/json" }),
+          },
+          ...(options.body === undefined
+            ? {}
+            : { body: JSON.stringify(options.body) }),
+        },
+      );
+      return { response, value: (await response.json()) as T };
+    };
+    try {
+      const namespace = (await miniflare.getDurableObjectNamespace(
+        "FACTORY",
+      )) as unknown as WorkerdNamespace;
+      const durableId = namespace.idFromName("factory-workerd-proof");
+      const bootstrap = await request<{ credential: string }>("/v1/bootstrap", {
+        bootstrap: true,
+        credential: bootstrapSecret,
+        body: { name: "Access owner" },
+      });
+      const ownerCredential = bootstrap.value.credential;
+      const project = await request<{ projectId: string }>("/v1/projects", {
+        credential: ownerCredential,
+        body: {
+          projectId: "project:workerd-access",
+          name: "Scoped workerd project",
+        },
+      });
+      const node = await request<{ node: { nodeId: string } }>("/v1/nodes", {
+        credential: ownerCredential,
+        body: { nodeId: "node:workerd-access", name: "Scoped workerd node" },
+      });
+      const workspace = await request<{ workspaceId: string }>(
+        "/v1/workspaces",
+        {
+          credential: ownerCredential,
+          body: {
+            workspaceId: "workspace:workerd-access",
+            nodeId: node.value.node.nodeId,
+            name: "Scoped workerd workspace",
+          },
+        },
+      );
+      const thread = await request<{ threadId: string }>("/v1/threads", {
+        credential: ownerCredential,
+        body: {
+          threadId: "thread:workerd-access",
+          projectId: project.value.projectId,
+          title: "Scoped workerd thread",
+          target: {
+            nodeId: node.value.node.nodeId,
+            workspaceId: workspace.value.workspaceId,
+          },
+        },
+      });
+      const invitation = await request<{
+        invitation: { invitationId: string };
+        code: string;
+      }>("/v1/invitations", {
+        credential: ownerCredential,
+        body: {
+          role: "viewer",
+          grants: [{ type: "thread", resourceId: thread.value.threadId }],
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        },
+      });
+      expect(invitation.response.status).toBe(201);
+      const joined = await request<{
+        credential: string;
+        participant: { userId: string };
+      }>("/v1/invitations/redeem", {
+        body: { code: invitation.value.code, displayName: "Workerd viewer" },
+      });
+      const viewerCredential = joined.value.credential;
+      const comment = await request<{
+        discussionId: string;
+        actor: { userId: string };
+        displayName: string;
+      }>(`/v1/threads/${thread.value.threadId}/discussion`, {
+        credential: viewerCredential,
+        body: { text: "Persistent viewer discussion" },
+      });
+      expect(comment.response.status).toBe(201);
+      expect(comment.value.actor.userId).toBe(joined.value.participant.userId);
+      expect(comment.value.displayName).toBe("Workerd viewer");
+      expect(
+        (
+          await request(`/v1/threads/${thread.value.threadId}/inputs`, {
+            credential: viewerCredential,
+            body: {
+              requestId: "request:workerd-viewer-denied",
+              text: "No Pi admission",
+            },
+          })
+        ).response.status,
+      ).toBe(403);
+
+      const managedNamespace = (await miniflare.getDurableObjectNamespace(
+        "MANAGED_WORK",
+      )) as unknown as WorkerdNamespace;
+      const managedId = managedNamespace.idFromName(thread.value.threadId);
+      const managedObject = managedNamespace.get(managedId);
+      const observations = async () =>
+        (
+          await managedObject.fetch(new Request("http://managed/observations"))
+        ).json() as Promise<{
+          modelCalls: number;
+        }>;
+      expect((await observations()).modelCalls).toBe(0);
+      await miniflare.unsafeEvictDurableObject("worker", "TestFactory", {
+        id: durableId.toString(),
+      });
+      const persistedDiscussion = await request<{
+        discussion: Array<{ discussionId: string; actor: { userId: string } }>;
+      }>(`/v1/threads/${thread.value.threadId}/discussion`, {
+        credential: viewerCredential,
+      });
+      expect(persistedDiscussion.value.discussion).toMatchObject([
+        {
+          discussionId: comment.value.discussionId,
+          actor: { userId: joined.value.participant.userId },
+        },
+      ]);
+      expect((await observations()).modelCalls).toBe(0);
+
+      const changed = await request(
+        `/v1/people/${joined.value.participant.userId}/access`,
+        {
+          method: "PUT",
+          credential: ownerCredential,
+          body: { role: "viewer", grants: [] },
+        },
+      );
+      expect(changed.response.status).toBe(200);
+      await miniflare.unsafeEvictDurableObject("worker", "TestFactory", {
+        id: durableId.toString(),
+      });
+      expect(
+        (
+          await request(`/v1/threads/${thread.value.threadId}/discussion`, {
+            credential: viewerCredential,
+          })
+        ).response.status,
+      ).toBe(404);
+      const deniedEvents = await request<{ events: unknown[] }>(
+        "/v1/events?after=0",
+        {
+          credential: viewerCredential,
+        },
+      );
+      expect(deniedEvents.value.events).toEqual([]);
+      expect((await observations()).modelCalls).toBe(0);
     } finally {
       await miniflare.dispose();
       await rm(directory, { recursive: true, force: true });

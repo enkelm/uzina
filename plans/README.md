@@ -4,19 +4,19 @@ Implement the scope in `SPEC.md` through the slices below. A slice is complete o
 
 ## Slice ledger
 
-| Slice | Outcome                                                                                    | Dependencies                           | Status                                                                                       |
-| ----- | ------------------------------------------------------------------------------------------ | -------------------------------------- | -------------------------------------------------------------------------------------------- |
-| 0     | Bun workspace foundation, initial validated contracts, repeatable checks                   | None                                   | Complete                                                                                     |
-| 1     | Persistent Pi Durable under Bun and Cloudflare; early managed-checkpoint feasibility proof | 0                                      | Integrated; pending review                                                                   |
-| 2     | Authenticated execution daemon, explicit workspace jobs, Rex lifecycle                     | 0                                      | Integrated; pending review                                                                   |
-| 3     | Owner-authenticated Factory commands, durable receipts, committed events                   | 0                                      | Integrated; pending review                                                                   |
-| 4     | Cloud-managed Pi executes a bounded tool on a selected laptop                              | 1, 2, 3                                | 4a/4b integrated locally and in workerd; reviewer gate pending; production/laptop unverified |
-| 5     | Minimal operational PWA with retained request identities and reconnect handling            | 3, 4                                   | Not started                                                                                  |
-| 6     | Persistent invitations, scoped roles, revocation, subscription enforcement                 | 3                                      | Not started                                                                                  |
-| 7     | MCP tools and private Factory assistant using ordinary authorized operations               | 1, 3, 4                                | Not started                                                                                  |
-| 8     | Coherent workspace and managed-runtime checkpoints; validated inactive restore             | 1, 2; workspace work can start after 0 | Workspace foundation integrated; pending review                                              |
-| 9     | Safely relocate workspace execution between nodes                                          | 4, 8                                   | Not started                                                                                  |
-| 10    | Transfer supported managed work from cloud to standalone local execution                   | 8, 9                                   | Not started                                                                                  |
+| Slice | Outcome                                                                                    | Dependencies                           | Status                                                                                         |
+| ----- | ------------------------------------------------------------------------------------------ | -------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| 0     | Bun workspace foundation, initial validated contracts, repeatable checks                   | None                                   | Complete                                                                                       |
+| 1     | Persistent Pi Durable under Bun and Cloudflare; early managed-checkpoint feasibility proof | 0                                      | Supported persistence/profile reviewed; actual deployment unverified                           |
+| 2     | Authenticated execution daemon, explicit workspace jobs, Rex lifecycle                     | 0                                      | HTTP execution and real local Rex reviewed; laptop B unverified                                |
+| 3     | Authorized Factory commands, durable receipts, committed events                            | 0                                      | Admission/protocol reviewed; expanded scoped access pending review                             |
+| 4     | Cloud-managed Pi executes a bounded tool on a selected laptop                              | 1, 2, 3                                | Local/workerd bridge reviewed; production/two-laptop gate open                                 |
+| 5     | Minimal operational PWA with retained request identities and reconnect handling            | 3, 4                                   | Held pending workforce direction                                                               |
+| 6     | Persistent invitations, scoped roles, revocation, subscription enforcement                 | 3                                      | Integrated; independent review pending                                                         |
+| 7     | MCP tools and private Factory assistant using ordinary authorized operations               | 1, 3, 4                                | Not started                                                                                    |
+| 8     | Coherent workspace and managed-runtime checkpoints; validated inactive restore             | 1, 2; workspace work can start after 0 | Local capture/inactive restore and R2 adapter integrated; review and production wiring pending |
+| 9     | Safely relocate workspace execution between nodes                                          | 4, 8                                   | Not started                                                                                    |
+| 10    | Transfer supported managed work from cloud to standalone local execution                   | 8, 9                                   | Not started                                                                                    |
 
 ## Execution rules
 
@@ -150,7 +150,15 @@ Post-correction validation in this checkout:
 - `bun run build` — passed: daemon bundle (1,382 modules, 4.93 MB) and Wrangler dry-run (1,854.29 KiB upload, 332.63 KiB gzip), with the Factory and ManagedWork bindings. This validates the build only, not deployment.
 - `git diff --check` — passed.
 
-Independent reviewer approval remains pending. This evidence does not claim all slices complete, production Cloudflare behavior, paid inference, or actual second-laptop operation; no deployment, push, or paid call was made.
+At that checkpoint independent review remained pending. The subsequent review accepted `af15f23` with no remaining findings: both reported P2s were fixed, late-node and startup wakes were covered, and the narrow Rex parser/lifecycle changes were accepted. Production Cloudflare and actual two-laptop execution remain unverified.
+
+### Scoped-access and coherent-checkpoint integration
+
+The isolated slice 6 and local slice 8 increments are now combined for independent review. Scoped access adds persistent Guest/Viewer identities, hashed single-use expiring invitations, current project/thread grants, revocation, owner-private threads, filtered reads/events/context, and discussion that never starts Pi work. Coherent checkpoints combine the supported public Pi profile, exact workspace/Git state, attachments and provenance; source capture uses durable Core and executor admission fences, and destination restore is staged and `prepared-inactive`, never activated.
+
+The integration retained both claim-time access revocation and capture guards, and included the owner-private column when reading capture metadata. Root workspace dependency changes were reconciled in `bun.lock`. Parent validation passed: frozen install, formatting check, typecheck, **103 tests passed / 1 opt-in Rex test skipped / 772 assertions**, daemon build, production-shaped Worker compatibility build/Wrangler dry-run, and staged/unstaged diff checks. Real Miniflare R2 proves the immutable blob adapter, not a production R2 deployment. The separately completed real Rex check on Baldur created and removed only its disposable session; it is not rerun by the ordinary suite.
+
+Remaining checkpoint wiring is explicit: the production local entry point has no configured trusted workspace/quiescence adapters or capture HTTP route; the Worker has no R2 binding or remote executor capture protocol. No ownership transition, destination activation, cloud-to-laptop capture or cloud-to-standalone continuation is claimed by this increment. Those are not satisfied by the inactive-restore test. The next gate is independent access/checkpoint review, then production capture/transfer composition and the shared authorized MCP/assistant layer. Broader UI remains held pending workforce direction.
 
 ## Workflow
 

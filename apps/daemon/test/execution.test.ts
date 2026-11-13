@@ -418,6 +418,9 @@ describe("persistent execution daemon", () => {
     expect(() => reopened.fenceWorkspace("workspace:test", 0, 1)).toThrow(
       "workspace_has_uncertain_effects",
     );
+    expect(() =>
+      reopened.beginWorkspaceCapture("workspace:test", "capture:uncertain-job"),
+    ).toThrow("workspace_has_unsettled_effects");
 
     const resolved = reopened.reconcileUncertainJob(
       "job:uncertain-command",
@@ -444,6 +447,9 @@ describe("persistent execution daemon", () => {
     expect(() => daemon.fenceWorkspace("workspace:test", 0, 1)).toThrow(
       "workspace_has_uncertain_effects",
     );
+    expect(() =>
+      daemon.beginWorkspaceCapture("workspace:test", "capture:running-job"),
+    ).toThrow("workspace_has_unsettled_effects");
     expect((await running).status).toBe("completed");
     daemon.fenceWorkspace("workspace:test", 0, 1);
     await expect(
@@ -492,6 +498,9 @@ describe("persistent execution daemon", () => {
     expect(await daemon.rex.inspect("process:isolated")).toMatchObject({
       status: "running",
     });
+    expect(() =>
+      daemon.beginWorkspaceCapture("workspace:test", "capture:rex-active"),
+    ).toThrow("workspace_has_running_rex_processes");
     expect(() => daemon.fenceWorkspace("workspace:test", 0, 1)).toThrow(
       "workspace_has_running_rex_processes",
     );
@@ -505,5 +514,26 @@ describe("persistent execution daemon", () => {
       },
     });
     expect(() => daemon.fenceWorkspace("workspace:test", 0, 1)).not.toThrow();
+    daemon.activateWorkspace("workspace:test", 1);
+
+    const captureId = "capture:rex-quiescent";
+    daemon.beginWorkspaceCapture("workspace:test", captureId);
+    await expect(
+      daemon.executeJob(
+        job({ jobId: "job:local-capture-block", ownershipGeneration: 1 }),
+      ),
+    ).rejects.toThrow("workspace_capture_active");
+    await expect(
+      daemon.rex.launch({
+        ...request,
+        processId: "process:capture-blocked",
+        ownershipGeneration: 1,
+      }),
+    ).rejects.toThrow("workspace_capture_active");
+    daemon.endWorkspaceCapture(captureId);
+    expect(() =>
+      daemon.beginWorkspaceCapture("workspace:test", captureId),
+    ).not.toThrow();
+    daemon.endWorkspaceCapture(captureId);
   });
 });

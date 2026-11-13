@@ -1,8 +1,25 @@
-import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import {
+  chmod,
+  mkdtemp,
+  mkdir,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, test } from "bun:test";
-import type { ManagedModels } from "@uzina/pi-runtime";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { ManagedPiWork, type ManagedModels } from "@uzina/pi-runtime";
+import {
+  FileBlobTransport,
+  restoreManagedWorkBundle,
+  validateManagedWorkBundle,
+  type BlobTransport,
+} from "@uzina/checkpoints";
 import {
   ExecutionDaemon,
   type WorkspaceMapping,
@@ -15,6 +32,11 @@ import {
 } from "../src/factory/standalone";
 import { deterministicFailingModels } from "../../../packages/pi-runtime/test-support/deterministic-failing-model";
 import { deterministicToolModels } from "../../../packages/pi-runtime/test-support/deterministic-tool-model";
+import { openBunSqliteStorage } from "../src/runtime/sqlite";
+
+function git(cwd: string, ...args: string[]): string {
+  return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+}
 
 const fixtures: Array<{ directory: string; close(): Promise<void> }> = [];
 
@@ -77,6 +99,18 @@ async function scenario(options: {
       models: options.models,
       modelProvider: options.modelProvider,
       modelId: options.modelId,
+      workspaceDirectories: { "workspace:local-proof": workspaceDirectory },
+      workspaceCaptureQuiescence: {
+        async acquire(workspaceId, captureId) {
+          if (!execution)
+            throw new Error("Local execution daemon is unavailable");
+          execution.beginWorkspaceCapture(workspaceId, captureId);
+          return {
+            workspacePath: execution.workspaceDirectory(workspaceId),
+            release: () => execution?.endWorkspaceCapture(captureId),
+          };
+        },
+      },
       port: 0,
     });
   host = await openHost();
@@ -200,6 +234,10 @@ async function scenario(options: {
     },
   );
   return Object.assign(fixture, {
+    executionDaemon() {
+      if (!execution) throw new Error("Execution daemon is not running");
+      return execution;
+    },
     owner,
     nodeId: node.value.node.nodeId,
     nodeCredential: node.value.credential,
@@ -339,6 +377,453 @@ describe("standalone local Factory managed Pi composition", () => {
     expect(
       proofEvents.filter((event) => event.type === "execution.completed"),
     ).toHaveLength(1);
+  });
+
+  test("captures quiescent local managed work and restores one validated inactive bundle", async () => {
+    const provider = deterministicToolModels({
+      toolName: "remote_write_file",
+      arguments: {
+        path: "managed-result.txt",
+        content: "Pi wrote this before capture",
+      },
+      answer: "The managed work is settled and ready to checkpoint.",
+    });
+    const local = await scenario({
+      models: provider.models,
+      modelProvider: "uzina-test",
+      modelId: "fixed-model",
+      directoryPrefix: "uzina-coherent-checkpoint-",
+    });
+    const workspace = local.workspaceDirectory;
+    git(workspace, "init", "--initial-branch=main", "--quiet");
+    git(workspace, "config", "user.name", "Checkpoint test");
+    git(workspace, "config", "user.email", "checkpoint@example.invalid");
+    await writeFile(join(workspace, "notes.txt"), "initial note\n");
+    await writeFile(join(workspace, "image.bin"), Buffer.from([0, 255, 1, 0]));
+    await writeFile(join(workspace, "run.sh"), "#!/bin/sh\necho ready\n");
+    await chmod(join(workspace, "run.sh"), 0o644);
+    git(workspace, "add", "--all");
+    git(workspace, "commit", "-m", "checkpoint base");
+    await writeFile(join(workspace, "notes.txt"), "staged note\n");
+    git(workspace, "add", "notes.txt");
+    await writeFile(join(workspace, "notes.txt"), "staged then unstaged\n");
+    await writeFile(
+      join(workspace, "image.bin"),
+      Buffer.from([0, 255, 2, 0, 128]),
+    );
+    git(workspace, "add", "image.bin");
+    await writeFile(
+      join(workspace, "image.bin"),
+      Buffer.from([0, 255, 3, 0, 129, 0]),
+    );
+    await chmod(join(workspace, "run.sh"), 0o755);
+    git(workspace, "add", "run.sh");
+    await writeFile(
+      join(workspace, "untracked.bin"),
+      Buffer.from([255, 0, 254, 128]),
+    );
+
+    const input = {
+      requestId: "request:coherent-capture",
+      text: "Write the result and finish this managed task before capture.",
+    };
+    await call(local.baseUrl, `/v1/threads/${local.threadId}/inputs`, {
+      credential: local.owner,
+      body: input,
+    });
+    await until(async () => {
+      const receipt = await call<{ dispatchStatus: string }>(
+        local.baseUrl,
+        `/v1/commands/${input.requestId}`,
+        { credential: local.owner },
+      );
+      return receipt.value.dispatchStatus === "completed";
+    });
+    const sourceContext = await call<{ runtime: unknown }>(
+      local.baseUrl,
+      `/v1/threads/${local.threadId}/context`,
+      { credential: local.owner },
+    );
+
+    const blobs = new FileBlobTransport(
+      join(local.directory, "checkpoint-blobs"),
+    );
+    let signalFirstPut!: () => void;
+    let releasePut!: () => void;
+    const firstPut = new Promise<void>((resolve) => {
+      signalFirstPut = resolve;
+    });
+    const putBlocked = new Promise<void>((resolve) => {
+      releasePut = resolve;
+    });
+    let firstWrite = true;
+    const blockingTransport: BlobTransport = {
+      async putBlob(bytes) {
+        if (firstWrite) {
+          firstWrite = false;
+          signalFirstPut();
+          await putBlocked;
+        }
+        return blobs.putBlob(bytes);
+      },
+      getBlob(reference) {
+        return blobs.getBlob(reference);
+      },
+    };
+    const pendingCapture = local.host.captureManagedWorkCheckpoint({
+      credential: local.owner,
+      threadId: local.threadId,
+      transport: blockingTransport,
+    });
+    void pendingCapture.catch(() => {});
+    await firstPut;
+    let session: Awaited<ReturnType<typeof local.host.factory.authenticate>>;
+    try {
+      const blockedInput = await call<{ error: string }>(
+        local.baseUrl,
+        `/v1/threads/${local.threadId}/inputs`,
+        {
+          credential: local.owner,
+          body: {
+            requestId: "request:blocked-during-capture",
+            text: "This must not enter managed work during capture.",
+          },
+        },
+      );
+      expect(blockedInput.status).toBe(409);
+      expect(blockedInput.value.error).toBe("managed_work_capture_active");
+
+      session = await local.host.factory.authenticate(local.owner);
+      const thread = local.host.factory.getAuthorizedThread(
+        session,
+        local.threadId,
+      );
+      await expect(
+        local.host.factory.enqueueRemoteExecution({
+          contractVersion: 1,
+          jobId: "job:blocked-during-capture",
+          nodeId: thread.target.nodeId,
+          target: thread.target,
+          ownershipGeneration: thread.ownershipGeneration,
+          operation: "write-file",
+          path: "blocked.txt",
+          contentBase64: Buffer.from("no write").toString("base64"),
+        }),
+      ).rejects.toThrow("Input or execution admission is blocked");
+      await expect(
+        local.executionDaemon().executeJob({
+          contractVersion: 1,
+          jobId: "job:direct-daemon-write-during-capture",
+          nodeId: thread.target.nodeId,
+          target: thread.target,
+          ownershipGeneration: thread.ownershipGeneration,
+          operation: "write-file",
+          path: "blocked-local-writer.txt",
+          contentBase64: Buffer.from("no local write").toString("base64"),
+        }),
+      ).rejects.toThrow("workspace_capture_active");
+      expect(local.host.factory.listManagedWorkCaptures(session)).toHaveLength(
+        1,
+      );
+    } finally {
+      releasePut();
+    }
+    const captured = await pendingCapture;
+    session = await local.host.factory.authenticate(local.owner);
+    expect(captured.manifest.format).toBe(
+      "uzina-coherent-managed-work-checkpoint",
+    );
+    expect(captured.manifest.profile).toBe(
+      "quiescent-current-documents-no-forks-v1",
+    );
+    expect(local.host.factory.listManagedWorkCaptures(session)).toHaveLength(0);
+
+    const destinationRequirements = [
+      "model:uzina-test/fixed-model",
+      "tool:remote_read_file:v1",
+      "tool:remote_write_file:v1",
+      "tool:remote_run_command:v1",
+    ];
+    await expect(
+      validateManagedWorkBundle(captured.manifestReference, blobs),
+    ).rejects.toThrow("Unsupported runtime requirements");
+    const failedDestination = join(local.directory, "failed-destination");
+    await mkdir(failedDestination);
+    await expect(
+      restoreManagedWorkBundle({
+        manifestReference: captured.manifestReference,
+        transport: blobs,
+        destinationPath: failedDestination,
+        supportedRuntimeRequirements: destinationRequirements,
+        async openStorage() {
+          throw new Error("staged runtime storage allocation failed");
+        },
+      }),
+    ).rejects.toThrow("staged runtime storage allocation failed");
+    expect(await readdir(failedDestination)).toEqual([]);
+
+    const destination = join(local.directory, "restored-inactive");
+    await mkdir(destination);
+    const providerCallsBeforeRestore = provider.requests();
+    let toolCalls = 0;
+    const restored = await restoreManagedWorkBundle({
+      manifestReference: captured.manifestReference,
+      transport: blobs,
+      destinationPath: destination,
+      supportedRuntimeRequirements: destinationRequirements,
+      async openStorage(path) {
+        const storage = await openBunSqliteStorage(path);
+        return {
+          storage,
+          close: () => storage.close(BACKGROUND_CONTEXT),
+        };
+      },
+    });
+    expect(restored.receipt.status).toBe("prepared-inactive");
+    expect(provider.requests()).toBe(providerCallsBeforeRestore);
+    expect(toolCalls).toBe(0);
+
+    const restoredWorkspace = restored.workspacePath;
+    expect(
+      git(
+        restoredWorkspace,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+      ),
+    ).toBe(git(workspace, "status", "--porcelain=v1", "--untracked-files=all"));
+    expect(git(restoredWorkspace, "diff", "--cached", "--binary", "HEAD")).toBe(
+      git(workspace, "diff", "--cached", "--binary", "HEAD"),
+    );
+    expect(git(restoredWorkspace, "diff", "--binary")).toBe(
+      git(workspace, "diff", "--binary"),
+    );
+    expect(
+      git(
+        restoredWorkspace,
+        "for-each-ref",
+        "--format=%(refname) %(objectname)",
+      ),
+    ).toBe(git(workspace, "for-each-ref", "--format=%(refname) %(objectname)"));
+    for (const filename of [
+      "notes.txt",
+      "image.bin",
+      "run.sh",
+      "untracked.bin",
+      "managed-result.txt",
+    ]) {
+      expect(await readFile(join(restoredWorkspace, filename))).toEqual(
+        await readFile(join(workspace, filename)),
+      );
+    }
+    expect((await stat(join(restoredWorkspace, "run.sh"))).mode & 0o111).toBe(
+      (await stat(join(workspace, "run.sh"))).mode & 0o111,
+    );
+    const provenanceText = await readFile(
+      join(destination, ".uzina", "attachments", "factory-provenance.json"),
+      "utf8",
+    );
+    expect(provenanceText).not.toContain(local.owner);
+    expect(provenanceText).not.toContain(local.nodeCredential);
+    const provenance = JSON.parse(provenanceText) as {
+      commands: Array<{ requestId: string; executionEffects?: unknown[] }>;
+    };
+    expect(provenance.commands.map((command) => command.requestId)).toContain(
+      input.requestId,
+    );
+    expect(
+      provenance.commands.find(
+        (command) => command.requestId === input.requestId,
+      )?.executionEffects,
+    ).toHaveLength(1);
+
+    const restoredStorage = await openBunSqliteStorage(restored.runtimePath);
+    const restoredWork = await ManagedPiWork.open({
+      storage: restoredStorage,
+      models: provider.models,
+      agent: { model: { provider: "uzina-test", modelId: "fixed-model" } },
+      toolExecutor: {
+        async readFile() {
+          toolCalls += 1;
+          return { content: "", truncated: false };
+        },
+        async writeFile() {
+          toolCalls += 1;
+        },
+        async runCommand() {
+          toolCalls += 1;
+          return {
+            stdout: "",
+            stderr: "",
+            exitCode: 0,
+            outputTruncated: false,
+          };
+        },
+      },
+    });
+    try {
+      expect(await restoredWork.context()).toEqual(
+        sourceContext.value.runtime as never,
+      );
+      const importedReceipt = await restoredWork.submission(input.requestId);
+      expect(importedReceipt).toBeDefined();
+      const duplicate = await restoredWork.submit(input.requestId, input.text);
+      expect(duplicate.submissionId).toBe(importedReceipt!.id);
+      expect(provider.requests()).toBe(providerCallsBeforeRestore);
+      expect(toolCalls).toBe(0);
+    } finally {
+      await restoredWork.close();
+    }
+
+    const retried = await restoreManagedWorkBundle({
+      manifestReference: captured.manifestReference,
+      transport: blobs,
+      destinationPath: destination,
+      supportedRuntimeRequirements: destinationRequirements,
+      async openStorage() {
+        throw new Error(
+          "prepared receipt retry must not reopen runtime storage",
+        );
+      },
+    });
+    expect(retried.receipt).toEqual(restored.receipt);
+  });
+
+  test("refuses unavailable and uncertain work instead of pausing it", async () => {
+    const local = await scenario({
+      models: deterministicFailingModels(),
+      modelProvider: "uzina-test-failure",
+      modelId: "fixed-model",
+      directoryPrefix: "uzina-capture-uncertain-",
+      deferExecutor: true,
+    });
+    const session = await local.host.factory.authenticate(local.owner);
+    await local.host.factory.submitInput(
+      session,
+      local.threadId,
+      "request:queued-for-capture",
+      "This remains unavailable and must block capture.",
+    );
+    expect(() =>
+      local.host.factory.beginManagedWorkCapture(session, local.threadId),
+    ).toThrow("unsettled unavailable input receipt");
+    expect(local.host.factory.listManagedWorkCaptures(session)).toHaveLength(0);
+
+    const uncertain = await scenario({
+      models: deterministicFailingModels(),
+      modelProvider: "uzina-test-failure",
+      modelId: "fixed-model",
+      directoryPrefix: "uzina-capture-uncertain-dispatch-",
+    });
+    const uncertainSession = await uncertain.host.factory.authenticate(
+      uncertain.owner,
+    );
+    const accepted = await uncertain.host.factory.submitInput(
+      uncertainSession,
+      uncertain.threadId,
+      "request:uncertain-capture",
+      "An interrupted adapter outcome must block capture.",
+    );
+    expect(accepted.dispatchStatus).toBe("queued");
+    let signalDispatch!: () => void;
+    let releaseDispatch!: () => void;
+    const enteredDispatch = new Promise<void>((resolve) => {
+      signalDispatch = resolve;
+    });
+    const holdDispatch = new Promise<void>((resolve) => {
+      releaseDispatch = resolve;
+    });
+    const runningDispatch = uncertain.host.factory.dispatchNext({
+      async dispatch() {
+        signalDispatch();
+        await holdDispatch;
+        return { status: "uncertain", detail: "adapter outcome is uncertain" };
+      },
+    });
+    await enteredDispatch;
+    try {
+      expect(() =>
+        uncertain.host.factory.beginManagedWorkCapture(
+          uncertainSession,
+          uncertain.threadId,
+        ),
+      ).toThrow("unsettled running input receipt");
+    } finally {
+      releaseDispatch();
+    }
+    const receipt = await runningDispatch;
+    expect(receipt?.dispatchStatus).toBe("uncertain");
+    expect(() =>
+      uncertain.host.factory.beginManagedWorkCapture(
+        uncertainSession,
+        uncertain.threadId,
+      ),
+    ).toThrow("unsettled uncertain input receipt");
+    expect(
+      uncertain.host.factory.listManagedWorkCaptures(uncertainSession),
+    ).toHaveLength(0);
+  });
+
+  test("refuses shared workspaces and keeps a capture fence durable across restart", async () => {
+    const local = await scenario({
+      models: deterministicFailingModels(),
+      modelProvider: "uzina-test-failure",
+      modelId: "fixed-model",
+      directoryPrefix: "uzina-capture-restart-",
+      deferExecutor: true,
+    });
+    const session = await local.host.factory.authenticate(local.owner);
+    local.host.factory.createThread(session, {
+      projectId: "project:local-proof",
+      title: "Second thread sharing workspace",
+      target: { nodeId: local.nodeId, workspaceId: local.workspaceId },
+    });
+    expect(() =>
+      local.host.factory.beginManagedWorkCapture(session, local.threadId),
+    ).toThrow("requires an exclusive workspace");
+
+    const exclusive = await scenario({
+      models: deterministicFailingModels(),
+      modelProvider: "uzina-test-failure",
+      modelId: "fixed-model",
+      directoryPrefix: "uzina-capture-durable-lock-",
+      deferExecutor: true,
+    });
+    const ownerSession = await exclusive.host.factory.authenticate(
+      exclusive.owner,
+    );
+    const capture = exclusive.host.factory.beginManagedWorkCapture(
+      ownerSession,
+      exclusive.threadId,
+    );
+    await exclusive.reopenFactory();
+    const reopenedSession = await exclusive.host.factory.authenticate(
+      exclusive.owner,
+    );
+    expect(
+      exclusive.host.factory.listManagedWorkCaptures(reopenedSession),
+    ).toEqual([
+      expect.objectContaining({
+        capture_id: capture.captureId,
+        thread_id: exclusive.threadId,
+        workspace_id: exclusive.workspaceId,
+      }),
+    ]);
+    await expect(
+      exclusive.host.factory.submitInput(
+        reopenedSession,
+        exclusive.threadId,
+        "request:blocked-after-restart",
+        "The durable capture lock remains active.",
+      ),
+    ).rejects.toThrow("Input or execution admission is blocked");
+    exclusive.host.factory.endManagedWorkCapture(
+      reopenedSession,
+      capture.captureId,
+    );
+    expect(
+      exclusive.host.factory.listManagedWorkCaptures(reopenedSession),
+    ).toHaveLength(0);
   });
 
   test("rejects model-selected node, workspace and generation instead of changing accepted placement", async () => {

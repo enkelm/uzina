@@ -20,6 +20,8 @@ import {
   type Wake,
 } from "@earendil-works/pi-durable";
 import { createRemoteToolExtension, type RemoteToolExecutor } from "./tools";
+import { exportManagedWorkCheckpoint } from "./checkpoint";
+import type { ManagedWorkCheckpoint } from "./checkpoint";
 
 export type ManagedPiWorkOptions<
   Tool extends ToolRegistration = ToolRegistration,
@@ -158,6 +160,18 @@ export class ManagedPiWork {
   async context(context: Context = BACKGROUND_CONTEXT) {
     const conversation = await this.requireRoot(context);
     return conversation.context(context);
+  }
+
+  /** Export the supported logical profile without opening or resuming a task. */
+  async exportCheckpoint(
+    context: Context = BACKGROUND_CONTEXT,
+  ): Promise<ManagedWorkCheckpoint> {
+    await this.openRoot(context);
+    return exportManagedWorkCheckpoint(
+      this.options.storage,
+      ROOT_CONVERSATION_ID,
+      context,
+    );
   }
 
   async status(

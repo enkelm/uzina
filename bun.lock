@@ -32,6 +32,7 @@
       "dependencies": {
         "@earendil-works/chord": "1.4.0",
         "@earendil-works/pi-durable": "1.4.0",
+        "@uzina/checkpoints": "workspace:*",
         "@uzina/contracts": "workspace:*",
         "@uzina/core": "workspace:*",
         "@uzina/pi-runtime": "workspace:*",
@@ -40,6 +41,10 @@
     "packages/checkpoints": {
       "name": "@uzina/checkpoints",
       "version": "0.0.0",
+      "dependencies": {
+        "@earendil-works/pi-durable": "1.4.0",
+        "@uzina/pi-runtime": "workspace:*",
+      },
     },
     "packages/contracts": {
       "name": "@uzina/contracts",
