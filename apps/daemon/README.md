@@ -6,7 +6,7 @@ The Bun daemon supports the default local health/identity service and an explici
 
 - `src/execution/daemon.ts` exports `ExecutionDaemon`, which stores durable local job receipts and reports interrupted effects as uncertain rather than replaying them.
 - `src/execution/connector.ts` exports `HttpExecutionControllerConnector`, an outbound Bearer-authenticated client for the schemas in `@uzina/contracts/execution`. Report reconciliation is controller-receipt based, not dependent on in-memory claims.
-- `src/execution/loop.ts` exports `ExecutionLoop`, a bounded/cancellable register-heartbeat-claim-execute-report loop. Each protocol request is bounded; file and argv operations use the execution contract's size and timeout limits. Credentials are never logged.
+- `src/execution/loop.ts` exports `ExecutionLoop`, a bounded/cancellable register-heartbeat-claim-execute-report loop. Heartbeats continue independently while an argv or file effect is awaited; shutdown stops heartbeat scheduling, waits for the in-flight effect, and propagates credential refusal without claiming more work. Each protocol request is bounded; file and argv operations use the execution contract's size and timeout limits. Credentials are never logged.
 - `src/factory/server.ts` exports `createLocalFactoryServer()` and `src/factory/sqlite.ts` exports `BunFactoryDatabase`. Its actual HTTP host can be run with the execution connector in tests.
 
 Start connected mode explicitly and provide a node credential created by the owner through `POST /v1/nodes`:

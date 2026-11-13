@@ -420,8 +420,32 @@ export class ExecutionDaemon {
       }
       const workspace = this.#workspaceRow(job.target.workspaceId);
       this.#assertActiveRow(workspace, job.ownershipGeneration);
-      this.#preflightJob(job);
       const acceptedAt = new Date().toISOString();
+      try {
+        this.#preflightJob(job);
+      } catch (error) {
+        if (!(error instanceof ExecutionError)) throw error;
+        const finishedAt = new Date().toISOString();
+        this.#db
+          .query(
+            `INSERT INTO execution_jobs(
+              job_id, payload_sha256, node_id, workspace_id, ownership_generation,
+              operation, status, accepted_at, finished_at, error_code
+            ) VALUES (?, ?, ?, ?, ?, ?, 'failed', ?, ?, ?)`,
+          )
+          .run(
+            job.jobId,
+            payloadSha256,
+            this.#nodeId,
+            job.target.workspaceId,
+            job.ownershipGeneration,
+            job.operation,
+            acceptedAt,
+            finishedAt,
+            errorCode(error),
+          );
+        return this.#receipt(this.#jobRow(job.jobId)!);
+      }
       this.#db
         .query(
           `INSERT INTO execution_jobs(

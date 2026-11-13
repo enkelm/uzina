@@ -28,17 +28,36 @@ function interval(value: number | undefined, fallback: number): number {
 function wait(ms: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted) return Promise.resolve();
   return new Promise((resolve) => {
+    let timer: ReturnType<typeof setTimeout>;
     const finish = () => {
       clearTimeout(timer);
       signal.removeEventListener("abort", finish);
       resolve();
     };
-    const timer = setTimeout(finish, ms);
+    timer = setTimeout(finish, ms);
     signal.addEventListener("abort", finish, { once: true });
+    if (signal.aborted) finish();
   });
 }
 
-/** Node-owned poller: each HTTP operation and workspace effect is bounded independently of browser lifetime. */
+function isCredentialRejection(error: unknown): boolean {
+  return (
+    error instanceof ControllerHttpError &&
+    (error.status === 401 || error.status === 403)
+  );
+}
+
+function isRetryableHeartbeatFailure(error: unknown): boolean {
+  return (
+    error instanceof TypeError ||
+    (error instanceof ControllerHttpError &&
+      (error.status === 408 || error.status === 429 || error.status >= 500)) ||
+    (error instanceof DOMException &&
+      (error.name === "TimeoutError" || error.name === "AbortError"))
+  );
+}
+
+/** Node-owned poller: heartbeat and each workspace effect remain independently bounded. */
 export class ExecutionLoop {
   readonly #daemon: ExecutionDaemon;
   readonly #controller: ExecutionControllerConnector;
@@ -56,54 +75,104 @@ export class ExecutionLoop {
   async run(signal: AbortSignal): Promise<void> {
     if (this.#running) throw new Error("Execution loop is already running");
     this.#running = true;
-    let registered = false;
-    let nextHeartbeat = 0;
-    try {
-      while (!signal.aborted) {
-        try {
-          if (!registered) {
-            await this.#controller.register(this.#daemon.registerRequest());
-            registered = true;
-            nextHeartbeat = Date.now();
-          }
-          if (Date.now() >= nextHeartbeat) {
-            await this.#controller.heartbeat(this.#daemon.heartbeatRequest());
-            nextHeartbeat = Date.now() + this.#heartbeatIntervalMs;
-          }
+    const shutdown = new AbortController();
+    const requestShutdown = () => shutdown.abort();
+    signal.addEventListener("abort", requestShutdown, { once: true });
+    if (signal.aborted) shutdown.abort();
 
+    let registered = false;
+    let credentialRejected = false;
+    let heartbeatFailure: unknown;
+    let heartbeatTask: Promise<void> | undefined;
+    const rejectCredential = () => {
+      credentialRejected = true;
+      shutdown.abort();
+    };
+
+    try {
+      while (!registered && !shutdown.signal.aborted) {
+        try {
+          await this.#controller.register(this.#daemon.registerRequest());
+          if (shutdown.signal.aborted) break;
+          await this.#controller.heartbeat(this.#daemon.heartbeatRequest());
+          registered = true;
+        } catch (error) {
+          if (isCredentialRejection(error)) {
+            rejectCredential();
+            break;
+          }
+          await wait(this.#pollIntervalMs, shutdown.signal);
+        }
+      }
+
+      if (registered && !shutdown.signal.aborted) {
+        heartbeatTask = this.#runHeartbeats(shutdown.signal).catch((error) => {
+          if (isCredentialRejection(error)) rejectCredential();
+          else {
+            heartbeatFailure = error;
+            shutdown.abort();
+          }
+        });
+      }
+
+      while (!shutdown.signal.aborted) {
+        try {
           for (const report of this.#daemon.pendingReports()) {
+            if (shutdown.signal.aborted) break;
             await this.#controller.report(report);
             this.#daemon.markReported(report.jobId, report.status);
           }
 
-          if (!signal.aborted) {
-            const job = await this.#controller.claim();
-            if (job) {
-              const receipt = await this.#daemon.executeJob(job);
-              if (
-                ["completed", "failed", "uncertain"].includes(receipt.status)
-              ) {
-                const report = this.#daemon.reportFor(job.jobId);
-                await this.#controller.report(report);
-                this.#daemon.markReported(job.jobId, report.status);
-              }
+          if (shutdown.signal.aborted) break;
+          const job = await this.#controller.claim();
+          if (shutdown.signal.aborted) break;
+          if (job) {
+            const receipt = await this.#daemon.executeJob(job);
+            if (
+              !credentialRejected &&
+              ["completed", "failed", "uncertain"].includes(receipt.status)
+            ) {
+              const report = this.#daemon.reportFor(job.jobId);
+              await this.#controller.report(report);
+              this.#daemon.markReported(job.jobId, report.status);
             }
           }
         } catch (error) {
-          if (
-            error instanceof ControllerHttpError &&
-            (error.status === 401 || error.status === 403)
-          ) {
-            throw new Error(
-              "Controller rejected the configured node identity or credential",
-            );
+          if (isCredentialRejection(error)) {
+            rejectCredential();
+            break;
           }
-          // Keep the durable receipt untouched; reconnect and reconcile it on a later bounded cycle.
+          // Keep durable receipts untouched; reconnect and reconcile on a later bounded cycle.
         }
-        await wait(this.#pollIntervalMs, signal);
+        await wait(this.#pollIntervalMs, shutdown.signal);
       }
     } finally {
+      shutdown.abort();
+      signal.removeEventListener("abort", requestShutdown);
+      if (heartbeatTask) await heartbeatTask;
       this.#running = false;
+    }
+
+    if (credentialRejected) {
+      throw new Error(
+        "Controller rejected the configured node identity or credential",
+      );
+    }
+    if (heartbeatFailure !== undefined) {
+      throw new Error("Execution heartbeat loop failed");
+    }
+  }
+
+  async #runHeartbeats(signal: AbortSignal): Promise<void> {
+    while (!signal.aborted) {
+      await wait(this.#heartbeatIntervalMs, signal);
+      if (signal.aborted) return;
+      try {
+        await this.#controller.heartbeat(this.#daemon.heartbeatRequest());
+      } catch (error) {
+        if (isCredentialRejection(error)) throw error;
+        if (!isRetryableHeartbeatFailure(error)) throw error;
+      }
     }
   }
 }

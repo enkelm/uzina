@@ -4,19 +4,19 @@ Implement the scope in `SPEC.md` through the slices below. A slice is complete o
 
 ## Slice ledger
 
-| Slice | Outcome                                                                                    | Dependencies                           | Status                                          |
-| ----- | ------------------------------------------------------------------------------------------ | -------------------------------------- | ----------------------------------------------- |
-| 0     | Bun workspace foundation, initial validated contracts, repeatable checks                   | None                                   | Complete                                        |
-| 1     | Persistent Pi Durable under Bun and Cloudflare; early managed-checkpoint feasibility proof | 0                                      | Integrated; pending review                      |
-| 2     | Authenticated execution daemon, explicit workspace jobs, Rex lifecycle                     | 0                                      | Integrated; pending review                      |
-| 3     | Owner-authenticated Factory commands, durable receipts, committed events                   | 0                                      | Integrated; pending review                      |
-| 4     | Cloud-managed Pi executes a bounded tool on a selected laptop                              | 1, 2, 3                                | Slice 4a implemented; slice 4b pending          |
-| 5     | Minimal operational PWA with retained request identities and reconnect handling            | 3, 4                                   | Not started                                     |
-| 6     | Persistent invitations, scoped roles, revocation, subscription enforcement                 | 3                                      | Not started                                     |
-| 7     | MCP tools and private Factory assistant using ordinary authorized operations               | 1, 3, 4                                | Not started                                     |
-| 8     | Coherent workspace and managed-runtime checkpoints; validated inactive restore             | 1, 2; workspace work can start after 0 | Workspace foundation integrated; pending review |
-| 9     | Safely relocate workspace execution between nodes                                          | 4, 8                                   | Not started                                     |
-| 10    | Transfer supported managed work from cloud to standalone local execution                   | 8, 9                                   | Not started                                     |
+| Slice | Outcome                                                                                    | Dependencies                           | Status                                           |
+| ----- | ------------------------------------------------------------------------------------------ | -------------------------------------- | ------------------------------------------------ |
+| 0     | Bun workspace foundation, initial validated contracts, repeatable checks                   | None                                   | Complete                                         |
+| 1     | Persistent Pi Durable under Bun and Cloudflare; early managed-checkpoint feasibility proof | 0                                      | Integrated; pending review                       |
+| 2     | Authenticated execution daemon, explicit workspace jobs, Rex lifecycle                     | 0                                      | Integrated; pending review                       |
+| 3     | Owner-authenticated Factory commands, durable receipts, committed events                   | 0                                      | Integrated; pending review                       |
+| 4     | Cloud-managed Pi executes a bounded tool on a selected laptop                              | 1, 2, 3                                | Slice 4a implemented; review pending; 4b pending |
+| 5     | Minimal operational PWA with retained request identities and reconnect handling            | 3, 4                                   | Not started                                      |
+| 6     | Persistent invitations, scoped roles, revocation, subscription enforcement                 | 3                                      | Not started                                      |
+| 7     | MCP tools and private Factory assistant using ordinary authorized operations               | 1, 3, 4                                | Not started                                      |
+| 8     | Coherent workspace and managed-runtime checkpoints; validated inactive restore             | 1, 2; workspace work can start after 0 | Workspace foundation integrated; pending review  |
+| 9     | Safely relocate workspace execution between nodes                                          | 4, 8                                   | Not started                                      |
+| 10    | Transfer supported managed work from cloud to standalone local execution                   | 8, 9                                   | Not started                                      |
 
 ## Execution rules
 
@@ -75,6 +75,28 @@ In the main checkout after implementing slice 4a:
 - `git diff --check` — passed.
 
 Production seams added: concrete authenticated node routes in `@uzina/core/http`; `FactoryService.registerExecutionNode`, `heartbeatExecutionNode`, `claimExecutionJob`, `reportExecutionJob`; trusted in-process `enqueueRemoteExecution` / `getRemoteExecutionReceipt`; local durable `ExecutionDaemon.pendingReports` / `markReported`; `ExecutionLoop`; and explicit `UZINA_MODE=connected-executor` startup. The managed Pi bridge and production Worker bindings remain slice 4b.
+
+### Slice 4a independent-review blocker follow-up
+
+The independent review of `e105be2` found two P2 defects. Before the fixes, `bun test apps/daemon/test/execution.test.ts apps/daemon/test/execution-controller.test.ts` failed four new regressions: a missing-file job stayed claimed and prevented a later job from reporting; a long argv effect had no intervening heartbeat; and deterministic oversized-write/traversal preflight failures threw without durable receipts.
+
+Implemented only those fixes:
+
+- Valid assigned jobs whose deterministic preflight fails now persist a terminal `failed` receipt and report. Invalid schemas, target identity, ownership generation, and conflicting job IDs still hard-fail before effects. The real HTTP regression reports a missing-file read as failed, then completes the next queued write, and verifies reopen/retry does not resurrect the failed job.
+- `ExecutionLoop` has a single background heartbeat task concurrent with effects. Cancellation stops its timer, waits for the bounded in-flight effect before returning/closing node storage, then reconciles a completed effect. Credential rejection stops later claims and propagates to startup. The loop rejects a second concurrent `run`; the bounded long-job test injects a short interval through the existing loop options, leaving production defaults unchanged.
+- A separate Miniflare execution claim/report round-trip across eviction was not added: the cloud Factory composition intentionally has no trusted job-admission binding yet, and providing one solely to seed the test would add a test-only/public admission path before slice 4b. The existing workerd proof still covers Factory bootstrap, managed-input admission, transaction receiver, eviction, and receipt deduplication; execution queue persistence/recovery remains covered against the actual local HTTP/SQLite host.
+
+Post-fix validation in the main checkout:
+
+- `bun test apps/daemon/test/execution.test.ts apps/daemon/test/execution-controller.test.ts` — passed: 14 tests, 107 assertions.
+- `bun run format` — passed.
+- `bun run check` — passed.
+- `bun run typecheck` — passed.
+- `bun run test` — passed: 72 tests across 13 files, 485 assertions, including the existing Miniflare/workerd tests.
+- `bun run build` — passed: daemon bundle 20 modules / 174.51 KiB; Wrangler dry-run 126.46 KiB estimated upload / 21.00 KiB gzip. Wrangler reported `No bindings found`; no deployment or production Worker claim.
+- `git diff --check` — passed.
+
+Independent reviewer approval remains pending. Slice 4b, production Cloudflare bindings, managed-Pi tool integration, and cloud-to-laptop operation remain unclaimed.
 
 ## Workflow
 

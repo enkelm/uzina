@@ -250,12 +250,15 @@ describe("authenticated Factory execution controller protocol", () => {
           }
         }
         if (route.endsWith("/report") && loseFirstReportAcknowledgement) {
-          loseFirstReportAcknowledgement = false;
-          reportCommittedResolve();
-          return Response.json(
-            { error: "lost_report_acknowledgement" },
-            { status: 502 },
-          );
+          const report = JSON.parse(requestBody ?? "{}") as { status?: string };
+          if (report.status === "completed") {
+            loseFirstReportAcknowledgement = false;
+            reportCommittedResolve();
+            return Response.json(
+              { error: "lost_report_acknowledgement" },
+              { status: 502 },
+            );
+          }
         }
         return upstream;
       },
@@ -283,6 +286,16 @@ describe("authenticated Factory execution controller protocol", () => {
         ).length === 1,
     );
 
+    const missingFileJob: ExecutionJob = executionJobSchema.parse({
+      contractVersion: 1,
+      jobId: "job:missing-file",
+      nodeId,
+      target: { nodeId, workspaceId },
+      ownershipGeneration: 0,
+      operation: "read-file",
+      path: "missing.txt",
+      maxBytes: 64,
+    });
     const job: ExecutionJob = executionJobSchema.parse({
       ...offlineJob,
       jobId: "job:write-workspace-file",
@@ -291,16 +304,39 @@ describe("authenticated Factory execution controller protocol", () => {
       ).toString("base64"),
     });
     expect(
+      (await localFactory.factory.enqueueRemoteExecution(missingFileJob))
+        .status,
+    ).toBe("queued");
+    expect(
       (await localFactory.factory.enqueueRemoteExecution(job)).status,
     ).toBe("queued");
-    await reportCommitted;
+    let reportTimedOut: ReturnType<typeof setTimeout> | undefined;
+    const completedReportArrived = await Promise.race([
+      reportCommitted.then(() => true),
+      new Promise<boolean>((resolve) => {
+        reportTimedOut = setTimeout(() => resolve(false), 2_000);
+      }),
+    ]);
+    if (reportTimedOut) clearTimeout(reportTimedOut);
     abort.abort();
     await running;
+    expect(completedReportArrived).toBe(true);
 
     expect(readFileSync(join(workspaceDirectory, "outcome.txt"), "utf8")).toBe(
       "performed by authenticated executor\n",
     );
-    expect(deliveredJobIds).toEqual([job.jobId, job.jobId]);
+    expect(() =>
+      readFileSync(join(workspaceDirectory, "missing.txt"), "utf8"),
+    ).toThrow();
+    expect(deliveredJobIds).toEqual([
+      missingFileJob.jobId,
+      missingFileJob.jobId,
+      job.jobId,
+    ]);
+    expect(executionDaemon.getReceipt(missingFileJob.jobId)).toMatchObject({
+      status: "failed",
+      errorCode: "workspace_path_not_found",
+    });
     expect(executionDaemon.getReceipt(job.jobId)?.status).toBe("completed");
     expect(
       executionDaemon.pendingReports().map((report) => report.jobId),
@@ -323,6 +359,22 @@ describe("authenticated Factory execution controller protocol", () => {
       daemonVersion: "test",
     });
     expect(executionDaemon.pendingReports()).toHaveLength(1);
+    const missingReceipt = executionDaemon.getReceipt(missingFileJob.jobId);
+    if (!missingReceipt)
+      throw new Error("Missing-file receipt was not persisted");
+    expect(missingReceipt).toMatchObject({
+      status: "failed",
+      errorCode: "workspace_path_not_found",
+    });
+    expect(await executionDaemon.executeJob(missingFileJob)).toEqual(
+      missingReceipt,
+    );
+    expect(
+      localFactory.factory.getRemoteExecutionReceipt(missingFileJob.jobId),
+    ).toMatchObject({
+      status: "failed",
+      errorCode: "workspace_path_not_found",
+    });
 
     const restartedConnector = new HttpExecutionControllerConnector({
       controllerUrl: localFactory.server.url.toString(),
@@ -366,15 +418,26 @@ describe("authenticated Factory execution controller protocol", () => {
     expect(
       localFactory.database.all<{ count: number }>(
         "SELECT COUNT(*) AS count FROM execution_job_claims WHERE job_id = ?",
-        [job.jobId],
+        [missingFileJob.jobId],
       )[0]?.count,
     ).toBe(2);
+    expect(
+      localFactory.database.all<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM execution_job_claims WHERE job_id = ?",
+        [job.jobId],
+      )[0]?.count,
+    ).toBe(1);
     expect(
       localFactory.database.all<{ report_sha256: string; report_json: string }>(
         "SELECT report_sha256, report_json FROM execution_jobs WHERE job_id = ?",
         [job.jobId],
       )[0],
     ).toMatchObject({ report_sha256: expect.stringMatching(/^[a-f0-9]{64}$/) });
+    expect(
+      (await localFactory.factory.enqueueRemoteExecution(missingFileJob))
+        .status,
+    ).toBe("failed");
+    expect(await restartedConnector.claim()).toBeNull();
     expect(
       (await localFactory.factory.enqueueRemoteExecution(job)).status,
     ).toBe("completed");
@@ -396,5 +459,262 @@ describe("authenticated Factory execution controller protocol", () => {
       executionDaemon.heartbeatRequest(),
     );
     expect(revokedNode.response.status).toBe(401);
+  });
+
+  test("keeps the controller heartbeat live during a bounded argv effect", async () => {
+    const root = temporaryRoot();
+    const workspaceDirectory = join(root, "workspace");
+    mkdirSync(workspaceDirectory);
+    localFactory = createLocalFactoryServer({
+      databasePath: join(root, "controller.sqlite"),
+      bootstrapSecret,
+      port: 0,
+    });
+    const controllerUrl = localFactory.server.url.toString();
+    const bootstrap = await fetch(new URL("/v1/bootstrap", controllerUrl), {
+      method: "POST",
+      headers: {
+        authorization: `Bootstrap ${bootstrapSecret}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ name: "Owner" }),
+    });
+    const owner = (await bootstrap.json()) as { credential: string };
+    const provisioned = await postJson<{
+      node: { nodeId: string };
+      credential: string;
+    }>(controllerUrl, "/v1/nodes", owner.credential, {
+      nodeId: "node:heartbeat-test",
+      name: "Heartbeat test node",
+    });
+    const nodeId = provisioned.value.node.nodeId;
+    const workspace = await postJson<{ workspaceId: string }>(
+      controllerUrl,
+      "/v1/workspaces",
+      owner.credential,
+      {
+        workspaceId: "workspace:heartbeat-test",
+        nodeId,
+        name: "Heartbeat workspace",
+      },
+    );
+    executionDaemon = new ExecutionDaemon({
+      databasePath: join(root, "executor.sqlite"),
+      nodeId,
+      nodeCredential: provisioned.value.credential,
+      workspaces: [
+        {
+          workspaceId: workspace.value.workspaceId,
+          directory: workspaceDirectory,
+        },
+      ],
+      daemonVersion: "test",
+    });
+    const connector = new HttpExecutionControllerConnector({
+      controllerUrl,
+      nodeId,
+      credential: provisioned.value.credential,
+    });
+    const abort = new AbortController();
+    const loop = new ExecutionLoop({
+      daemon: executionDaemon,
+      controller: connector,
+      pollIntervalMs: 10,
+      heartbeatIntervalMs: 25,
+    });
+    const running = loop.run(abort.signal);
+    await expect(loop.run(new AbortController().signal)).rejects.toThrow(
+      "Execution loop is already running",
+    );
+    const waitUntil = waitFor(2_000);
+    try {
+      await waitUntil(
+        () =>
+          localFactory!.database.all<{ node_id: string }>(
+            "SELECT node_id FROM execution_node_state WHERE node_id = ?",
+            [nodeId],
+          ).length === 1,
+      );
+      const job: ExecutionJob = executionJobSchema.parse({
+        contractVersion: 1,
+        jobId: "job:long-enough-for-heartbeats",
+        nodeId,
+        target: { nodeId, workspaceId: workspace.value.workspaceId },
+        ownershipGeneration: 0,
+        operation: "argv-command",
+        argv: [
+          process.execPath,
+          "-e",
+          "await Bun.sleep(400); process.stdout.write('finished')",
+        ],
+        timeoutMs: 2_000,
+        maxOutputBytes: 64,
+      });
+      expect(
+        (await localFactory.factory.enqueueRemoteExecution(job)).status,
+      ).toBe("queued");
+      await waitUntil(
+        () => executionDaemon!.getReceipt(job.jobId)?.status === "running",
+      );
+      const heartbeatsAtStart = localFactory.database.all<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM factory_events WHERE type = 'node.heartbeat'",
+      )[0]!.count;
+      await waitUntil(
+        () =>
+          executionDaemon!.getReceipt(job.jobId)?.status === "running" &&
+          localFactory!.database.all<{ count: number }>(
+            "SELECT COUNT(*) AS count FROM factory_events WHERE type = 'node.heartbeat'",
+          )[0]!.count >=
+            heartbeatsAtStart + 2,
+      );
+      expect(executionDaemon.getReceipt(job.jobId)?.status).toBe("running");
+      abort.abort();
+      let settleTimer: ReturnType<typeof setTimeout> | undefined;
+      const settledBeforeEffectFinished = await Promise.race([
+        running.then(
+          () => true,
+          () => true,
+        ),
+        new Promise<boolean>((resolve) => {
+          settleTimer = setTimeout(() => resolve(false), 25);
+        }),
+      ]);
+      if (settleTimer) clearTimeout(settleTimer);
+      expect(settledBeforeEffectFinished).toBe(false);
+      expect(executionDaemon.getReceipt(job.jobId)?.status).toBe("running");
+      await running;
+      expect(
+        localFactory.factory.getRemoteExecutionReceipt(job.jobId),
+      ).toMatchObject({
+        status: "completed",
+        result: { operation: "argv-command", stdout: "finished" },
+      });
+      const heartbeatsAfterShutdown = localFactory.database.all<{
+        count: number;
+      }>(
+        "SELECT COUNT(*) AS count FROM factory_events WHERE type = 'node.heartbeat'",
+      )[0]!.count;
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      expect(
+        localFactory.database.all<{ count: number }>(
+          "SELECT COUNT(*) AS count FROM factory_events WHERE type = 'node.heartbeat'",
+        )[0]!.count,
+      ).toBe(heartbeatsAfterShutdown);
+    } finally {
+      abort.abort();
+      await running;
+    }
+  });
+
+  test("stops claiming after a heartbeat credential refusal and propagates it", async () => {
+    const root = temporaryRoot();
+    const workspaceDirectory = join(root, "workspace");
+    mkdirSync(workspaceDirectory);
+    localFactory = createLocalFactoryServer({
+      databasePath: join(root, "controller.sqlite"),
+      bootstrapSecret,
+      port: 0,
+    });
+    const controllerUrl = localFactory.server.url.toString();
+    const bootstrap = await fetch(new URL("/v1/bootstrap", controllerUrl), {
+      method: "POST",
+      headers: {
+        authorization: `Bootstrap ${bootstrapSecret}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ name: "Owner" }),
+    });
+    const owner = (await bootstrap.json()) as { credential: string };
+    const provisioned = await postJson<{
+      node: { nodeId: string };
+      credentialId: string;
+      credential: string;
+    }>(controllerUrl, "/v1/nodes", owner.credential, {
+      nodeId: "node:revoked-loop",
+      name: "Revoked loop node",
+    });
+    const nodeId = provisioned.value.node.nodeId;
+    const workspace = await postJson<{ workspaceId: string }>(
+      controllerUrl,
+      "/v1/workspaces",
+      owner.credential,
+      {
+        workspaceId: "workspace:revoked-loop",
+        nodeId,
+        name: "Revoked workspace",
+      },
+    );
+    executionDaemon = new ExecutionDaemon({
+      databasePath: join(root, "executor.sqlite"),
+      nodeId,
+      nodeCredential: provisioned.value.credential,
+      workspaces: [
+        {
+          workspaceId: workspace.value.workspaceId,
+          directory: workspaceDirectory,
+        },
+      ],
+    });
+
+    let claimRequests = 0;
+    let heartbeatRequests = 0;
+    let refusedHeartbeats = 0;
+    const proxy = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        const route = new URL(request.url).pathname;
+        if (route.endsWith("/jobs/claim")) claimRequests += 1;
+        if (route.endsWith("/heartbeat")) {
+          heartbeatRequests += 1;
+          if (heartbeatRequests > 1) {
+            refusedHeartbeats += 1;
+            return Response.json(
+              { error: "credential_revoked" },
+              { status: 401 },
+            );
+          }
+        }
+        const body =
+          request.method === "GET" ? undefined : await request.text();
+        return fetch(new URL(route, controllerUrl), {
+          method: request.method,
+          headers: request.headers,
+          ...(body === undefined ? {} : { body }),
+        });
+      },
+    });
+    servers.push(proxy);
+    const loop = new ExecutionLoop({
+      daemon: executionDaemon,
+      controller: new HttpExecutionControllerConnector({
+        controllerUrl: proxy.url.toString(),
+        nodeId,
+        credential: provisioned.value.credential,
+      }),
+      pollIntervalMs: 500,
+      heartbeatIntervalMs: 20,
+    });
+    const abort = new AbortController();
+    const running = loop.run(abort.signal);
+    const waitUntil = waitFor(2_000);
+    try {
+      await waitUntil(
+        () =>
+          localFactory!.database.all<{ node_id: string }>(
+            "SELECT node_id FROM execution_node_state WHERE node_id = ?",
+            [nodeId],
+          ).length === 1,
+      );
+      await expect(running).rejects.toThrow(
+        "Controller rejected the configured node identity or credential",
+      );
+      expect(refusedHeartbeats).toBeGreaterThan(0);
+      const claimsAtStop = claimRequests;
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      expect(claimRequests).toBe(claimsAtStop);
+    } finally {
+      abort.abort();
+      await running.catch(() => undefined);
+    }
   });
 });

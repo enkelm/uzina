@@ -173,7 +173,7 @@ describe("persistent execution daemon", () => {
     },
   );
 
-  test("bounds file reads and rejects writes above the maximum byte size", async () => {
+  test("bounds file effects and persists deterministic preflight failures", async () => {
     const { workspace, daemon } = fixture();
     writeFileSync(join(workspace, "large.bin"), Buffer.alloc(8, 65));
     const read = await daemon.executeJob(
@@ -188,11 +188,28 @@ describe("persistent execution daemon", () => {
     expect(read.errorCode).toBe("file_size_limit_exceeded");
 
     const oversized = Buffer.alloc(1_048_577).toString("base64");
-    await expect(
-      daemon.executeJob(
-        job({ jobId: "job:write-limit", contentBase64: oversized }),
+    const rejectedWrite = await daemon.executeJob(
+      job({ jobId: "job:write-limit", contentBase64: oversized }),
+    );
+    expect(rejectedWrite).toMatchObject({
+      status: "failed",
+      errorCode: "invalid_file_content",
+    });
+    expect(daemon.reportFor("job:write-limit")).toMatchObject({
+      status: "failed",
+      errorCode: "invalid_file_content",
+    });
+    expect(() =>
+      readFileSync(join(workspace, "artifact.txt"), "utf8"),
+    ).toThrow();
+    expect(
+      await daemon.executeJob(
+        job({
+          jobId: "job:write-limit",
+          contentBase64: oversized,
+        }),
       ),
-    ).rejects.toThrow("invalid_file_content");
+    ).toEqual(rejectedWrite);
   });
 
   test("rejects wrong targets, generations, unsupported operations, and bounded-size violations", async () => {
@@ -206,6 +223,7 @@ describe("persistent execution daemon", () => {
         }),
       ),
     ).rejects.toThrow("target_node_mismatch");
+    expect(daemon.getReceipt("job:one")).toBeUndefined();
     await expect(
       daemon.executeJob(job({ ownershipGeneration: 3 })),
     ).rejects.toThrow("stale_ownership_generation");
@@ -236,25 +254,37 @@ describe("persistent execution daemon", () => {
     writeFileSync(join(root, "outside-dir", "secret.txt"), "secret");
     symlinkSync(join(root, "outside-dir"), join(workspace, "outside-link-dir"));
 
-    await expect(
-      daemon.executeJob(
-        job({ jobId: "job:traversal", path: "../outside.txt" }),
-      ),
-    ).rejects.toThrow("unsafe_workspace_path");
-    await expect(
-      daemon.executeJob(job({ jobId: "job:link", path: "outside-link.txt" })),
-    ).rejects.toThrow("workspace_symlink_rejected");
-    await expect(
-      daemon.executeJob(
-        job({
-          jobId: "job:link-dir",
-          operation: "read-file",
-          path: "outside-link-dir/secret.txt",
-          maxBytes: 32,
-          contentBase64: undefined,
-        }),
-      ),
-    ).rejects.toThrow("workspace_symlink_rejected");
+    const traversal = await daemon.executeJob(
+      job({ jobId: "job:traversal", path: "../outside.txt" }),
+    );
+    expect(traversal).toMatchObject({
+      status: "failed",
+      errorCode: "unsafe_workspace_path",
+    });
+    const linkWrite = await daemon.executeJob(
+      job({ jobId: "job:link", path: "outside-link.txt" }),
+    );
+    expect(linkWrite).toMatchObject({
+      status: "failed",
+      errorCode: "workspace_symlink_rejected",
+    });
+    const linkRead = await daemon.executeJob(
+      job({
+        jobId: "job:link-dir",
+        operation: "read-file",
+        path: "outside-link-dir/secret.txt",
+        maxBytes: 32,
+        contentBase64: undefined,
+      }),
+    );
+    expect(linkRead).toMatchObject({
+      status: "failed",
+      errorCode: "workspace_symlink_rejected",
+    });
+    expect(daemon.reportFor("job:traversal")).toMatchObject({
+      status: "failed",
+      errorCode: "unsafe_workspace_path",
+    });
     expect(readFileSync(outside, "utf8")).toBe("outside original");
   });
 
