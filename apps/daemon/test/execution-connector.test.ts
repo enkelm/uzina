@@ -3,7 +3,9 @@ import { executionPayloadSha256 } from "../src/execution/payload";
 import {
   ControllerHttpError,
   ControllerProtocolError,
+  ControllerTransportError,
   HttpExecutionControllerConnector,
+  isRetryableControllerFailure,
 } from "../src/execution/connector";
 
 const servers: Array<ReturnType<typeof Bun.serve>> = [];
@@ -194,6 +196,37 @@ describe("outbound execution controller connector", () => {
     });
     await expect(connector.claim()).rejects.toBeInstanceOf(
       ControllerProtocolError,
+    );
+  });
+
+  test("classifies transport loss separately from local and protocol failures", async () => {
+    const server = start(() => Response.json({}));
+    const controllerUrl = server.url.toString();
+    await server.stop(true);
+    const connector = new HttpExecutionControllerConnector({
+      controllerUrl,
+      nodeId: "node:test",
+      credential: "controller-node-secret",
+    });
+    await expect(connector.claim()).rejects.toBeInstanceOf(
+      ControllerTransportError,
+    );
+    expect(isRetryableControllerFailure(new ControllerTransportError())).toBe(
+      true,
+    );
+    expect(isRetryableControllerFailure(new ControllerHttpError(502))).toBe(
+      true,
+    );
+    expect(isRetryableControllerFailure(new ControllerHttpError(409))).toBe(
+      false,
+    );
+    expect(
+      isRetryableControllerFailure(
+        new ControllerProtocolError("malformed response"),
+      ),
+    ).toBe(false);
+    expect(isRetryableControllerFailure(new Error("local failure"))).toBe(
+      false,
     );
   });
 

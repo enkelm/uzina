@@ -1,4 +1,4 @@
-import { ControllerHttpError } from "./connector";
+import { ControllerHttpError, isRetryableControllerFailure } from "./connector";
 import type { ExecutionControllerConnector } from "./connector";
 import type { ExecutionDaemon } from "./daemon";
 
@@ -47,16 +47,6 @@ function isCredentialRejection(error: unknown): boolean {
   );
 }
 
-function isRetryableHeartbeatFailure(error: unknown): boolean {
-  return (
-    error instanceof TypeError ||
-    (error instanceof ControllerHttpError &&
-      (error.status === 408 || error.status === 429 || error.status >= 500)) ||
-    (error instanceof DOMException &&
-      (error.name === "TimeoutError" || error.name === "AbortError"))
-  );
-}
-
 /** Node-owned poller: heartbeat and each workspace effect remain independently bounded. */
 export class ExecutionLoop {
   readonly #daemon: ExecutionDaemon;
@@ -82,7 +72,7 @@ export class ExecutionLoop {
 
     let registered = false;
     let credentialRejected = false;
-    let heartbeatFailure: unknown;
+    let heartbeatFailure: { error: unknown } | undefined;
     let heartbeatTask: Promise<void> | undefined;
     const rejectCredential = () => {
       credentialRejected = true;
@@ -101,6 +91,7 @@ export class ExecutionLoop {
             rejectCredential();
             break;
           }
+          if (!isRetryableControllerFailure(error)) throw error;
           await wait(this.#pollIntervalMs, shutdown.signal);
         }
       }
@@ -109,7 +100,7 @@ export class ExecutionLoop {
         heartbeatTask = this.#runHeartbeats(shutdown.signal).catch((error) => {
           if (isCredentialRejection(error)) rejectCredential();
           else {
-            heartbeatFailure = error;
+            heartbeatFailure = { error };
             shutdown.abort();
           }
         });
@@ -142,7 +133,8 @@ export class ExecutionLoop {
             rejectCredential();
             break;
           }
-          // Keep durable receipts untouched; reconnect and reconcile on a later bounded cycle.
+          if (!isRetryableControllerFailure(error)) throw error;
+          // Preserve durable receipts while retrying transient controller failures.
         }
         await wait(this.#pollIntervalMs, shutdown.signal);
       }
@@ -158,9 +150,7 @@ export class ExecutionLoop {
         "Controller rejected the configured node identity or credential",
       );
     }
-    if (heartbeatFailure !== undefined) {
-      throw new Error("Execution heartbeat loop failed");
-    }
+    if (heartbeatFailure) throw heartbeatFailure.error;
   }
 
   async #runHeartbeats(signal: AbortSignal): Promise<void> {
@@ -171,7 +161,7 @@ export class ExecutionLoop {
         await this.#controller.heartbeat(this.#daemon.heartbeatRequest());
       } catch (error) {
         if (isCredentialRejection(error)) throw error;
-        if (!isRetryableHeartbeatFailure(error)) throw error;
+        if (!isRetryableControllerFailure(error)) throw error;
       }
     }
   }

@@ -27,6 +27,32 @@ export class ControllerProtocolError extends Error {
   }
 }
 
+export class ControllerTransportError extends Error {
+  constructor() {
+    super("Controller transport failed");
+    this.name = "ControllerTransportError";
+  }
+}
+
+function isTransportFailure(error: unknown): boolean {
+  return (
+    error instanceof TypeError ||
+    (error instanceof DOMException &&
+      (error.name === "TimeoutError" || error.name === "AbortError"))
+  );
+}
+
+export function isRetryableControllerFailure(error: unknown): boolean {
+  return (
+    error instanceof ControllerTransportError ||
+    (error instanceof ControllerHttpError &&
+      (error.status === 408 ||
+        error.status === 425 ||
+        error.status === 429 ||
+        error.status >= 500))
+  );
+}
+
 export interface ExecutionControllerConnector {
   register(request: unknown): Promise<void>;
   heartbeat(request: unknown): Promise<void>;
@@ -132,22 +158,34 @@ export class HttpExecutionControllerConnector implements ExecutionControllerConn
       ): { success: true; data: T } | { success: false; error: unknown };
     },
   ): Promise<T> {
-    const response = await fetch(`${this.#baseUrl}${route}`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${this.#credential}`,
-        "content-type": "application/json",
-        accept: "application/json",
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(30_000),
-    });
+    const requestUrl = `${this.#baseUrl}${route}`;
+    const requestBody = JSON.stringify(body);
+    const timeout = AbortSignal.timeout(30_000);
+    let response: Response;
+    try {
+      response = await fetch(requestUrl, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${this.#credential}`,
+          "content-type": "application/json",
+          accept: "application/json",
+        },
+        body: requestBody,
+        signal: timeout,
+      });
+    } catch (error) {
+      if (isTransportFailure(error)) {
+        throw new ControllerTransportError();
+      }
+      throw error;
+    }
     if (!response.ok) throw new ControllerHttpError(response.status);
 
     let value: unknown;
     try {
       value = await response.json();
-    } catch {
+    } catch (error) {
+      if (isTransportFailure(error)) throw new ControllerTransportError();
       throw new ControllerProtocolError("Controller returned invalid JSON");
     }
     const parsed = schema.safeParse(value);

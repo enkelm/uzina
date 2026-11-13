@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import {
   chmodSync,
   mkdtempSync,
@@ -210,6 +211,32 @@ describe("persistent execution daemon", () => {
         }),
       ),
     ).toEqual(rejectedWrite);
+  });
+
+  test("does not convert a failed receipt write into a terminal filesystem failure", async () => {
+    const { root, daemon } = fixture();
+    const database = new Database(join(root, "node.sqlite"));
+    database.exec(`
+      CREATE TRIGGER reject_failed_receipt
+      BEFORE INSERT ON execution_jobs
+      WHEN NEW.status = 'failed'
+      BEGIN
+        SELECT RAISE(ABORT, 'receipt write blocked');
+      END;
+    `);
+    database.close();
+
+    await expect(
+      daemon.executeJob(
+        job({
+          jobId: "job:failed-receipt-write",
+          operation: "read-file",
+          path: "missing.txt",
+          maxBytes: 64,
+        }),
+      ),
+    ).rejects.toThrow("receipt write blocked");
+    expect(daemon.getReceipt("job:failed-receipt-write")).toBeUndefined();
   });
 
   test("rejects wrong targets, generations, unsupported operations, and bounded-size violations", async () => {

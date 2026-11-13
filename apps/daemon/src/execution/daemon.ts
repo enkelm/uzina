@@ -112,6 +112,26 @@ function hasSymlink(component: string): boolean {
   }
 }
 
+const FILESYSTEM_EXECUTION_CODES: Readonly<Record<string, string>> = {
+  EACCES: "workspace_path_access_denied",
+  EISDIR: "workspace_path_is_directory",
+  ELOOP: "workspace_symlink_rejected",
+  ENAMETOOLONG: "workspace_path_too_long",
+  ENOENT: "workspace_path_not_found",
+  ENOTDIR: "workspace_path_not_directory",
+  EPERM: "workspace_path_access_denied",
+};
+
+function filesystemErrorAsExecutionFailure(
+  error: unknown,
+): ExecutionError | undefined {
+  if (error instanceof ExecutionError) return error;
+  if (!(error instanceof Error) || !("code" in error)) return undefined;
+  const code = (error as NodeJS.ErrnoException).code;
+  const executionCode = code ? FILESYSTEM_EXECUTION_CODES[code] : undefined;
+  return executionCode ? new ExecutionError(executionCode) : undefined;
+}
+
 function errorCode(error: unknown): string {
   if (error instanceof ExecutionError) return error.code;
   if (error && typeof error === "object" && "code" in error) {
@@ -424,7 +444,8 @@ export class ExecutionDaemon {
       try {
         this.#preflightJob(job);
       } catch (error) {
-        if (!(error instanceof ExecutionError)) throw error;
+        const failure = filesystemErrorAsExecutionFailure(error);
+        if (!failure) throw error;
         const finishedAt = new Date().toISOString();
         this.#db
           .query(
@@ -442,7 +463,7 @@ export class ExecutionDaemon {
             job.operation,
             acceptedAt,
             finishedAt,
-            errorCode(error),
+            failure.code,
           );
         return this.#receipt(this.#jobRow(job.jobId)!);
       }
@@ -512,10 +533,16 @@ export class ExecutionDaemon {
         status === "failed" ? "command_failed" : undefined,
       );
     } catch (error) {
-      const code = errorCode(error);
+      const failure = filesystemErrorAsExecutionFailure(error);
+      if (!(error instanceof UncertainEffectError) && !failure) throw error;
       const status =
         error instanceof UncertainEffectError ? "uncertain" : "failed";
-      return this.#finishJob(job.jobId, status, undefined, code);
+      return this.#finishJob(
+        job.jobId,
+        status,
+        undefined,
+        errorCode(failure ?? error),
+      );
     }
   }
 

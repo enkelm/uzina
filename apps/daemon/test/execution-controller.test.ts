@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -13,7 +19,10 @@ import {
   type LocalFactoryServer,
 } from "../src/factory/server";
 import { ExecutionDaemon } from "../src/execution/daemon";
-import { HttpExecutionControllerConnector } from "../src/execution/connector";
+import {
+  ControllerProtocolError,
+  HttpExecutionControllerConnector,
+} from "../src/execution/connector";
 import { ExecutionLoop } from "../src/execution/loop";
 
 const bootstrapSecret = "private-controller-bootstrap-fixture";
@@ -286,6 +295,7 @@ describe("authenticated Factory execution controller protocol", () => {
         ).length === 1,
     );
 
+    writeFileSync(join(workspaceDirectory, "plain-file"), "not a directory");
     const missingFileJob: ExecutionJob = executionJobSchema.parse({
       contractVersion: 1,
       jobId: "job:missing-file",
@@ -296,6 +306,34 @@ describe("authenticated Factory execution controller protocol", () => {
       path: "missing.txt",
       maxBytes: 64,
     });
+    const intermediateFileJob: ExecutionJob = executionJobSchema.parse({
+      contractVersion: 1,
+      jobId: "job:intermediate-file",
+      nodeId,
+      target: { nodeId, workspaceId },
+      ownershipGeneration: 0,
+      operation: "read-file",
+      path: "plain-file/child.txt",
+      maxBytes: 64,
+    });
+    const excessivePathJob: ExecutionJob = executionJobSchema.parse({
+      contractVersion: 1,
+      jobId: "job:excessive-path-component",
+      nodeId,
+      target: { nodeId, workspaceId },
+      ownershipGeneration: 0,
+      operation: "read-file",
+      path: `${"x".repeat(300)}/child.txt`,
+      maxBytes: 64,
+    });
+    const preflightFailures = [
+      { job: missingFileJob, errorCode: "workspace_path_not_found" },
+      {
+        job: intermediateFileJob,
+        errorCode: "workspace_path_not_directory",
+      },
+      { job: excessivePathJob, errorCode: "workspace_path_too_long" },
+    ];
     const job: ExecutionJob = executionJobSchema.parse({
       ...offlineJob,
       jobId: "job:write-workspace-file",
@@ -303,10 +341,11 @@ describe("authenticated Factory execution controller protocol", () => {
         "performed by authenticated executor\n",
       ).toString("base64"),
     });
-    expect(
-      (await localFactory.factory.enqueueRemoteExecution(missingFileJob))
-        .status,
-    ).toBe("queued");
+    for (const failure of preflightFailures) {
+      expect(
+        (await localFactory.factory.enqueueRemoteExecution(failure.job)).status,
+      ).toBe("queued");
+    }
     expect(
       (await localFactory.factory.enqueueRemoteExecution(job)).status,
     ).toBe("queued");
@@ -328,15 +367,29 @@ describe("authenticated Factory execution controller protocol", () => {
     expect(() =>
       readFileSync(join(workspaceDirectory, "missing.txt"), "utf8"),
     ).toThrow();
-    expect(deliveredJobIds).toEqual([
-      missingFileJob.jobId,
-      missingFileJob.jobId,
-      job.jobId,
+    const firstClaimedJobId = deliveredJobIds[0];
+    expect(deliveredJobIds.slice(0, 2)).toEqual([
+      firstClaimedJobId,
+      firstClaimedJobId,
     ]);
-    expect(executionDaemon.getReceipt(missingFileJob.jobId)).toMatchObject({
-      status: "failed",
-      errorCode: "workspace_path_not_found",
-    });
+    expect(
+      preflightFailures.some(
+        (failure) => failure.job.jobId === firstClaimedJobId,
+      ),
+    ).toBe(true);
+    expect(deliveredJobIds.slice(2, -1).sort()).toEqual(
+      preflightFailures
+        .map((failure) => failure.job.jobId)
+        .filter((jobId) => jobId !== firstClaimedJobId)
+        .sort(),
+    );
+    expect(deliveredJobIds.at(-1)).toBe(job.jobId);
+    for (const failure of preflightFailures) {
+      expect(executionDaemon.getReceipt(failure.job.jobId)).toMatchObject({
+        status: "failed",
+        errorCode: failure.errorCode,
+      });
+    }
     expect(executionDaemon.getReceipt(job.jobId)?.status).toBe("completed");
     expect(
       executionDaemon.pendingReports().map((report) => report.jobId),
@@ -359,22 +412,20 @@ describe("authenticated Factory execution controller protocol", () => {
       daemonVersion: "test",
     });
     expect(executionDaemon.pendingReports()).toHaveLength(1);
-    const missingReceipt = executionDaemon.getReceipt(missingFileJob.jobId);
-    if (!missingReceipt)
-      throw new Error("Missing-file receipt was not persisted");
-    expect(missingReceipt).toMatchObject({
-      status: "failed",
-      errorCode: "workspace_path_not_found",
-    });
-    expect(await executionDaemon.executeJob(missingFileJob)).toEqual(
-      missingReceipt,
-    );
-    expect(
-      localFactory.factory.getRemoteExecutionReceipt(missingFileJob.jobId),
-    ).toMatchObject({
-      status: "failed",
-      errorCode: "workspace_path_not_found",
-    });
+    for (const failure of preflightFailures) {
+      const receipt = executionDaemon.getReceipt(failure.job.jobId);
+      if (!receipt) {
+        throw new Error(`Receipt for ${failure.job.jobId} was not persisted`);
+      }
+      expect(receipt).toMatchObject({
+        status: "failed",
+        errorCode: failure.errorCode,
+      });
+      expect(await executionDaemon.executeJob(failure.job)).toEqual(receipt);
+      expect(
+        localFactory.factory.getRemoteExecutionReceipt(failure.job.jobId),
+      ).toMatchObject({ status: "failed", errorCode: failure.errorCode });
+    }
 
     const restartedConnector = new HttpExecutionControllerConnector({
       controllerUrl: localFactory.server.url.toString(),
@@ -420,7 +471,7 @@ describe("authenticated Factory execution controller protocol", () => {
         "SELECT COUNT(*) AS count FROM execution_job_claims WHERE job_id = ?",
         [missingFileJob.jobId],
       )[0]?.count,
-    ).toBe(2);
+    ).toBe(firstClaimedJobId === missingFileJob.jobId ? 2 : 1);
     expect(
       localFactory.database.all<{ count: number }>(
         "SELECT COUNT(*) AS count FROM execution_job_claims WHERE job_id = ?",
@@ -459,6 +510,66 @@ describe("authenticated Factory execution controller protocol", () => {
       executionDaemon.heartbeatRequest(),
     );
     expect(revokedNode.response.status).toBe(401);
+  });
+
+  test("fails closed on local storage and controller protocol errors", async () => {
+    const root = temporaryRoot();
+    const workspaceDirectory = join(root, "workspace");
+    mkdirSync(workspaceDirectory);
+    const makeDaemon = (databaseName: string) =>
+      new ExecutionDaemon({
+        databasePath: join(root, databaseName),
+        nodeId: "node:error-loop",
+        nodeCredential: "node-error-loop-secret",
+        workspaces: [
+          {
+            workspaceId: "workspace:error-loop",
+            directory: workspaceDirectory,
+          },
+        ],
+      });
+
+    executionDaemon = makeDaemon("local-error.sqlite");
+    let claimsAfterLocalFailure = 0;
+    const localFailureLoop = new ExecutionLoop({
+      daemon: executionDaemon,
+      controller: {
+        register: async () => undefined,
+        heartbeat: async () => executionDaemon!.close(),
+        claim: async () => {
+          claimsAfterLocalFailure += 1;
+          return null;
+        },
+        report: async () => undefined,
+      },
+      pollIntervalMs: 10,
+      heartbeatIntervalMs: 20,
+    });
+    await expect(
+      localFailureLoop.run(new AbortController().signal),
+    ).rejects.toThrow("daemon_closed");
+    expect(claimsAfterLocalFailure).toBe(0);
+
+    executionDaemon = makeDaemon("protocol-error.sqlite");
+    let protocolClaims = 0;
+    const protocolFailureLoop = new ExecutionLoop({
+      daemon: executionDaemon,
+      controller: {
+        register: async () => undefined,
+        heartbeat: async () => undefined,
+        claim: async () => {
+          protocolClaims += 1;
+          throw new ControllerProtocolError("invalid controller response");
+        },
+        report: async () => undefined,
+      },
+      pollIntervalMs: 10,
+      heartbeatIntervalMs: 20,
+    });
+    await expect(
+      protocolFailureLoop.run(new AbortController().signal),
+    ).rejects.toBeInstanceOf(ControllerProtocolError);
+    expect(protocolClaims).toBe(1);
   });
 
   test("keeps the controller heartbeat live during a bounded argv effect", async () => {

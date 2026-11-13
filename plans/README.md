@@ -98,6 +98,26 @@ Post-fix validation in the main checkout:
 
 Independent reviewer approval remains pending. Slice 4b, production Cloudflare bindings, managed-Pi tool integration, and cloud-to-laptop operation remain unclaimed.
 
+### Re-review correction: filesystem failures and retry classification
+
+A subsequent read-only review found that the first preflight fix handled typed `ExecutionError`s but missed native filesystem errors. The repro was a valid read job for `plain-file/child.txt` when `plain-file` was a regular file: `lstat` raised `ENOTDIR`, leaving the node receipt absent and the Factory job claimed. It also identified that `ExecutionLoop` swallowed local and protocol errors in broad retry catches.
+
+The correction now maps an explicit allowlist of expected path errors (`ENOENT`, `ENOTDIR`, `EACCES`, `EPERM`, `ELOOP`, `EISDIR`, `ENAMETOOLONG`) to safe reportable execution failures. The mapping is confined to filesystem preflight/effect handling; receipt persistence errors and unrecognized/programming errors propagate instead of becoming filesystem receipts. The loop retries only connector-classified transport loss and transient HTTP responses (408, 425, 429, and 5xx); credential refusal remains terminal, and local storage/protocol/other HTTP failures fail closed. Existing 502 lost-ack reconciliation remains exercised by the real HTTP integration test.
+
+The real HTTP queue-progress regression now queues a missing leaf, an intermediate regular-file path (`ENOTDIR`), an overlong path component, and then a valid workspace write. It verifies all failure reports, the later successful mutation, and failed-receipt persistence/reconciliation after controller and executor reopen. Additional regressions verify that failed receipt persistence surfaces a SQLite trigger error and that local-storage and protocol failures terminate the loop instead of retrying indefinitely.
+
+Post-correction validation in the main checkout:
+
+- `bun test apps/daemon/test/execution.test.ts apps/daemon/test/execution-connector.test.ts apps/daemon/test/execution-controller.test.ts` — passed: 20 tests, 146 assertions.
+- `bun run format` — passed.
+- `bun run check` — passed.
+- `bun run typecheck` — passed.
+- `bun run test` — passed: 75 tests across 13 files, 510 assertions.
+- `bun run build` — passed: daemon bundle 20 modules / 176.12 KiB; Wrangler dry-run 126.46 KiB estimated upload / 21.00 KiB gzip. Wrangler printed `No bindings found`; no deployment or production Worker binding is claimed.
+- `git diff --check` — passed.
+
+Independent reviewer approval of this re-review correction remains required. Slice 4b and production/cloud-to-laptop claims remain out of scope.
+
 ## Workflow
 
 1. Scaffold and review slice 0.
