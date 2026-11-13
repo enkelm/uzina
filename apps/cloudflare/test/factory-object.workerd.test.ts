@@ -17,6 +17,7 @@ describe("Cloudflare Factory in Miniflare workerd", () => {
       outdir: directory,
       target: "browser",
       packages: "bundle",
+      external: ["cloudflare:workers"],
       sourcemap: "none",
     });
     if (!build.success) {
@@ -33,6 +34,7 @@ describe("Cloudflare Factory in Miniflare workerd", () => {
       bindings: { UZINA_BOOTSTRAP_SECRET: bootstrapSecret },
       durableObjects: {
         FACTORY: { className: "TestFactory", useSQLite: true },
+        MANAGED_WORK: { className: "TestManagedWork", useSQLite: true },
       },
     });
     const request = async <T>(

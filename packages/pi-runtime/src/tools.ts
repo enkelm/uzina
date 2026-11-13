@@ -3,6 +3,7 @@ import {
   defineExtension,
   defineTool,
   type Extension,
+  type ToolExecutionApi,
   type ToolRegistration,
 } from "@earendil-works/pi-durable";
 import { Type } from "typebox";
@@ -23,15 +24,21 @@ export type RemoteCommandResult = {
   exitCode: number;
 };
 
-/** Bounded destination calls. The executor is responsible for workspace authorization and path safety. */
+export type RemoteToolIdentity = {
+  conversationId: number;
+  taskId: string;
+  callId: string;
+};
+
+/** Bounded destination calls; hosts derive destination authority from accepted Factory work. */
 export interface RemoteToolExecutor {
   readFile(
     input: { path: string; maxBytes: number },
-    context: Context,
+    identity: RemoteToolIdentity,
   ): Promise<RemoteReadResult>;
   writeFile(
     input: { path: string; content: string },
-    context: Context,
+    identity: RemoteToolIdentity,
   ): Promise<void>;
   runCommand(
     input: {
@@ -40,7 +47,7 @@ export interface RemoteToolExecutor {
       timeoutMs: number;
       maxOutputBytes: number;
     },
-    context: Context,
+    identity: RemoteToolIdentity,
   ): Promise<RemoteCommandResult>;
 }
 
@@ -106,6 +113,28 @@ function outputText(value: unknown): string {
   return JSON.stringify(value);
 }
 
+const REMOTE_EFFECT_MEMO = "uzina.remote-effect-evidence";
+
+async function toolIdentity(
+  api: ToolExecutionApi,
+  context: Context,
+): Promise<RemoteToolIdentity> {
+  const identity = {
+    conversationId: api.conversationId,
+    taskId: String(api.taskId),
+    callId: api.callId,
+  };
+  const stored = await api.memo(REMOTE_EFFECT_MEMO, identity, context);
+  if (
+    stored.conversationId !== identity.conversationId ||
+    stored.taskId !== identity.taskId ||
+    stored.callId !== identity.callId
+  ) {
+    throw new Error("Pi Durable effect evidence changed during recovery");
+  }
+  return identity;
+}
+
 function createRemoteTools(executor: RemoteToolExecutor): ToolRegistration[] {
   const read = defineTool({
     name: "remote_read_file",
@@ -114,11 +143,11 @@ function createRemoteTools(executor: RemoteToolExecutor): ToolRegistration[] {
     parameters: readSchema,
     structuredOutputSchema: readOutputSchema,
     replay: "safe",
-    async execute(args, _api, context) {
+    async execute(args, api, context) {
       const maxBytes = args.maxBytes ?? MAX_REMOTE_FILE_BYTES;
       const result = await executor.readFile(
         { path: args.path, maxBytes },
-        context,
+        await toolIdentity(api, context),
       );
       const content = truncateUtf8(result.content, maxBytes);
       const truncated = result.truncated || content !== result.content;
@@ -136,7 +165,7 @@ function createRemoteTools(executor: RemoteToolExecutor): ToolRegistration[] {
       "Write a bounded UTF-8 file inside the explicitly assigned workspace.",
     parameters: writeSchema,
     replay: "unsafe",
-    async execute(args, _api, context) {
+    async execute(args, api, context) {
       if (
         new TextEncoder().encode(args.content).byteLength >
         MAX_REMOTE_FILE_BYTES
@@ -145,7 +174,7 @@ function createRemoteTools(executor: RemoteToolExecutor): ToolRegistration[] {
       }
       await executor.writeFile(
         { path: args.path, content: args.content },
-        context,
+        await toolIdentity(api, context),
       );
       const result = { path: args.path, written: true };
       return {
@@ -162,7 +191,7 @@ function createRemoteTools(executor: RemoteToolExecutor): ToolRegistration[] {
     parameters: commandSchema,
     structuredOutputSchema: commandOutputSchema,
     replay: "unsafe",
-    async execute(args, _api, context) {
+    async execute(args, api, _context) {
       const maxOutputBytes = args.maxOutputBytes ?? MAX_REMOTE_OUTPUT_BYTES;
       const result = await executor.runCommand(
         {
@@ -171,7 +200,7 @@ function createRemoteTools(executor: RemoteToolExecutor): ToolRegistration[] {
           timeoutMs: args.timeoutMs ?? MAX_REMOTE_TIMEOUT_MS,
           maxOutputBytes,
         },
-        context,
+        await toolIdentity(api, _context),
       );
       const stdout = truncateUtf8(result.stdout, maxOutputBytes);
       const remaining = Math.max(

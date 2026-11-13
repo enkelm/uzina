@@ -203,3 +203,15 @@ export class ManagedPiWork {
 export type { ConversationView, Wake };
 export { createRemoteToolExtension } from "./tools";
 export type { RemoteToolExecutor } from "./tools";
+export { createManagedRemoteToolExecutor } from "./remote-bridge";
+export type { ManagedRemoteExecutionBridge } from "./remote-bridge";
+export {
+  createConfiguredModels,
+  createManagedRuntimeOptions,
+  readManagedModelConfig,
+} from "./provider";
+export type {
+  ManagedModelConfig,
+  ManagedRuntimeEnvironment,
+  ManagedModels,
+} from "./provider";

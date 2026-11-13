@@ -1,25 +1,18 @@
-import {
-  FactoryObject,
-  type FactoryDurableObjectEnvironment,
+import type {
+  FactoryDurableObjectEnvironment,
+  FactoryRpc,
 } from "../src/factory-object";
+import { TestFactory, TestManagedWork } from "./workerd-entry";
 
-type FactoryState = ConstructorParameters<typeof FactoryObject>[0];
+export { TestFactory, TestManagedWork };
+
 type FactoryNamespace = {
   idFromName(name: string): unknown;
-  get(id: unknown): { fetch(request: Request): Promise<Response> };
+  get(id: unknown): FactoryRpc;
 };
 type TestEnvironment = FactoryDurableObjectEnvironment & {
   FACTORY: FactoryNamespace;
 };
-
-export class TestFactory extends FactoryObject {
-  constructor(
-    state: FactoryState,
-    environment: FactoryDurableObjectEnvironment,
-  ) {
-    super(state, environment);
-  }
-}
 
 export default {
   fetch(request: Request, environment: TestEnvironment): Promise<Response> {

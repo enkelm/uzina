@@ -67,8 +67,14 @@ function numberParameter(value: string | null, fallback: number): number {
   return Number.isSafeInteger(parsed) ? parsed : Number.NaN;
 }
 
+export interface ManagedWorkQueries {
+  context(threadId: string): Promise<unknown>;
+  status(threadId: string): Promise<unknown>;
+}
+
 export function createFactoryHttpHandler(
   factory: FactoryService,
+  managedWork?: ManagedWorkQueries,
 ): (request: Request) => Promise<Response> {
   return async (request) => {
     const url = new URL(request.url);
@@ -172,6 +178,21 @@ export function createFactoryHttpHandler(
       if (request.method === "POST" && path === "/v1/threads") {
         const input = await body(request, createThreadRequestSchema);
         return json(factory.createThread(session, input), 201);
+      }
+      const managedQueryMatch = path.match(
+        /^\/v1\/threads\/([^/]+)\/(context|status)$/,
+      );
+      if (request.method === "GET" && managedQueryMatch) {
+        const threadId = decodeURIComponent(managedQueryMatch[1]!);
+        const thread = factory.getAuthorizedThread(session, threadId);
+        if (!managedWork) {
+          throw new FactoryError(503, "managed_runtime_unavailable");
+        }
+        const runtime =
+          managedQueryMatch[2] === "context"
+            ? await managedWork.context(threadId)
+            : await managedWork.status(threadId);
+        return json({ contractVersion: CONTRACT_VERSION, thread, runtime });
       }
       const inputMatch = path.match(/^\/v1\/threads\/([^/]+)\/inputs$/);
       if (request.method === "POST" && inputMatch) {

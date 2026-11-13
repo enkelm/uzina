@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { CONTRACT_VERSION, actorIdentitySchema } from "./index";
+import { executionReceiptSchema } from "./execution";
 
 const identifier = z
   .string()
@@ -112,6 +113,7 @@ export const factoryCommandReceiptSchema = z.object({
   dispatchStatus: factoryDispatchStatusSchema,
   acceptedAt: z.string().datetime(),
   outcome: z.string().max(4_000).optional(),
+  executionEffects: z.array(executionReceiptSchema).optional(),
 });
 export const factoryQueueJobSchema = z.object({
   ...versioned,
@@ -145,6 +147,10 @@ export const factoryEventSchema = z.object({
     "dispatch.failed",
     "dispatch.uncertain",
     "credential.revoked",
+    "execution.accepted",
+    "execution.completed",
+    "execution.failed",
+    "execution.uncertain",
   ]),
   actor: factoryActorSchema,
   projectId: identifier.nullable(),
@@ -177,6 +183,7 @@ export interface ManagedRuntimeDispatch {
     input: FactoryQueueJob,
   ): Promise<
     | { status: "dispatched"; detail?: string }
+    | { status: "completed"; detail?: string }
     | { status: "failed"; detail?: string }
     | { status: "uncertain"; detail?: string }
   >;

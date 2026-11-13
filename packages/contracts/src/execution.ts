@@ -119,6 +119,7 @@ export const executionJobSchema = z.discriminatedUnion("operation", [
       ...jobCommon,
       operation: z.literal("argv-command"),
       argv: z.array(z.string().min(1).max(4096)).min(1).max(128),
+      cwd: relativePath.optional(),
       timeoutMs: z
         .number()
         .int()
@@ -266,6 +267,11 @@ export type ExecutionHeartbeatRequest = z.infer<
   typeof executionHeartbeatRequestSchema
 >;
 export type ExecutionJob = z.infer<typeof executionJobSchema>;
+export type ExecutionOperation = ExecutionJob extends infer Job
+  ? Job extends ExecutionJob
+    ? Omit<Job, keyof typeof jobCommon>
+    : never
+  : never;
 export type ExecutionJobReport = z.infer<typeof executionJobReportSchema>;
 export type ExecutionReceipt = z.infer<typeof executionReceiptSchema>;
 export type ExecutionRegisterRequest = z.infer<

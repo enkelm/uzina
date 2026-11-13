@@ -738,6 +738,7 @@ export class ExecutionDaemon {
       ) {
         throw new ExecutionError("command_limit_exceeded");
       }
+      this.#resolveCommandCwd(job.target.workspaceId, job.cwd);
     } else {
       throw new ExecutionError("unsupported_operation");
     }
@@ -842,7 +843,7 @@ export class ExecutionDaemon {
   async #runCommand(
     job: Extract<ExecutionJob, { operation: "argv-command" }>,
   ): Promise<ExecutionResult> {
-    const cwd = this.#workspaceRoot(job.target.workspaceId);
+    const cwd = this.#resolveCommandCwd(job.target.workspaceId, job.cwd);
     let process: ReturnType<typeof Bun.spawn>;
     try {
       process = Bun.spawn({
@@ -1016,6 +1017,40 @@ export class ExecutionDaemon {
     }
     if (!allowNewFile && !statSync(canonical).isFile()) {
       throw new ExecutionError("workspace_path_not_file");
+    }
+    return canonical;
+  }
+
+  #resolveCommandCwd(workspaceId: string, requested?: string): string {
+    const root = this.#workspaceRoot(workspaceId);
+    if (requested === undefined || requested === ".") return root;
+    if (
+      isAbsolute(requested) ||
+      requested.includes("\\") ||
+      requested.includes("\0")
+    ) {
+      throw new ExecutionError("unsafe_workspace_path");
+    }
+    const parts = requested.split("/");
+    if (parts.some((part) => part === "" || part === "." || part === "..")) {
+      throw new ExecutionError("unsafe_workspace_path");
+    }
+    let cursor = root;
+    for (const part of parts) {
+      cursor = resolve(cursor, part);
+      if (hasSymlink(cursor)) {
+        throw new ExecutionError("workspace_symlink_rejected");
+      }
+      if (!existsSync(cursor)) {
+        throw new ExecutionError("workspace_path_not_found");
+      }
+    }
+    const canonical = realpathSync(cursor);
+    if (!within(root, canonical)) {
+      throw new ExecutionError("unsafe_workspace_path");
+    }
+    if (!statSync(canonical).isDirectory()) {
+      throw new ExecutionError("workspace_path_not_directory");
     }
     return canonical;
   }

@@ -7,7 +7,10 @@ import {
   FactoryService,
   createFactoryHttpHandler,
 } from "@uzina/core";
-import { executionRegisterRequestSchema } from "@uzina/contracts/execution";
+import {
+  executionJobReportSchema,
+  executionRegisterRequestSchema,
+} from "@uzina/contracts/execution";
 import { BunFactoryDatabase } from "../src/factory/sqlite";
 
 const bootstrapSecret = "fixture-only-private-bootstrap-secret";
@@ -323,6 +326,285 @@ describe("persistent Factory behavior over Bun SQLite", () => {
     expect(
       fixture.factory.claimExecutionJob(fixture.nodeSession, "node:laptop-a"),
     ).toBeNull();
+  });
+
+  test("an expired queued managed effect is fenced before the node can claim it", async () => {
+    const fixture = await provisionFixture(true);
+    const accepted = await fixture.factory.submitInput(
+      fixture.owner,
+      fixture.thread.threadId,
+      "request:effect-wait-expired-queued",
+      "Write a bounded effect",
+    );
+    const operation = {
+      operation: "write-file" as const,
+      path: "expired-effect.txt",
+      contentBase64: Buffer.from("must not run").toString("base64"),
+    };
+    const result = await fixture.factory.dispatchNext({
+      async dispatch(input) {
+        const admitted = await fixture.factory.enqueueManagedRemoteExecution(
+          input.threadId,
+          "task:wait-expired-queued",
+          "call:wait-expired-queued",
+          operation,
+        );
+        expect(admitted.status).toBe("queued");
+        fixture.factory.markManagedEffectUncertain(
+          admitted.jobId,
+          "The tool stopped waiting before an executor claim",
+        );
+        return { status: "uncertain", detail: "Managed work timed out" };
+      },
+    });
+
+    expect(result?.dispatchStatus).toBe("uncertain");
+    expect(result?.executionEffects).toMatchObject([
+      {
+        status: "failed",
+        errorCode: "managed_effect_abandoned_before_claim",
+      },
+    ]);
+    expect(
+      fixture.factory.claimExecutionJob(fixture.nodeSession, "node:laptop-a"),
+    ).toBeNull();
+    expect(
+      fixture.factory.getReceipt(fixture.owner, accepted.requestId)
+        .dispatchStatus,
+    ).toBe("uncertain");
+  });
+
+  test("an expired claimed effect is not reclaimed but one late correlated report reconciles its receipt", async () => {
+    const fixture = await provisionFixture(true);
+    const accepted = await fixture.factory.submitInput(
+      fixture.owner,
+      fixture.thread.threadId,
+      "request:effect-wait-expired-claimed",
+      "Write a bounded effect",
+    );
+    const operation = {
+      operation: "write-file" as const,
+      path: "claimed-effect.txt",
+      contentBase64: Buffer.from(
+        "completed by the original assignment",
+      ).toString("base64"),
+    };
+    let claimed:
+      | {
+          jobId: string;
+          nodeId: string;
+          target: { nodeId: string; workspaceId: string };
+          ownershipGeneration: number;
+          payloadSha256: string;
+        }
+      | undefined;
+    const result = await fixture.factory.dispatchNext({
+      async dispatch(input) {
+        const admitted = await fixture.factory.enqueueManagedRemoteExecution(
+          input.threadId,
+          "task:wait-expired-claimed",
+          "call:wait-expired-claimed",
+          operation,
+        );
+        const assignment = fixture.factory.claimExecutionJob(
+          fixture.nodeSession,
+          "node:laptop-a",
+        );
+        claimed = assignment
+          ? { ...assignment, payloadSha256: admitted.payloadSha256 }
+          : undefined;
+        expect(claimed?.jobId).toBe(admitted.jobId);
+        fixture.factory.markManagedEffectUncertain(
+          admitted.jobId,
+          "The tool stopped waiting after executor assignment",
+        );
+        expect(
+          fixture.factory.claimExecutionJob(
+            fixture.nodeSession,
+            "node:laptop-a",
+          ),
+        ).toBeNull();
+        return { status: "uncertain", detail: "Managed work timed out" };
+      },
+    });
+
+    expect(result?.dispatchStatus).toBe("uncertain");
+    expect(result?.executionEffects).toMatchObject([
+      { status: "uncertain", errorCode: "managed_tool_wait_expired" },
+    ]);
+    const lateReport = executionJobReportSchema.parse({
+      contractVersion: 1,
+      jobId: claimed!.jobId,
+      nodeId: claimed!.nodeId,
+      target: claimed!.target,
+      ownershipGeneration: claimed!.ownershipGeneration,
+      status: "completed",
+      payloadSha256: claimed!.payloadSha256,
+      finishedAt: new Date().toISOString(),
+      result: {
+        operation: "write-file",
+        bytes: Buffer.from("completed by the original assignment").byteLength,
+        sha256: "a".repeat(64),
+      },
+    });
+    await fixture.factory.reportExecutionJob(
+      fixture.nodeSession,
+      "node:laptop-a",
+      claimed!.jobId,
+      lateReport,
+    );
+    const reconciled = fixture.factory.getReceipt(
+      fixture.owner,
+      accepted.requestId,
+    );
+    expect(reconciled.dispatchStatus).toBe("uncertain");
+    expect(reconciled.executionEffects).toMatchObject([
+      {
+        jobId: claimed!.jobId,
+        status: "completed",
+        operation: "write-file",
+      },
+    ]);
+    expect(
+      fixture.factory.claimExecutionJob(fixture.nodeSession, "node:laptop-a"),
+    ).toBeNull();
+  });
+
+  test("controller reopen cancels a queued Pi effect before another node claim", async () => {
+    const fixture = await provisionFixture(true);
+    const accepted = await fixture.factory.submitInput(
+      fixture.owner,
+      fixture.thread.threadId,
+      "request:restart-fences-effect",
+      "Perform one managed write",
+    );
+    let enteredDispatch!: () => void;
+    const dispatchEntered = new Promise<void>((resolve) => {
+      enteredDispatch = resolve;
+    });
+    let admitted:
+      | Awaited<ReturnType<FactoryService["enqueueManagedRemoteExecution"]>>
+      | undefined;
+    void fixture.factory.dispatchNext({
+      async dispatch(input) {
+        admitted = await fixture.factory.enqueueManagedRemoteExecution(
+          input.threadId,
+          "task:restart-fences-effect",
+          "call:restart-fences-effect",
+          {
+            operation: "write-file",
+            path: "restart-effect.txt",
+            contentBase64: Buffer.from("must not replay").toString("base64"),
+          },
+        );
+        enteredDispatch();
+        return new Promise(() => {});
+      },
+    });
+    await dispatchEntered;
+    expect(admitted?.status).toBe("queued");
+
+    fixture.database.close();
+    const reopenedDatabase = new BunFactoryDatabase(
+      join(fixture.directory, "factory.sqlite"),
+    );
+    fixtures[fixtures.length - 1]!.database = reopenedDatabase;
+    const reopened = new FactoryService(reopenedDatabase, bootstrapSecret);
+    const owner = await reopened.authenticate(
+      fixture.ownerCredential.credential,
+    );
+    const node = await reopened.authenticate(fixture.nodeCredential.credential);
+    const recovered = reopened.getReceipt(owner, accepted.requestId);
+    expect(recovered.dispatchStatus).toBe("uncertain");
+    expect(recovered.executionEffects).toMatchObject([
+      {
+        jobId: admitted!.jobId,
+        status: "failed",
+        errorCode: "managed_input_interrupted_before_claim",
+      },
+    ]);
+    expect(reopened.claimExecutionJob(node, "node:laptop-a")).toBeNull();
+    const retry = await reopened.submitInput(
+      owner,
+      fixture.thread.threadId,
+      accepted.requestId,
+      "Perform one managed write",
+    );
+    expect(retry).toMatchObject({
+      jobId: accepted.jobId,
+      dispatchStatus: "uncertain",
+    });
+    expect(retry.executionEffects).toMatchObject([
+      { jobId: admitted!.jobId, status: "failed" },
+    ]);
+  });
+
+  test("controller reopen fences a claimed Pi effect from redelivery", async () => {
+    const fixture = await provisionFixture(true);
+    const accepted = await fixture.factory.submitInput(
+      fixture.owner,
+      fixture.thread.threadId,
+      "request:restart-fences-claimed-effect",
+      "Perform one managed write",
+    );
+    let enteredDispatch!: () => void;
+    const dispatchEntered = new Promise<void>((resolve) => {
+      enteredDispatch = resolve;
+    });
+    let admitted:
+      | Awaited<ReturnType<FactoryService["enqueueManagedRemoteExecution"]>>
+      | undefined;
+    let claimed:
+      | {
+          jobId: string;
+          nodeId: string;
+          target: { nodeId: string; workspaceId: string };
+          ownershipGeneration: number;
+        }
+      | undefined;
+    void fixture.factory.dispatchNext({
+      async dispatch(input) {
+        admitted = await fixture.factory.enqueueManagedRemoteExecution(
+          input.threadId,
+          "task:restart-fences-claimed-effect",
+          "call:restart-fences-claimed-effect",
+          {
+            operation: "write-file",
+            path: "restart-claimed-effect.txt",
+            contentBase64: Buffer.from("may have started").toString("base64"),
+          },
+        );
+        claimed = fixture.factory.claimExecutionJob(
+          fixture.nodeSession,
+          "node:laptop-a",
+        )!;
+        enteredDispatch();
+        return new Promise(() => {});
+      },
+    });
+    await dispatchEntered;
+    expect(claimed?.jobId).toBe(admitted?.jobId);
+
+    fixture.database.close();
+    const reopenedDatabase = new BunFactoryDatabase(
+      join(fixture.directory, "factory.sqlite"),
+    );
+    fixtures[fixtures.length - 1]!.database = reopenedDatabase;
+    const reopened = new FactoryService(reopenedDatabase, bootstrapSecret);
+    const owner = await reopened.authenticate(
+      fixture.ownerCredential.credential,
+    );
+    const node = await reopened.authenticate(fixture.nodeCredential.credential);
+    const recovered = reopened.getReceipt(owner, accepted.requestId);
+    expect(recovered.dispatchStatus).toBe("uncertain");
+    expect(recovered.executionEffects).toMatchObject([
+      {
+        jobId: claimed!.jobId,
+        status: "uncertain",
+        errorCode: "managed_input_interrupted_after_claim",
+      },
+    ]);
+    expect(reopened.claimExecutionJob(node, "node:laptop-a")).toBeNull();
   });
 
   test("interrupted managed-runtime dispatch is uncertain after reopen and is not converted into a node job", async () => {

@@ -1,3 +1,20 @@
 name = "uzina"
-main = "src/index.ts"
+main = "build/index.js"
 compatibility_date = "2026-05-01"
+workers_dev = false
+
+[vars]
+UZINA_MODEL_PROVIDER = "openai"
+UZINA_MODEL_ID = "gpt-4o-mini"
+
+[[durable_objects.bindings]]
+name = "FACTORY"
+class_name = "FactoryObject"
+
+[[durable_objects.bindings]]
+name = "MANAGED_WORK"
+class_name = "ManagedWorkObject"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["FactoryObject", "ManagedWorkObject"]

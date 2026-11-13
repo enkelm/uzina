@@ -1,6 +1,8 @@
 import type { Models } from "@earendil-works/pi-ai";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
-import { ManagedWork, type ManagedWorkEnvironment } from "../src/work-object";
+import { FactoryObject, ManagedWorkRpcObject } from "../src/durable-objects";
+import type { FactoryRpc } from "../src/factory-object";
+import type { ManagedWorkFactoryBridge } from "../src/work-object";
 
 let modelCalls = 0;
 let readAlarm: () => Promise<number | null> = async () => null;
@@ -68,23 +70,40 @@ function delayedResponse() {
   return stream;
 }
 
-type State = ConstructorParameters<typeof ManagedWork>[0];
-type TestEnvironment = ManagedWorkEnvironment & {
+type State = ConstructorParameters<typeof ManagedWorkRpcObject>[0];
+type FactoryState = ConstructorParameters<typeof FactoryObject>[0];
+
+export class TestFactory extends FactoryObject {
+  constructor(
+    state: FactoryState,
+    environment: ConstructorParameters<typeof FactoryObject>[1],
+  ) {
+    super(state, environment);
+  }
+}
+
+type TestEnvironment = {
+  FACTORY: {
+    idFromName(name: string): unknown;
+    get(id: unknown): FactoryRpc & ManagedWorkFactoryBridge;
+  };
   MANAGED_WORK: {
     idFromName(name: string): unknown;
     get(id: unknown): { fetch(request: Request): Promise<Response> };
   };
 };
 
-export class TestManagedWork extends ManagedWork {
+export class TestManagedWork extends ManagedWorkRpcObject {
   private readonly alarmStorage: State["storage"];
 
-  constructor(state: State, _env: ManagedWorkEnvironment) {
-    super(state, {
+  constructor(state: State, env: TestEnvironment) {
+    super(state, env, {
       runtimeOptions: () => ({
         models,
         agent: { model: { provider: "uzina-test", modelId: "fixed-model" } },
       }),
+      factory: () =>
+        env.FACTORY.get(env.FACTORY.idFromName("uzina-single-factory")),
     });
     this.alarmStorage = state.storage;
     readAlarm = () => state.storage.getAlarm();

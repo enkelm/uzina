@@ -106,6 +106,9 @@ const schema = [
     operation TEXT NOT NULL CHECK (operation IN ('read-file', 'write-file', 'argv-command')),
     payload_json TEXT NOT NULL,
     payload_sha256 TEXT NOT NULL,
+    request_id TEXT,
+    pi_task_id TEXT,
+    pi_call_id TEXT,
     status TEXT NOT NULL CHECK (status IN ('queued', 'claimed', 'completed', 'failed', 'uncertain')),
     accepted_at TEXT NOT NULL,
     claimed_at TEXT,
@@ -129,4 +132,14 @@ const schema = [
 
 export function initializeFactoryDatabase(database: FactoryDatabase): void {
   for (const statement of schema) database.exec(statement);
+  const columns = new Set(
+    database
+      .all<{ name: string }>("PRAGMA table_info(execution_jobs)")
+      .map((column) => column.name),
+  );
+  for (const column of ["request_id", "pi_task_id", "pi_call_id"] as const) {
+    if (!columns.has(column)) {
+      database.exec(`ALTER TABLE execution_jobs ADD COLUMN ${column} TEXT`);
+    }
+  }
 }

@@ -1,7 +1,16 @@
 import type { Context } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openDurableObjectSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/cloudflare";
-import { ManagedPiWork, type ManagedPiWorkOptions } from "@uzina/pi-runtime";
+import type { FactoryQueueJob } from "@uzina/contracts/factory";
+import type {
+  ExecutionOperation,
+  ExecutionReceipt,
+} from "@uzina/contracts/execution";
+import {
+  ManagedPiWork,
+  createManagedRemoteToolExecutor,
+  type ManagedPiWorkOptions,
+} from "@uzina/pi-runtime/work";
 
 type DurableObjectSqliteStorage = Parameters<
   typeof openDurableObjectSqliteStorage
@@ -14,6 +23,7 @@ type AlarmStorage = DurableObjectSqliteStorage & {
 };
 
 export interface ManagedWorkState {
+  id: { name?: string };
   storage: AlarmStorage;
   blockConcurrencyWhile<T>(callback: () => Promise<T>): Promise<T>;
   abort(reason?: string): void;
@@ -25,8 +35,34 @@ export type ManagedWorkRuntimeOptions = Omit<
   "storage" | "onWake" | "beforeWork"
 >;
 
+export type ManagedWorkFactoryBridge = {
+  getActiveManagedInput(
+    threadId: string,
+  ): FactoryQueueJob | undefined | Promise<FactoryQueueJob | undefined>;
+  enqueueManagedRemoteExecution(
+    threadId: string,
+    taskId: string,
+    callId: string,
+    operation: ExecutionOperation,
+  ): Promise<ExecutionReceipt>;
+  getRemoteExecutionReceipt(
+    jobId: string,
+  ): ExecutionReceipt | null | Promise<ExecutionReceipt | null>;
+  markManagedEffectUncertain(
+    jobId: string,
+    detail: string,
+  ): void | Promise<void>;
+};
+
 export type ManagedWorkEnvironment = {
-  runtimeOptions(): ManagedWorkRuntimeOptions;
+  runtimeOptions():
+    ManagedWorkRuntimeOptions | Promise<ManagedWorkRuntimeOptions>;
+  factory(): ManagedWorkFactoryBridge;
+};
+
+export type ManagedInputSettlement = {
+  status: "completed" | "failed" | "uncertain";
+  detail: string;
 };
 
 /** Cloudflare Durable Object adapter for one Pi Durable managed-work storage unit. */
@@ -57,12 +93,81 @@ export class ManagedWork {
     return this.run(async (work) => work.submit(requestId, content));
   }
 
+  async acceptManagedInput(
+    input: FactoryQueueJob,
+  ): Promise<ManagedInputSettlement> {
+    if (input.threadId !== this.threadId) {
+      throw new Error(
+        "Managed input thread does not match its Durable Object identity",
+      );
+    }
+    const persisted = await this.env
+      .factory()
+      .getActiveManagedInput(this.threadId);
+    if (
+      !persisted ||
+      persisted.jobId !== input.jobId ||
+      persisted.requestId !== input.requestId ||
+      persisted.threadId !== input.threadId ||
+      persisted.actor.kind !== input.actor.kind ||
+      JSON.stringify(persisted.actor) !== JSON.stringify(input.actor) ||
+      persisted.target.nodeId !== input.target.nodeId ||
+      persisted.target.workspaceId !== input.target.workspaceId ||
+      persisted.ownershipGeneration !== input.ownershipGeneration ||
+      persisted.input.text !== input.input.text
+    ) {
+      throw new Error(
+        "Managed input does not match accepted persisted Factory work",
+      );
+    }
+    return this.run(async (work) => {
+      await work.create();
+      const accepted = await work.submit(input.requestId, input.input.text);
+      if (accepted.status.status === "unanswered") {
+        return {
+          status: "failed",
+          detail: `Managed Pi submission ended unanswered: ${accepted.status.reason}`,
+        };
+      }
+      try {
+        const settled = await work.waitForSubmission(input.requestId);
+        return settled.status === "done"
+          ? {
+              status: "completed",
+              detail: `Pi submission ${settled.id} settled with assistant entry ${settled.answer}`,
+            }
+          : {
+              status: "failed",
+              detail: `Managed Pi submission ended unanswered: ${settled.reason}`,
+            };
+      } catch (error) {
+        return {
+          status: "uncertain",
+          detail:
+            error instanceof Error
+              ? `Managed Pi completion is uncertain: ${error.message}`
+              : "Managed Pi completion is uncertain",
+        };
+      }
+    });
+  }
+
   async context() {
     return this.run(async (work) => work.context());
   }
 
   async status() {
-    return this.run(async (work) => work.status());
+    try {
+      return await this.run(async (work) => work.status());
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message === "Managed Pi work has not been created"
+      ) {
+        return { status: "not-created" };
+      }
+      throw error;
+    }
   }
 
   async resume(): Promise<void> {
@@ -110,22 +215,44 @@ export class ManagedWork {
     return result;
   }
 
+  private get threadId(): string {
+    const threadId = this.state.id.name;
+    if (!threadId)
+      throw new Error("Managed Pi work requires a named thread Durable Object");
+    return threadId;
+  }
+
   private async openWork(): Promise<ManagedPiWork> {
     if (this.work) return this.work;
     if (this.opening) return this.opening;
     const storage = await openDurableObjectSqliteStorage(this.state.storage);
-    const opening = ManagedPiWork.open(
-      {
-        ...this.env.runtimeOptions(),
-        storage,
-        onWake: (wake) => {
-          void this.arm(wake).catch(() =>
-            this.state.abort("Could not arm managed-work recovery alarm"),
-          );
+    const bridge = this.env.factory();
+    const opening = Promise.resolve(this.env.runtimeOptions()).then((options) =>
+      ManagedPiWork.open(
+        {
+          ...options,
+          storage,
+          toolExecutor: createManagedRemoteToolExecutor(this.threadId, {
+            enqueue: (threadId, identity, operation) =>
+              bridge.enqueueManagedRemoteExecution(
+                threadId,
+                identity.taskId,
+                identity.callId,
+                operation,
+              ),
+            receipt: (jobId) => bridge.getRemoteExecutionReceipt(jobId),
+            markUncertain: (jobId, detail) =>
+              bridge.markManagedEffectUncertain(jobId, detail),
+          }),
+          onWake: (wake) => {
+            void this.arm(wake).catch(() =>
+              this.state.abort("Could not arm managed-work recovery alarm"),
+            );
+          },
+          beforeWork: (wake) => this.arm(wake),
         },
-        beforeWork: (wake) => this.arm(wake),
-      },
-      BACKGROUND_CONTEXT,
+        BACKGROUND_CONTEXT,
+      ),
     );
     this.opening = opening;
     try {

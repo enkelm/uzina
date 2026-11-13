@@ -26,6 +26,7 @@ import {
   type ExecutionJob,
   type ExecutionJobReport,
   type ExecutionReceipt,
+  type ExecutionOperation,
   type ExecutionRegisterRequest,
   type ExecutionWorkspaceReport,
 } from "@uzina/contracts/execution";
@@ -127,6 +128,9 @@ type ExecutionJobRow = {
   operation: ExecutionJob["operation"];
   payload_json: string;
   payload_sha256: string;
+  request_id: string | null;
+  pi_task_id: string | null;
+  pi_call_id: string | null;
   status: "queued" | "claimed" | "completed" | "failed" | "uncertain";
   accepted_at: string;
   claimed_at: string | null;
@@ -144,6 +148,14 @@ type EventRow = {
   request_id: string | null;
   payload_json: string;
   created_at: string;
+};
+
+export type ManagedRemoteOperation = ExecutionOperation;
+
+export type ManagedExecutionEvidence = {
+  requestId: string;
+  taskId: string;
+  callId: string;
 };
 
 const NODE_HEARTBEAT_TTL_MS = 90_000;
@@ -814,6 +826,76 @@ export class FactoryService {
     return this.#receiptByJob(receipt.job_id);
   }
 
+  /** Authorized runtime query target; placement always comes from the stored thread. */
+  getAuthorizedThread(session: FactorySession, threadId: string) {
+    this.#requireHumanOrAssistant(session);
+    const row = this.database.all<ThreadRow>(
+      "SELECT thread_id, project_id, title, node_id, workspace_id, ownership_generation, created_at FROM threads WHERE thread_id = ?",
+      [threadId],
+    )[0];
+    if (!row) throw notFound("Thread");
+    return this.#thread(row);
+  }
+
+  /** In-process only: returns the persisted active input, never a body-selected placement. */
+  getActiveManagedInput(threadId: string): FactoryQueueJob | undefined {
+    const row = this.database.all<IntentRow>(
+      "SELECT job_id, request_id, actor_json, project_id, thread_id, node_id, workspace_id, ownership_generation, payload_json, payload_hash, status, outcome, created_at, updated_at FROM dispatch_intents WHERE thread_id = ? AND status = 'running' ORDER BY created_at, job_id LIMIT 1",
+      [threadId],
+    )[0];
+    return row
+      ? factoryQueueJobSchema.parse(JSON.parse(row.payload_json))
+      : undefined;
+  }
+
+  /** Called only by the managed-runtime host after reading Pi's durable submission receipt. */
+  settleManagedInput(
+    requestId: string,
+    status: "completed" | "failed" | "uncertain",
+    detail: string,
+  ): FactoryCommandReceipt {
+    if (!detail.trim() || detail.length > 4_000) {
+      throw new FactoryError(400, "invalid_settlement_detail");
+    }
+    const row = this.database.all<IntentRow>(
+      "SELECT job_id, request_id, actor_json, project_id, thread_id, node_id, workspace_id, ownership_generation, payload_json, payload_hash, status, outcome, created_at, updated_at FROM dispatch_intents WHERE request_id = ?",
+      [requestId],
+    )[0];
+    if (!row) throw notFound("Managed input receipt");
+    const eventType = `dispatch.${status}` as const;
+    const timestamp = now();
+    this.database.transaction(() => {
+      const current = this.database.all<IntentRow>(
+        "SELECT job_id, request_id, actor_json, project_id, thread_id, node_id, workspace_id, ownership_generation, payload_json, payload_hash, status, outcome, created_at, updated_at FROM dispatch_intents WHERE request_id = ?",
+        [requestId],
+      )[0];
+      if (!current) throw notFound("Managed input receipt");
+      if (current.status !== "running" && current.status !== "dispatched") {
+        return;
+      }
+      this.database.exec(
+        "UPDATE dispatch_intents SET status = ?, outcome = ?, updated_at = ? WHERE request_id = ?",
+        [status, detail, timestamp, requestId],
+      );
+      this.#event(
+        eventType,
+        parseActor(current.actor_json),
+        current.project_id,
+        current.thread_id,
+        requestId,
+        {
+          jobId: current.job_id,
+          nodeId: current.node_id,
+          workspaceId: current.workspace_id,
+          ownershipGeneration: current.ownership_generation,
+          detail,
+        },
+        timestamp,
+      );
+    });
+    return this.#receiptByRequest(requestId);
+  }
+
   events(session: FactorySession, after: number, limit = 100) {
     this.#requireHumanOrAssistant(session);
     if (
@@ -1069,10 +1151,13 @@ export class FactoryService {
       }
       return this.#executionReportAcknowledgement(nodeId, jobId, input.status);
     }
-    if (job.status !== "claimed") {
+    if (
+      job.status !== "claimed" &&
+      !(job.status === "uncertain" && job.report_json === null)
+    ) {
       throw conflict(
         "job_not_claimed",
-        "The execution job has no persisted claim",
+        "The execution job has no persisted claim or reconcilable uncertain assignment",
       );
     }
     this.database.transaction(() => {
@@ -1088,15 +1173,18 @@ export class FactoryService {
         }
         return;
       }
-      if (current.status !== "claimed") {
+      if (
+        current.status !== "claimed" &&
+        !(current.status === "uncertain" && current.report_json === null)
+      ) {
         throw conflict(
           "job_not_claimed",
-          "The execution job has no persisted claim",
+          "The execution job has no persisted claim or reconcilable uncertain assignment",
         );
       }
       this.database.exec(
         `UPDATE execution_jobs SET status = ?, finished_at = ?, report_json = ?,
-          report_sha256 = ?, error_code = ? WHERE job_id = ? AND status = 'claimed'`,
+          report_sha256 = ?, error_code = ? WHERE job_id = ? AND status IN ('claimed', 'uncertain')`,
         [
           input.status,
           input.finishedAt,
@@ -1106,21 +1194,132 @@ export class FactoryService {
           jobId,
         ],
       );
+      if (current.request_id) {
+        const accepted = this.database.all<IntentRow>(
+          "SELECT job_id, request_id, actor_json, project_id, thread_id, node_id, workspace_id, ownership_generation, payload_json, payload_hash, status, outcome, created_at, updated_at FROM dispatch_intents WHERE request_id = ?",
+          [current.request_id],
+        )[0];
+        this.#event(
+          `execution.${input.status}`,
+          session.actor,
+          accepted?.project_id ?? null,
+          accepted?.thread_id ?? null,
+          current.request_id,
+          {
+            jobId,
+            nodeId,
+            target: input.target,
+            ownershipGeneration: input.ownershipGeneration,
+            piTaskId: current.pi_task_id,
+            piCallId: current.pi_call_id,
+            errorCode: input.errorCode ?? null,
+            reconciliationEvidence: input.reconciliationEvidence ?? null,
+          },
+          input.finishedAt,
+        );
+      }
     });
+    if (input.status === "uncertain" && job.request_id) {
+      this.settleManagedInput(
+        job.request_id,
+        "uncertain",
+        `Remote effect ${jobId} is uncertain${input.errorCode ? ` (${input.errorCode})` : ""}`,
+      );
+    }
     return this.#executionReportAcknowledgement(nodeId, jobId, input.status);
   }
 
-  /** Trusted in-process admission seam for the managed remote-tool bridge; no HTTP injection route exists. */
-  async enqueueRemoteExecution(input: unknown): Promise<ExecutionReceipt> {
+  /** Trusted bridge: placement and generation are read from the accepted, persisted input. */
+  async enqueueManagedRemoteExecution(
+    threadId: string,
+    taskId: string,
+    callId: string,
+    operation: ManagedRemoteOperation,
+  ): Promise<ExecutionReceipt> {
+    if (
+      !taskId.trim() ||
+      taskId.length > 256 ||
+      !callId.trim() ||
+      callId.length > 256
+    ) {
+      throw new FactoryError(400, "invalid_pi_execution_evidence");
+    }
+    const prior = this.database.all<ExecutionJobRow>(
+      `SELECT jobs.* FROM execution_jobs AS jobs
+       JOIN dispatch_intents AS intents ON intents.request_id = jobs.request_id
+       WHERE intents.thread_id = ? AND jobs.pi_task_id = ? AND jobs.pi_call_id = ?
+       LIMIT 1`,
+      [threadId, taskId, callId],
+    )[0];
+    if (prior) {
+      const persisted = executionJobSchema.parse(
+        JSON.parse(prior.payload_json),
+      );
+      const candidate = executionJobSchema.parse({
+        ...persisted,
+        ...operation,
+      });
+      if (stableJson(candidate) !== stableJson(persisted)) {
+        throw conflict(
+          "pi_execution_payload_conflict",
+          "Pi replay changed arguments for a previously admitted remote effect",
+        );
+      }
+      return this.#executionReceipt(prior);
+    }
+    const input = this.getActiveManagedInput(threadId);
+    if (!input) {
+      throw conflict(
+        "managed_input_not_running",
+        "Remote tools require an active persisted Factory input",
+      );
+    }
+    const jobId = `job:pi-${await sha256(
+      `${threadId}\u0000${input.requestId}\u0000${input.threadId}\u0000${taskId}\u0000${callId}`,
+    )}`;
+    const job = executionJobSchema.parse({
+      contractVersion: EXECUTION_CONTRACT_VERSION,
+      jobId,
+      nodeId: input.target.nodeId,
+      target: input.target,
+      ownershipGeneration: input.ownershipGeneration,
+      ...operation,
+    });
+    return this.enqueueRemoteExecution(job, {
+      requestId: input.requestId,
+      taskId,
+      callId,
+    });
+  }
+
+  /** Trusted in-process admission seam; no HTTP job-injection route exists. */
+  async enqueueRemoteExecution(
+    input: unknown,
+    evidence?: ManagedExecutionEvidence,
+  ): Promise<ExecutionReceipt> {
     const job = executionJobSchema.parse(input);
+    if (
+      evidence &&
+      (!evidence.requestId.trim() ||
+        !evidence.taskId.trim() ||
+        !evidence.callId.trim())
+    ) {
+      throw new FactoryError(400, "invalid_pi_execution_evidence");
+    }
     const payloadJson = encode(job);
     const payloadHash = await sha256(stableJson(job));
     const existing = this.#executionJob(job.jobId);
     if (existing) {
-      if (existing.payload_sha256 !== payloadHash) {
+      if (
+        existing.payload_sha256 !== payloadHash ||
+        (evidence &&
+          (existing.request_id !== evidence.requestId ||
+            existing.pi_task_id !== evidence.taskId ||
+            existing.pi_call_id !== evidence.callId))
+      ) {
         throw conflict(
           "job_id_payload_conflict",
-          "Job ID is bound to another payload",
+          "Job ID is bound to another payload or Pi execution evidence",
         );
       }
       return this.#executionReceipt(existing);
@@ -1130,10 +1329,16 @@ export class FactoryService {
     this.database.transaction(() => {
       const raced = this.#executionJob(job.jobId);
       if (raced) {
-        if (raced.payload_sha256 !== payloadHash) {
+        if (
+          raced.payload_sha256 !== payloadHash ||
+          (evidence &&
+            (raced.request_id !== evidence.requestId ||
+              raced.pi_task_id !== evidence.taskId ||
+              raced.pi_call_id !== evidence.callId))
+        ) {
           throw conflict(
             "job_id_payload_conflict",
-            "Job ID is bound to another payload",
+            "Job ID is bound to another payload or Pi execution evidence",
           );
         }
         return;
@@ -1141,8 +1346,9 @@ export class FactoryService {
       this.#assertRemoteExecutionAdmission(job);
       this.database.exec(
         `INSERT INTO execution_jobs(job_id, node_id, workspace_id, ownership_generation,
-          operation, payload_json, payload_sha256, status, accepted_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)`,
+          operation, payload_json, payload_sha256, request_id, pi_task_id, pi_call_id,
+          status, accepted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)`,
         [
           job.jobId,
           job.nodeId,
@@ -1151,9 +1357,40 @@ export class FactoryService {
           job.operation,
           payloadJson,
           payloadHash,
+          evidence?.requestId ?? null,
+          evidence?.taskId ?? null,
+          evidence?.callId ?? null,
           timestamp,
         ],
       );
+      if (evidence) {
+        const accepted = this.database.all<IntentRow>(
+          "SELECT job_id, request_id, actor_json, project_id, thread_id, node_id, workspace_id, ownership_generation, payload_json, payload_hash, status, outcome, created_at, updated_at FROM dispatch_intents WHERE request_id = ?",
+          [evidence.requestId],
+        )[0];
+        if (!accepted || accepted.status !== "running") {
+          throw conflict(
+            "managed_input_not_running",
+            "The Pi tool evidence is no longer attached to active work",
+          );
+        }
+        this.#event(
+          "execution.accepted",
+          parseActor(accepted.actor_json),
+          accepted.project_id,
+          accepted.thread_id,
+          evidence.requestId,
+          {
+            jobId: job.jobId,
+            target: job.target,
+            ownershipGeneration: job.ownershipGeneration,
+            operation: job.operation,
+            piTaskId: evidence.taskId,
+            piCallId: evidence.callId,
+          },
+          timestamp,
+        );
+      }
     });
     const admitted = this.#executionJob(job.jobId);
     if (!admitted) throw new FactoryError(500, "execution_admission_lost");
@@ -1166,11 +1403,71 @@ export class FactoryService {
     return row ? this.#executionReceipt(row) : null;
   }
 
+  /** Fences expired effects from new claims while allowing one late report to reconcile an assigned job. */
+  markManagedEffectUncertain(jobId: string, detail: string): void {
+    if (!detail.trim() || detail.length > 4_000) {
+      throw new FactoryError(400, "invalid_settlement_detail");
+    }
+    const row = this.#executionJob(jobId);
+    if (!row || !row.request_id) throw notFound("Managed execution effect");
+    this.database.transaction(() => {
+      const current = this.#executionJob(jobId);
+      if (!current || !current.request_id)
+        throw notFound("Managed execution effect");
+      if (current.status !== "queued" && current.status !== "claimed") return;
+      const timestamp = now();
+      const status = current.status === "queued" ? "failed" : "uncertain";
+      const errorCode =
+        current.status === "queued"
+          ? "managed_effect_abandoned_before_claim"
+          : "managed_tool_wait_expired";
+      this.database.exec(
+        "UPDATE execution_jobs SET status = ?, finished_at = ?, error_code = ? WHERE job_id = ? AND status = ?",
+        [status, timestamp, errorCode, jobId, current.status],
+      );
+      const accepted = this.database.all<IntentRow>(
+        "SELECT job_id, request_id, actor_json, project_id, thread_id, node_id, workspace_id, ownership_generation, payload_json, payload_hash, status, outcome, created_at, updated_at FROM dispatch_intents WHERE request_id = ?",
+        [current.request_id],
+      )[0];
+      if (accepted) {
+        this.#event(
+          `execution.${status}`,
+          parseActor(accepted.actor_json),
+          accepted.project_id,
+          accepted.thread_id,
+          current.request_id,
+          {
+            jobId,
+            nodeId: current.node_id,
+            target: {
+              nodeId: current.node_id,
+              workspaceId: current.workspace_id,
+            },
+            ownershipGeneration: current.ownership_generation,
+            piTaskId: current.pi_task_id,
+            piCallId: current.pi_call_id,
+            errorCode,
+            detail,
+          },
+          timestamp,
+        );
+      }
+    });
+    this.settleManagedInput(row.request_id, "uncertain", detail);
+  }
+
   /** Dispatches one durable intent through the injected managed-runtime boundary. */
   async dispatchNext(
     adapter: RuntimeDispatchAdapter,
   ): Promise<FactoryCommandReceipt | null> {
     const intent = this.database.transaction(() => {
+      if (
+        this.database.all(
+          "SELECT job_id FROM dispatch_intents WHERE status = 'running' LIMIT 1",
+        ).length
+      ) {
+        return null;
+      }
       const queued = this.database.all<IntentRow>(
         "SELECT job_id, request_id, actor_json, project_id, thread_id, node_id, workspace_id, ownership_generation, payload_json, payload_hash, status, outcome, created_at, updated_at FROM dispatch_intents WHERE status = 'queued' ORDER BY created_at, job_id LIMIT 1",
       )[0];
@@ -1241,9 +1538,11 @@ export class FactoryService {
     const eventType =
       outcome.status === "dispatched"
         ? "dispatch.dispatched"
-        : outcome.status === "failed"
-          ? "dispatch.failed"
-          : "dispatch.uncertain";
+        : outcome.status === "completed"
+          ? "dispatch.completed"
+          : outcome.status === "failed"
+            ? "dispatch.failed"
+            : "dispatch.uncertain";
     this.database.transaction(() => {
       const current = this.database.all<IntentRow>(
         "SELECT job_id, request_id, actor_json, project_id, thread_id, node_id, workspace_id, ownership_generation, payload_json, payload_hash, status, outcome, created_at, updated_at FROM dispatch_intents WHERE job_id = ?",
@@ -1616,6 +1915,12 @@ export class FactoryService {
       [jobId],
     )[0];
     if (!row) throw notFound("Command receipt");
+    const executionEffects = this.database
+      .all<ExecutionJobRow>(
+        "SELECT * FROM execution_jobs WHERE request_id = ? ORDER BY accepted_at, job_id",
+        [row.request_id],
+      )
+      .map((effect) => this.#executionReceipt(effect));
     return factoryCommandReceiptSchema.parse({
       contractVersion: CONTRACT_VERSION,
       status: "accepted",
@@ -1627,6 +1932,7 @@ export class FactoryService {
       dispatchStatus: row.status,
       acceptedAt: row.created_at,
       ...(row.outcome ? { outcome: row.outcome } : {}),
+      ...(executionEffects.length ? { executionEffects } : {}),
     });
   }
 
@@ -1662,7 +1968,7 @@ export class FactoryService {
     this.database.transaction(() => {
       for (const row of rows) {
         const detail =
-          "Controller reopened while an external effect was in flight; it was not replayed";
+          "Controller reopened while managed work was in flight; it was not replayed";
         this.database.exec(
           "UPDATE dispatch_intents SET status = 'uncertain', outcome = ?, updated_at = ? WHERE job_id = ? AND status = 'running'",
           [detail, timestamp, row.job_id],
@@ -1676,7 +1982,43 @@ export class FactoryService {
           { jobId: row.job_id, detail },
           timestamp,
         );
+        this.#fenceInterruptedManagedEffects(row, timestamp);
       }
     });
+  }
+
+  #fenceInterruptedManagedEffects(row: IntentRow, timestamp: string): void {
+    const jobs = this.database.all<ExecutionJobRow>(
+      "SELECT * FROM execution_jobs WHERE request_id = ? AND status IN ('queued', 'claimed') AND report_json IS NULL",
+      [row.request_id],
+    );
+    for (const job of jobs) {
+      const status = job.status === "queued" ? "failed" : "uncertain";
+      const errorCode =
+        job.status === "queued"
+          ? "managed_input_interrupted_before_claim"
+          : "managed_input_interrupted_after_claim";
+      this.database.exec(
+        "UPDATE execution_jobs SET status = ?, finished_at = ?, error_code = ? WHERE job_id = ? AND status = ? AND report_json IS NULL",
+        [status, timestamp, errorCode, job.job_id, job.status],
+      );
+      this.#event(
+        `execution.${status}`,
+        parseActor(row.actor_json),
+        row.project_id,
+        row.thread_id,
+        row.request_id,
+        {
+          jobId: job.job_id,
+          nodeId: job.node_id,
+          target: { nodeId: job.node_id, workspaceId: job.workspace_id },
+          ownershipGeneration: job.ownership_generation,
+          piTaskId: job.pi_task_id,
+          piCallId: job.pi_call_id,
+          errorCode,
+        },
+        timestamp,
+      );
+    }
   }
 }

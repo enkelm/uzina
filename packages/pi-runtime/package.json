@@ -6,14 +6,18 @@
   "exports": {
     ".": "./src/index.ts",
     "./checkpoint": "./src/checkpoint.ts",
-    "./tools": "./src/tools.ts"
+    "./tools": "./src/tools.ts",
+    "./provider": "./src/provider.ts",
+    "./worker-provider": "./src/worker-provider.ts",
+    "./work": "./src/work.ts",
+    "./model-config": "./src/model-config.ts",
+    "./remote-bridge": "./src/remote-bridge.ts"
   },
   "dependencies": {
+    "@uzina/contracts": "workspace:*",
+    "@earendil-works/pi-ai": "1.4.0",
     "@earendil-works/chord": "1.4.0",
     "@earendil-works/pi-durable": "1.4.0",
     "typebox": "1.3.27"
-  },
-  "devDependencies": {
-    "@earendil-works/pi-ai": "1.4.0"
   }
 }

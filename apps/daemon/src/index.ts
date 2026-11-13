@@ -1,11 +1,16 @@
+import {
+  createConfiguredModels,
+  readManagedModelConfig,
+} from "@uzina/pi-runtime";
 import { createDaemonServer } from "./server";
+import { createStandaloneFactoryServer } from "./factory/standalone";
 import { ExecutionDaemon, type WorkspaceMapping } from "./execution/daemon";
 import { HttpExecutionControllerConnector } from "./execution/connector";
 import { ExecutionLoop } from "./execution/loop";
 
 function required(name: string): string {
   const value = Bun.env[name];
-  if (!value) throw new Error(`Connected executor requires ${name}`);
+  if (!value) throw new Error(`Configuration requires ${name}`);
   return value;
 }
 
@@ -22,12 +27,37 @@ function workspaceMappings(value: string): WorkspaceMapping[] {
   return parsed as WorkspaceMapping[];
 }
 
+const mode = Bun.env.UZINA_MODE ?? "local";
 const port = Number(Bun.env.PORT ?? "8788");
 const hostname = Bun.env.HOST ?? "127.0.0.1";
-const mode = Bun.env.UZINA_MODE ?? "local";
-const server = createDaemonServer(port, hostname);
 
-if (mode === "connected-executor") {
+async function startLocalFactory(): Promise<void> {
+  const modelConfig = readManagedModelConfig({
+    UZINA_MODEL_PROVIDER: Bun.env.UZINA_MODEL_PROVIDER,
+    UZINA_MODEL_ID: Bun.env.UZINA_MODEL_ID,
+    UZINA_MODEL_API_KEY: Bun.env.UZINA_MODEL_API_KEY,
+  });
+  const models = await createConfiguredModels(modelConfig);
+  const server = await createStandaloneFactoryServer({
+    databasePath: Bun.env.UZINA_FACTORY_DATABASE_PATH,
+    runtimeDirectory: Bun.env.UZINA_MANAGED_WORK_DIRECTORY,
+    bootstrapSecret: required("UZINA_BOOTSTRAP_SECRET"),
+    models,
+    modelProvider: modelConfig.provider,
+    modelId: modelConfig.modelId,
+    port,
+    hostname,
+  });
+  const close = () => {
+    void server.close(false);
+  };
+  process.once("SIGINT", close);
+  process.once("SIGTERM", close);
+  console.log(`Uzina standalone Factory listening at ${server.server.url}`);
+}
+
+function startConnectedExecutor(): void {
+  const server = createDaemonServer(port, hostname);
   let daemon: ExecutionDaemon | undefined;
   const shutdown = new AbortController();
   try {
@@ -73,10 +103,20 @@ if (mode === "connected-executor") {
     );
     process.exitCode = 1;
   }
-} else if (mode === "local") {
-  console.log(`Uzina daemon listening at ${server.url}`);
+}
+
+if (mode === "local") {
+  void startLocalFactory().catch((error: unknown) => {
+    console.error(
+      error instanceof Error
+        ? error.message
+        : "Standalone Factory configuration failed",
+    );
+    process.exitCode = 1;
+  });
+} else if (mode === "connected-executor") {
+  startConnectedExecutor();
 } else {
-  server.stop(true);
   console.error("UZINA_MODE must be local or connected-executor");
   process.exitCode = 1;
 }

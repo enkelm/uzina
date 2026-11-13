@@ -26,6 +26,7 @@ describe("Cloudflare ManagedWork in Miniflare workerd", () => {
       outdir: directory,
       target: "browser",
       packages: "bundle",
+      external: ["cloudflare:workers"],
       sourcemap: "none",
     });
     if (!build.success) {
@@ -41,6 +42,7 @@ describe("Cloudflare ManagedWork in Miniflare workerd", () => {
       modules: true,
       compatibilityDate: "2026-05-01",
       durableObjects: {
+        FACTORY: { className: "TestFactory", useSQLite: true },
         MANAGED_WORK: { className: "TestManagedWork", useSQLite: true },
       },
     });

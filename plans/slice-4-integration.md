@@ -18,22 +18,33 @@ Behavior evidence:
 
 Slice 4a does **not** complete slice 4. No production Worker binding, managed-Pi `RemoteToolExecutor` bridge, managed runtime dispatch/completion integration, Cloudflare-to-laptop flow, or production/second-laptop execution is claimed.
 
-## Slice 4b pending
+## Slice 4b implemented locally and in workerd
 
-- Dispatch an accepted Factory input to stable per-thread Pi managed work, then dispatch managed completion/failure/uncertainty to Factory receipts/events.
-- Bind `RemoteToolExecutor` to the exact authorized node/workspace/generation, using a durable effect identity tied to runtime execution evidence. Read-only replay and unsafe effect replay remain distinct.
-- Connect the remote-tool seam to stable admission/result reconciliation. Runtime recovery must find prior job evidence or retain uncertainty, not allocate a new effect after a lost reply.
-- Compose local standalone behavior and root Cloudflare Factory/ManagedWork Durable Objects with Wrangler bindings/migrations. Require real model/provider configuration and keep deterministic providers test-only.
-- Validate the composed application behavior and managed runtime recovery under real workerd. Deployment to Cloudflare and the actual second laptop remain separate operator gates.
+Accepted persisted Factory input now dispatches to stable per-thread Pi Durable work. The same Factory command receipt records managed completion, provider failure, or uncertainty and emits committed dispatch events. Owner-authorized `/context` and `/status` queries return canonical Pi Durable state; command receipts include persisted remote execution receipts after reopen.
+
+The managed remote-tool bridge is restricted to bounded file read/write and argv-command operations. Stable effect identity comes from the accepted request plus Pi Durable conversation/task/tool-call memo evidence. Actor, node, workspace, and ownership generation are derived by Core from persisted accepted placement. Managed-input `dispatch_intents` and remote-effect `execution_jobs` remain separate queues. The built-in unsafe Pi file-write and command tools are not replayed after uncertain task recovery. A tool wait timeout cancels a job still queued or fences a claimed job from subsequent claims; one late report for the original immutable assignment may reconcile its effect receipt while the parent Pi command remains uncertain.
+
+Both executable compositions are wired: a loopback standalone daemon uses SQLite for Factory and Pi Durable persistence; the root Cloudflare Worker declares the actual SQLite Factory and per-thread ManagedWork Durable Object classes/migrations and schedules alarms before recovery. Both require a real provider/model/API key and fail closed when missing or unsupported. The Cloudflare profile intentionally permits only Pi AI OpenAI API-key Responses and disables ambient environment/filesystem auth and OAuth. Its checked-in build plugin replaces only the two pinned Pi AI 1.4.0 auth helper modules; the production Wrangler and Miniflare tests consume the exact same compatibility-built Worker entry. Local Bun mode retains the full Pi AI provider catalog. The remote command contract has an optional relative `cwd` that the executor resolves inside its selected existing workspace and rejects for traversal, absolute paths, missing/non-directory paths, and symlink escapes.
+
+Behavior evidence:
+
+- `apps/daemon/test/standalone-factory.test.ts` drives the local persistent Factory HTTP host, Pi Durable runtime, real HTTP execution daemon/loop, and temporary workspace. It verifies completed file writes with Pi tool result context/correlated events and no duplicate execution for duplicate input; refuses model-selected placement overrides; checks a model-provider failure creates a failed parent receipt without an execution admission; verifies a timed command preserves an actual partial workspace effect and uncertain remote receipt across host reopen; checks relative `cwd` and escape rejection; and confirms authorized context/status plus unauthorized context refusal.
+- `apps/daemon/test/factory.test.ts` verifies a managed-tool timeout cancels an unclaimed remote job, fences an assigned job from further claims, and allows only a single correlated late report to reconcile that effect receipt without changing the uncertain parent command.
+- `apps/cloudflare/test/composed-workerd.test.ts` performs the accepted-Pi-tool-to-real-HTTP-node-to-workspace scenario through the same compatibility-built production Worker and actual `cloudflare:workers` Durable Object wrappers in Miniflare/workerd. The Pi AI OpenAI Responses provider receives two bounded mocked HTTP responses (tool call then final answer) with a dummy API key; no Internet or paid request is used. After Durable Object eviction the test confirms canonical context, settled command/effect receipts, selected destination/generation and duplicate-input identity. It also confirms missing Worker API credentials fail closed. `factory-object.workerd.test.ts` and `work-object.workerd.test.ts` separately cover alarm/recovery/reopen behavior.
+- `apps/cloudflare/test/worker-compat.test.ts` verifies Worker environment/file discovery stays disabled and every upstream OAuth loader rejects with an explicit unsupported-profile error.
+- `packages/pi-runtime/test/provider.test.ts` validates real Pi AI catalog/model/credential resolution without a paid request and missing/unsupported local/Worker configuration failures.
+- Existing `execution-controller.test.ts`, `execution.test.ts`, and `factory.test.ts` retain the admission tests for unavailable nodes, capabilities, stale generations, credential revocation, duplicate claims/reports, queue separation, and interrupted dispatch uncertainty.
+
+The composed Miniflare test executes actual Durable Object storage/alarms/RPC and Pi AI's real OpenAI provider/Responses stream parser against mocked outbound HTTP. Local tests use actual SQLite and a temporary real workspace. This is emulator/local evidence, not a production deployment or an actual remote laptop connection. No production secrets were read, no deployment/push or paid model request was made, and no existing Rex session was changed.
 
 ## Full-slice acceptance gates (4b)
 
-1. A deterministic external model selects a remote bounded file or command tool in a managed conversation.
-2. A separately authenticated execution daemon performs that effect in its explicitly selected temporary workspace.
-3. The accepted Factory command becomes observably completed with resulting model context and committed events available through authorized requests.
-4. Lost browser acceptance, duplicate node delivery/report, connection loss, and reopen retain identities without duplicating effects.
-5. Unavailable nodes, unsupported capabilities, stale ownership, and uncertain outcomes are explicit and never silently fall back.
-6. The composed scenario runs locally and through the Cloudflare-compatible runtime. Production deployment and actual second-laptop evidence are separately recorded.
+1. **Satisfied in automated local/workerd tests:** deterministic provider responses (local test adapter and workerd mocked OpenAI Responses HTTP) select a bounded remote tool in a managed Pi conversation.
+2. **Satisfied in automated local/workerd tests:** a separately authenticated execution daemon performs the effect in the explicit temporary workspace.
+3. **Satisfied in automated local/workerd tests:** accepted Factory receipts, model context, and committed correlated events are observable through authorized requests.
+4. **Satisfied for the tested lost-response/duplicate/reopen cases:** stable identities preserve receipts without duplicating effects; a timeout remains uncertain with its real partial effect and is not automatically retried.
+5. **Satisfied in protocol/local tests:** unavailable nodes, unsupported capabilities, stale ownership, revoked credentials, cwd escapes, model failures, and uncertain effects fail explicitly without fallback.
+6. **Satisfied for the Cloudflare-compatible runtime:** the composed scenario runs in Miniflare/workerd. **Not claimed/untested:** actual Cloudflare production deployment, production credential configuration, private route/Access/tailnet setup, second-laptop use, and production provider inference.
 
 ## Scope discipline
 
