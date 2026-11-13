@@ -4,13 +4,17 @@ import {
   createProjectRequestSchema,
   createThreadRequestSchema,
   createWorkspaceRequestSchema,
-  heartbeatNodeRequestSchema,
   provisionCredentialRequestSchema,
   provisionNodeRequestSchema,
-  registerNodeRequestSchema,
-  reportNodeJobRequestSchema,
   submitInputRequestSchema,
 } from "@uzina/contracts/factory";
+import {
+  executionClaimRequestSchema,
+  executionClaimResponseSchema,
+  executionHeartbeatRequestSchema,
+  executionJobReportSchema,
+  executionRegisterRequestSchema,
+} from "@uzina/contracts/execution";
 import { FactoryError, FactoryService } from "./factory";
 
 function json(body: unknown, status = 200): Response {
@@ -220,39 +224,40 @@ export function createFactoryHttpHandler(
 
       const registerMatch = path.match(/^\/v1\/nodes\/([^/]+)\/register$/);
       if (request.method === "POST" && registerMatch) {
-        await body(request, registerNodeRequestSchema);
-        return json(
-          factory.registerNode(session, decodeURIComponent(registerMatch[1]!)),
-        );
+        const input = await body(request, executionRegisterRequestSchema);
+        if (input.nodeId !== decodeURIComponent(registerMatch[1]!)) {
+          throw new FactoryError(403, "node_identity_mismatch");
+        }
+        return json(factory.registerExecutionNode(session, input));
       }
       const heartbeatMatch = path.match(/^\/v1\/nodes\/([^/]+)\/heartbeat$/);
       if (request.method === "POST" && heartbeatMatch) {
-        await body(request, heartbeatNodeRequestSchema);
-        return json(
-          factory.heartbeatNode(
-            session,
-            decodeURIComponent(heartbeatMatch[1]!),
-          ),
-        );
+        const input = await body(request, executionHeartbeatRequestSchema);
+        if (input.nodeId !== decodeURIComponent(heartbeatMatch[1]!)) {
+          throw new FactoryError(403, "node_identity_mismatch");
+        }
+        return json(factory.heartbeatExecutionNode(session, input));
       }
       const claimMatch = path.match(/^\/v1\/nodes\/([^/]+)\/jobs\/claim$/);
       if (request.method === "POST" && claimMatch) {
-        await body(request, registerNodeRequestSchema);
-        return json({
-          contractVersion: CONTRACT_VERSION,
-          job: factory.claimNodeJob(
-            session,
-            decodeURIComponent(claimMatch[1]!),
-          ),
-        });
+        const input = await body(request, executionClaimRequestSchema);
+        if (input.nodeId !== decodeURIComponent(claimMatch[1]!)) {
+          throw new FactoryError(403, "node_identity_mismatch");
+        }
+        return json(
+          executionClaimResponseSchema.parse({
+            contractVersion: CONTRACT_VERSION,
+            job: factory.claimExecutionJob(session, input.nodeId),
+          }),
+        );
       }
       const reportMatch = path.match(
         /^\/v1\/nodes\/([^/]+)\/jobs\/([^/]+)\/report$/,
       );
       if (request.method === "POST" && reportMatch) {
-        const input = await body(request, reportNodeJobRequestSchema);
+        const input = await body(request, executionJobReportSchema);
         return json(
-          factory.reportNodeJob(
+          await factory.reportExecutionJob(
             session,
             decodeURIComponent(reportMatch[1]!),
             decodeURIComponent(reportMatch[2]!),

@@ -13,11 +13,15 @@ interface DurableSqlStorage {
     query: string,
     ...values: SqlValue[]
   ): DurableSqlCursor<T>;
+}
+
+interface FactoryDurableObjectStorage {
+  sql: DurableSqlStorage;
   transactionSync<T>(operation: () => T): T;
 }
 
 interface FactoryDurableObjectState {
-  storage: { sql: DurableSqlStorage };
+  storage: FactoryDurableObjectStorage;
 }
 
 export interface FactoryDurableObjectEnvironment {
@@ -25,21 +29,21 @@ export interface FactoryDurableObjectEnvironment {
 }
 
 class DurableObjectFactoryDatabase implements FactoryDatabase {
-  constructor(private readonly sql: DurableSqlStorage) {}
+  constructor(private readonly storage: FactoryDurableObjectStorage) {}
 
   exec(query: string, values: readonly SqlValue[] = []): void {
-    this.sql.exec(query, ...values);
+    this.storage.sql.exec(query, ...values);
   }
 
   all<T extends SqlRow = SqlRow>(
     query: string,
     values: readonly SqlValue[] = [],
   ): T[] {
-    return this.sql.exec<T>(query, ...values).toArray();
+    return this.storage.sql.exec<T>(query, ...values).toArray();
   }
 
   transaction<T>(operation: () => T): T {
-    return this.sql.transactionSync(operation);
+    return this.storage.transactionSync(operation);
   }
 }
 
@@ -52,7 +56,7 @@ export class FactoryObject {
     environment: FactoryDurableObjectEnvironment,
   ) {
     const factory = new FactoryService(
-      new DurableObjectFactoryDatabase(state.storage.sql),
+      new DurableObjectFactoryDatabase(state.storage),
       environment.UZINA_BOOTSTRAP_SECRET,
     );
     this.#handle = createFactoryHttpHandler(factory);

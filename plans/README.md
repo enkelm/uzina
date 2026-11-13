@@ -10,7 +10,7 @@ Implement the scope in `SPEC.md` through the slices below. A slice is complete o
 | 1     | Persistent Pi Durable under Bun and Cloudflare; early managed-checkpoint feasibility proof | 0                                      | Integrated; pending review                      |
 | 2     | Authenticated execution daemon, explicit workspace jobs, Rex lifecycle                     | 0                                      | Integrated; pending review                      |
 | 3     | Owner-authenticated Factory commands, durable receipts, committed events                   | 0                                      | Integrated; pending review                      |
-| 4     | Cloud-managed Pi executes a bounded tool on a selected laptop                              | 1, 2, 3                                | Not started                                     |
+| 4     | Cloud-managed Pi executes a bounded tool on a selected laptop                              | 1, 2, 3                                | Slice 4a implemented; slice 4b pending          |
 | 5     | Minimal operational PWA with retained request identities and reconnect handling            | 3, 4                                   | Not started                                     |
 | 6     | Persistent invitations, scoped roles, revocation, subscription enforcement                 | 3                                      | Not started                                     |
 | 7     | MCP tools and private Factory assistant using ordinary authorized operations               | 1, 3, 4                                | Not started                                     |
@@ -42,7 +42,7 @@ Early feasibility: Pi Durable/chord 1.4.0 supplies public storage records and a 
 
 ## Integration checkpoint
 
-Slices 1, 2, 3, and the workspace portion of 8 have been copied into the main workspace for review. These are foundation modules, not completed user-facing slices. No slice-4 Factory-to-Pi-to-node execution bridge or ownership transfer is implemented. See `plans/integration-contracts.md`, `packages/pi-runtime/README.md`, `packages/checkpoints/README.md`, and `packages/core/README.md` for public interfaces, profiles, and remaining integration boundaries.
+Slices 1, 2, 3, and the workspace portion of 8 have been copied into the main workspace for review. Slice 4a now implements the authenticated Factory-to-execution-node protocol, separate durable managed-input and remote-effect queues, the connected daemon loop, and a real local HTTP/workerd test seam. Slice 4b has not connected managed Pi tools or Factory dispatch to those seams. No ownership transfer is implemented. See `plans/integration-contracts.md`, `plans/slice-4-integration.md`, and the package READMEs for exact interfaces and remaining gates.
 
 ### Reviewed correction integration
 
@@ -62,6 +62,19 @@ Integration validation in the main checkout:
 - `bun run test` — passed after correction integration: 68 tests across 11 files, 432 assertions, including descendant process-group termination, bounded Git output and wildcard traversal, managed-checkpoint root/fresh-store validation, Bun SQLite persistence/execution/Factory/workspace checkpoint tests, and the Miniflare workerd Durable Object eviction/recovery test.
 - `bun run build` — passed: Bun daemon bundle (13 modules, 115.68 KiB) and Wrangler dry-run Worker bundle (126.46 KiB upload, 21.00 KiB gzip). Wrangler printed `No bindings found`; this does not validate ManagedWork or Factory Durable Object bindings or deployment.
 - `git diff --check` — passed.
+
+### Slice 4a checkpoint validation
+
+In the main checkout after implementing slice 4a:
+
+- `bun run format` — passed.
+- `bun run check` — passed.
+- `bun run typecheck` — passed.
+- `bun run test` — passed: 70 tests across 13 files, 460 assertions. This includes real local HTTP Factory-to-ExecutionDaemon file mutation/lost-ack/reopen coverage and a real Miniflare/workerd Factory Durable Object bootstrap/admission/eviction/reopen test.
+- `bun run build` — passed: daemon bundled (20 modules, 171.71 KiB) and Wrangler dry-run completed (126.46 KiB upload estimate, 21.00 KiB gzip). Wrangler reported `No bindings found`; no Worker Durable Object binding/deployment is claimed.
+- `git diff --check` — passed.
+
+Production seams added: concrete authenticated node routes in `@uzina/core/http`; `FactoryService.registerExecutionNode`, `heartbeatExecutionNode`, `claimExecutionJob`, `reportExecutionJob`; trusted in-process `enqueueRemoteExecution` / `getRemoteExecutionReceipt`; local durable `ExecutionDaemon.pendingReports` / `markReported`; `ExecutionLoop`; and explicit `UZINA_MODE=connected-executor` startup. The managed Pi bridge and production Worker bindings remain slice 4b.
 
 ## Workflow
 

@@ -7,6 +7,7 @@ import {
   FactoryService,
   createFactoryHttpHandler,
 } from "@uzina/core";
+import { executionRegisterRequestSchema } from "@uzina/contracts/execution";
 import { BunFactoryDatabase } from "../src/factory/sqlite";
 
 const bootstrapSecret = "fixture-only-private-bootstrap-secret";
@@ -17,6 +18,23 @@ function openDatabase() {
   const database = new BunFactoryDatabase(join(directory, "factory.sqlite"));
   fixtures.push({ directory, database });
   return { directory, database };
+}
+
+function registration(nodeId: string, workspaceId: string) {
+  return executionRegisterRequestSchema.parse({
+    contractVersion: 1,
+    nodeId,
+    daemonVersion: "test",
+    workspaces: [{ workspaceId, ownershipGeneration: 0, state: "active" }],
+    capabilities: {
+      fileRead: true,
+      fileWrite: true,
+      argvCommand: true,
+      rexProcessCreate: true,
+      rexProcessInspect: true,
+      rexProcessStop: true,
+    },
+  });
 }
 
 afterEach(() => {
@@ -56,7 +74,12 @@ async function provisionFixture(nodeOnline: boolean) {
     title: "First thread",
     target: { nodeId: node.nodeId, workspaceId: workspace.workspaceId },
   });
-  if (nodeOnline) factory.registerNode(nodeSession, node.nodeId);
+  if (nodeOnline) {
+    factory.registerExecutionNode(
+      nodeSession,
+      registration(node.nodeId, workspace.workspaceId),
+    );
+  }
   return {
     directory,
     database,
@@ -168,7 +191,10 @@ describe("persistent Factory behavior over Bun SQLite", () => {
       fixture.factory.createProject(assistant, undefined, "Forbidden project"),
     ).toThrow(FactoryError);
     expect(() =>
-      fixture.factory.registerNode(assistant, "node:laptop-a"),
+      fixture.factory.registerExecutionNode(
+        assistant,
+        registration("node:laptop-a", "workspace:repo"),
+      ),
     ).toThrow();
     expect(() =>
       fixture.factory.listProjects({
@@ -272,79 +298,52 @@ describe("persistent Factory behavior over Bun SQLite", () => {
     expect(revokedNode.status).toBe(401);
   });
 
-  test("node reports persist completed and failed outcomes without allowing conflicting rewrites", async () => {
+  test("managed inputs remain in their runtime queue and are never exposed as node execution jobs", async () => {
     const fixture = await provisionFixture(true);
-    for (const status of ["completed", "failed"] as const) {
-      const requestId = `request:${status}`;
-      const accepted = await fixture.factory.submitInput(
-        fixture.owner,
-        fixture.thread.threadId,
-        requestId,
-        `Attempt ${status}`,
-      );
-      expect(
-        fixture.factory.claimNodeJob(fixture.nodeSession, "node:laptop-a")
-          ?.jobId,
-      ).toBe(accepted.jobId);
-      const report = {
-        workspaceId: "workspace:repo",
-        ownershipGeneration: 0,
-        status,
-        detail: `${status} outcome`,
-      };
-      expect(() =>
-        fixture.factory.reportNodeJob(
-          fixture.nodeSession,
-          "node:laptop-a",
-          accepted.jobId,
-          { ...report, workspaceId: "workspace:other" },
-        ),
-      ).toThrow(FactoryError);
-      expect(
-        fixture.factory.reportNodeJob(
-          fixture.nodeSession,
-          "node:laptop-a",
-          accepted.jobId,
-          report,
-        ).dispatchStatus,
-      ).toBe(status);
-      expect(
-        fixture.factory.reportNodeJob(
-          fixture.nodeSession,
-          "node:laptop-a",
-          accepted.jobId,
-          report,
-        ).dispatchStatus,
-      ).toBe(status);
-      expect(() =>
-        fixture.factory.reportNodeJob(
-          fixture.nodeSession,
-          "node:laptop-a",
-          accepted.jobId,
-          {
-            workspaceId: "workspace:repo",
-            ownershipGeneration: 0,
-            status: status === "completed" ? "failed" : "completed",
-            detail: "conflicting outcome",
-          },
-        ),
-      ).toThrow(FactoryError);
-    }
+    const accepted = await fixture.factory.submitInput(
+      fixture.owner,
+      fixture.thread.threadId,
+      "request:managed-input",
+      "Run this in the managed conversation",
+    );
+    let dispatchedInput: unknown;
+    const dispatched = await fixture.factory.dispatchNext({
+      async dispatch(job) {
+        dispatchedInput = job.input;
+        return { status: "dispatched", detail: "runtime accepted submission" };
+      },
+    });
+
+    expect(dispatched?.jobId).toBe(accepted.jobId);
+    expect(dispatched?.dispatchStatus).toBe("dispatched");
+    expect(dispatchedInput).toEqual({
+      kind: "managed-input",
+      text: "Run this in the managed conversation",
+    });
+    expect(
+      fixture.factory.claimExecutionJob(fixture.nodeSession, "node:laptop-a"),
+    ).toBeNull();
   });
 
-  test("claimed external work becomes uncertain after reopen and is never claimed again", async () => {
+  test("interrupted managed-runtime dispatch is uncertain after reopen and is not converted into a node job", async () => {
     const fixture = await provisionFixture(true);
     const accepted = await fixture.factory.submitInput(
       fixture.owner,
       fixture.thread.threadId,
       "request:uncertain",
-      "Perform an external effect",
+      "Perform a managed runtime effect",
     );
-    const job = fixture.factory.claimNodeJob(
-      fixture.nodeSession,
-      "node:laptop-a",
-    );
-    expect(job?.jobId).toBe(accepted.jobId);
+    let enteredDispatch!: () => void;
+    const dispatchEntered = new Promise<void>((resolve) => {
+      enteredDispatch = resolve;
+    });
+    void fixture.factory.dispatchNext({
+      dispatch: () =>
+        new Promise(() => {
+          enteredDispatch();
+        }),
+    });
+    await dispatchEntered;
     expect(
       fixture.factory.getReceipt(fixture.owner, accepted.requestId)
         .dispatchStatus,
@@ -363,7 +362,7 @@ describe("persistent Factory behavior over Bun SQLite", () => {
     expect(reopened.getReceipt(owner, accepted.requestId).dispatchStatus).toBe(
       "uncertain",
     );
-    expect(reopened.claimNodeJob(node, "node:laptop-a")).toBeNull();
+    expect(reopened.claimExecutionJob(node, "node:laptop-a")).toBeNull();
     expect(
       reopened
         .events(owner, 0)
@@ -373,29 +372,5 @@ describe("persistent Factory behavior over Bun SQLite", () => {
             event.requestId === accepted.requestId,
         ),
     ).toBe(true);
-
-    const reconciled = reopened.reportNodeJob(
-      node,
-      "node:laptop-a",
-      accepted.jobId,
-      {
-        workspaceId: "workspace:repo",
-        ownershipGeneration: 0,
-        status: "uncertain",
-        detail: "The node cannot prove whether the effect happened",
-      },
-    );
-    expect(reconciled.dispatchStatus).toBe("uncertain");
-    const eventCount = reopened.events(owner, 0).events.length;
-    expect(
-      reopened.reportNodeJob(node, "node:laptop-a", accepted.jobId, {
-        workspaceId: "workspace:repo",
-        ownershipGeneration: 0,
-        status: "uncertain",
-        detail: "The node cannot prove whether the effect happened",
-      }).dispatchStatus,
-    ).toBe("uncertain");
-    expect(reopened.events(owner, 0).events.length).toBe(eventCount);
-    expect(reopened.claimNodeJob(node, "node:laptop-a")).toBeNull();
   });
 });

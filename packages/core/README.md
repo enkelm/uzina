@@ -1,15 +1,28 @@
-# Factory Core foundation
+# Factory Core
 
-`@uzina/core` provides the owner-authenticated Factory service and durable queue seam. The public exports are `FactoryService`, `FactoryError`, `createFactoryHttpHandler`, `FactoryDatabase`, `RuntimeDispatchAdapter`, and related types; `@uzina/core/http` and `@uzina/core/database` are independently importable subpaths. The validated Factory API and queue types are at `@uzina/contracts/factory`.
+`@uzina/core` provides owner-authenticated Factory operations over the portable `FactoryDatabase` interface. The local Bun SQLite and Cloudflare Durable Object adapters use the same service behavior.
 
-The local `BunFactoryDatabase` and Cloudflare `FactoryObject` adapters are present but neither is wired into the root daemon or Worker entry point. The injected `RuntimeDispatchAdapter` is an explicit managed-runtime seam and accepts a `FactoryQueueJob`; it is not the executor node protocol.
+## Separate durable queues
 
-## Slice 4 integration boundary
+Factory managed-input intents remain in `dispatch_intents`; they contain `{ kind: "managed-input", text }` and are consumed only by the injected `ManagedRuntimeDispatch` boundary (`FactoryService.dispatchNext`). They are not node jobs.
 
-Factory routes currently reserve `/v1/nodes/:nodeId/register`, `/heartbeat`, `/jobs/claim`, and `/jobs/:jobId/report`, but their payloads do not match `@uzina/contracts/execution` or `HttpExecutionControllerConnector`:
+Remote effects are persisted separately in `execution_jobs`. The trusted in-process slice-4b bridge seam is `FactoryService.enqueueRemoteExecution(job)` with `FactoryService.getRemoteExecutionReceipt(jobId)` for reconciliation. Admission validates the concrete `@uzina/contracts/execution` job schema, stable job ID/payload hash, provisioned node/workspace assignment, online heartbeat, current ownership generation, and active workspace report. There is deliberately no public HTTP job-injection route.
 
-- Factory register/heartbeat requests are empty objects; execution requests include version, daemon version or timestamp, workspace generation/state reports, and capabilities.
-- Factory claim returns a `FactoryQueueJob` whose input is `{ kind: "managed-input", text }`; execution claim returns one `ExecutionJob` with a `read-file`, `write-file`, or `argv-command` operation.
-- Factory reports carry workspace, generation, status, and optional detail; execution reports additionally bind the job/node/target, payload digest, finish time, and optional result/error/reconciliation evidence.
+## Authenticated execution-node protocol
 
-Do not route one schema through the other or claim these protocols are connected. Slice 4 must define and implement the authorized controller-side node API for the execution contract, connect its queued bounded tool operations to the managed Pi remote-tool executor, and separately dispatch `FactoryQueueJob` through the stable managed-work submission/receipt API. Keep the actor, workspace/node identity, and ownership-generation checks explicit at each boundary.
+The owner provisions a node with `POST /v1/nodes` and creates each allowed workspace with `POST /v1/workspaces`. The one-time-visible node bearer credential is bound to the provisioned node actor. Node routes derive identity from this credential and match it to the path and schema body:
+
+- `POST /v1/nodes/:nodeId/register`
+- `POST /v1/nodes/:nodeId/heartbeat`
+- `POST /v1/nodes/:nodeId/jobs/claim`
+- `POST /v1/nodes/:nodeId/jobs/:jobId/report`
+
+All four requests and responses use `@uzina/contracts/execution`. Registration persists the node's capability report and owner-permitted workspace/generation/state reports. Claims persist claim evidence and return the same assigned job on retry after a lost acknowledgement; reports are checked against the persisted assignment and payload digest and exact duplicates reconcile the original report. Neither lost acknowledgements nor controller/node reopen require an in-memory prior claim. Interrupted node effects remain uncertain and are not replayed.
+
+## Production seams and limits
+
+- `FactoryService.registerExecutionNode`, `heartbeatExecutionNode`, `claimExecutionJob`, and `reportExecutionJob` implement the node-facing Core operations.
+- `FactoryService.enqueueRemoteExecution` / `getRemoteExecutionReceipt` are trusted in-process bridge seams for slice 4b. They must not be exposed as an anonymous or owner-facing job injection API.
+- `@uzina/contracts/execution` remains the wire contract. The legacy empty Factory register/heartbeat/claim/report schemas and the managed-input node claim/report methods have been removed.
+- `FactoryObject` now calls `state.storage.transactionSync` (not `state.storage.sql.transactionSync`). The workerd-compatible adapter is exercised by `apps/cloudflare/test/factory-object.workerd.test.ts`.
+- This implements slice 4a controller-to-executor protocol only. It does not connect managed Pi tools to the remote-job admission seam, dispatch managed submissions through Pi Durable, bind Factory/ManagedWork Durable Objects in the production Worker, or prove production Cloudflare/laptop operation. Those are slice 4b/operator gates.

@@ -84,7 +84,46 @@ const schema = [
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS execution_node_state (
+    node_id TEXT PRIMARY KEY REFERENCES nodes(node_id),
+    daemon_version TEXT NOT NULL,
+    capabilities_json TEXT NOT NULL,
+    registered_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS execution_node_workspaces (
+    node_id TEXT NOT NULL REFERENCES nodes(node_id),
+    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id),
+    ownership_generation INTEGER NOT NULL CHECK (ownership_generation >= 0),
+    state TEXT NOT NULL CHECK (state IN ('active', 'fenced')),
+    PRIMARY KEY (node_id, workspace_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS execution_jobs (
+    job_id TEXT PRIMARY KEY,
+    node_id TEXT NOT NULL REFERENCES nodes(node_id),
+    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id),
+    ownership_generation INTEGER NOT NULL CHECK (ownership_generation >= 0),
+    operation TEXT NOT NULL CHECK (operation IN ('read-file', 'write-file', 'argv-command')),
+    payload_json TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('queued', 'claimed', 'completed', 'failed', 'uncertain')),
+    accepted_at TEXT NOT NULL,
+    claimed_at TEXT,
+    finished_at TEXT,
+    report_json TEXT,
+    report_sha256 TEXT,
+    error_code TEXT
+  )`,
+  `CREATE TABLE IF NOT EXISTS execution_job_claims (
+    job_id TEXT NOT NULL REFERENCES execution_jobs(job_id),
+    claim_number INTEGER NOT NULL CHECK (claim_number > 0),
+    node_id TEXT NOT NULL REFERENCES nodes(node_id),
+    payload_sha256 TEXT NOT NULL,
+    claimed_at TEXT NOT NULL,
+    PRIMARY KEY (job_id, claim_number)
+  )`,
   `CREATE INDEX IF NOT EXISTS dispatch_queue_by_node ON dispatch_intents(status, node_id, created_at)`,
+  `CREATE INDEX IF NOT EXISTS execution_queue_by_node ON execution_jobs(status, node_id, accepted_at)`,
   `CREATE INDEX IF NOT EXISTS factory_events_by_cursor ON factory_events(cursor)`,
 ];
 

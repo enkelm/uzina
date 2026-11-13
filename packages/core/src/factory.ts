@@ -12,6 +12,23 @@ import {
   type FactoryQueueJob,
   type ManagedRuntimeDispatch,
 } from "@uzina/contracts/factory";
+import {
+  EXECUTION_CONTRACT_VERSION,
+  executionHeartbeatRequestSchema,
+  executionHeartbeatResponseSchema,
+  executionJobReportSchema,
+  executionJobSchema,
+  executionReceiptSchema,
+  executionRegisterRequestSchema,
+  executionRegisterResponseSchema,
+  executionReportResponseSchema,
+  type ExecutionHeartbeatRequest,
+  type ExecutionJob,
+  type ExecutionJobReport,
+  type ExecutionReceipt,
+  type ExecutionRegisterRequest,
+  type ExecutionWorkspaceReport,
+} from "@uzina/contracts/execution";
 import type { FactoryDatabase } from "./database";
 import { initializeFactoryDatabase } from "./database";
 
@@ -89,6 +106,35 @@ type ReceiptRow = {
   accepted_at: string;
 };
 type StoredCredential = BootstrapResult & { tokenHash: string };
+type ExecutionNodeStateRow = {
+  node_id: string;
+  daemon_version: string;
+  capabilities_json: string;
+  registered_at: string;
+  last_seen_at: string;
+};
+type ExecutionWorkspaceRow = {
+  node_id: string;
+  workspace_id: string;
+  ownership_generation: number;
+  state: "active" | "fenced";
+};
+type ExecutionJobRow = {
+  job_id: string;
+  node_id: string;
+  workspace_id: string;
+  ownership_generation: number;
+  operation: ExecutionJob["operation"];
+  payload_json: string;
+  payload_sha256: string;
+  status: "queued" | "claimed" | "completed" | "failed" | "uncertain";
+  accepted_at: string;
+  claimed_at: string | null;
+  finished_at: string | null;
+  report_json: string | null;
+  report_sha256: string | null;
+  error_code: string | null;
+};
 type EventRow = {
   cursor: number;
   type: string;
@@ -152,6 +198,18 @@ function conflict(code: string, message: string): FactoryError {
 }
 
 function encode<T>(value: T): string {
+  return JSON.stringify(value);
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`)
+      .join(",")}}`;
+  }
   return JSON.stringify(value);
 }
 
@@ -795,151 +853,317 @@ export class FactoryService {
     };
   }
 
-  registerNode(session: FactorySession, nodeId: string) {
-    this.#requireNode(session, nodeId);
-    return this.#touchNode(session.actor, nodeId, "node.registered");
-  }
-
-  heartbeatNode(session: FactorySession, nodeId: string) {
-    this.#requireNode(session, nodeId);
-    return this.#touchNode(session.actor, nodeId, "node.heartbeat");
-  }
-
-  claimNodeJob(
+  registerExecutionNode(
     session: FactorySession,
-    nodeId: string,
-  ): ReturnType<typeof factoryQueueJobSchema.parse> | null {
-    this.#requireNode(session, nodeId);
-    const node = this.database.all<NodeRow>(
-      "SELECT node_id, name, availability, last_seen_at FROM nodes WHERE node_id = ?",
-      [nodeId],
-    )[0];
-    if (!node) throw notFound("Execution node");
-    if (!this.#isNodeOnline(node)) return null;
-    return this.database.transaction(() => {
-      const intent = this.database.all<IntentRow>(
-        "SELECT job_id, request_id, actor_json, project_id, thread_id, node_id, workspace_id, ownership_generation, payload_json, payload_hash, status, outcome, created_at, updated_at FROM dispatch_intents WHERE node_id = ? AND status = 'queued' ORDER BY created_at, job_id LIMIT 1",
-        [nodeId],
+    request: ExecutionRegisterRequest,
+  ) {
+    const input = executionRegisterRequestSchema.parse(request);
+    this.#requireNode(session, input.nodeId);
+    const timestamp = now();
+    this.#validateReportedWorkspaces(input.nodeId, input.workspaces);
+    this.database.transaction(() => {
+      this.#requireNode(session, input.nodeId);
+      const node = this.database.all<NodeRow>(
+        "SELECT node_id, name, availability, last_seen_at FROM nodes WHERE node_id = ?",
+        [input.nodeId],
       )[0];
-      if (!intent) return null;
-      const currentGeneration = this.#ownershipGeneration();
-      if (intent.ownership_generation !== currentGeneration) {
-        const timestamp = now();
-        const detail =
-          "The assignment is fenced by a newer ownership generation";
-        this.database.exec(
-          "UPDATE dispatch_intents SET status = 'unavailable', outcome = ?, updated_at = ? WHERE job_id = ? AND status = 'queued'",
-          [detail, timestamp, intent.job_id],
-        );
-        this.#event(
-          "dispatch.unavailable",
-          session.actor,
-          intent.project_id,
-          intent.thread_id,
-          intent.request_id,
-          { jobId: intent.job_id, reason: "ownership_generation_mismatch" },
-          timestamp,
-        );
-        return null;
-      }
-      const timestamp = now();
+      if (!node) throw notFound("Execution node");
       this.database.exec(
-        "UPDATE dispatch_intents SET status = 'running', updated_at = ? WHERE job_id = ? AND status = 'queued'",
-        [timestamp, intent.job_id],
+        `INSERT INTO execution_node_state(node_id, daemon_version, capabilities_json, registered_at, last_seen_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(node_id) DO UPDATE SET daemon_version = excluded.daemon_version,
+           capabilities_json = excluded.capabilities_json, last_seen_at = excluded.last_seen_at`,
+        [
+          input.nodeId,
+          input.daemonVersion,
+          encode(input.capabilities),
+          timestamp,
+          timestamp,
+        ],
+      );
+      this.#storeReportedWorkspaces(input.nodeId, input.workspaces);
+      this.database.exec(
+        "UPDATE nodes SET availability = 'online', last_seen_at = ? WHERE node_id = ?",
+        [timestamp, input.nodeId],
       );
       this.#event(
-        "dispatch.started",
+        "node.registered",
         session.actor,
-        intent.project_id,
-        intent.thread_id,
-        intent.request_id,
-        { jobId: intent.job_id },
+        null,
+        null,
+        null,
+        {
+          nodeId: input.nodeId,
+          daemonVersion: input.daemonVersion,
+          workspaceCount: input.workspaces.length,
+          capabilities: input.capabilities,
+        },
         timestamp,
       );
-      return factoryQueueJobSchema.parse(JSON.parse(intent.payload_json));
+    });
+    return executionRegisterResponseSchema.parse({
+      contractVersion: EXECUTION_CONTRACT_VERSION,
+      nodeId: input.nodeId,
+      registered: true,
+      controllerTime: timestamp,
     });
   }
 
-  reportNodeJob(
+  heartbeatExecutionNode(
     session: FactorySession,
-    nodeId: string,
-    jobId: string,
-    report: {
-      workspaceId: string;
-      ownershipGeneration: number;
-      status: "completed" | "failed" | "uncertain";
-      detail?: string;
-    },
-  ): FactoryCommandReceipt {
-    this.#requireNode(session, nodeId);
-    const intent = this.database.all<IntentRow>(
-      "SELECT job_id, request_id, actor_json, project_id, thread_id, node_id, workspace_id, ownership_generation, payload_json, payload_hash, status, outcome, created_at, updated_at FROM dispatch_intents WHERE job_id = ?",
-      [jobId],
+    request: ExecutionHeartbeatRequest,
+  ) {
+    const input = executionHeartbeatRequestSchema.parse(request);
+    this.#requireNode(session, input.nodeId);
+    const registered = this.database.all<ExecutionNodeStateRow>(
+      "SELECT node_id, daemon_version, capabilities_json, registered_at, last_seen_at FROM execution_node_state WHERE node_id = ?",
+      [input.nodeId],
     )[0];
-    if (!intent) throw notFound("Assigned job");
-    if (intent.node_id !== nodeId) throw forbidden();
-    const assignment = factoryQueueJobSchema.parse(
-      JSON.parse(intent.payload_json),
-    );
-    if (
-      assignment.target.nodeId !== nodeId ||
-      assignment.target.workspaceId !== intent.workspace_id ||
-      assignment.ownershipGeneration !== intent.ownership_generation ||
-      report.workspaceId !== intent.workspace_id ||
-      report.ownershipGeneration !== intent.ownership_generation
-    ) {
+    if (!registered) {
       throw conflict(
-        "assignment_mismatch",
-        "The report does not match the persisted node, workspace, or ownership generation",
-      );
-    }
-    if (
-      intent.status === report.status &&
-      intent.outcome === (report.detail ?? null)
-    ) {
-      return this.#receiptByJob(jobId);
-    }
-    if (["completed", "failed"].includes(intent.status)) {
-      if (
-        intent.status !== report.status ||
-        intent.outcome !== (report.detail ?? null)
-      ) {
-        throw conflict(
-          "report_conflict",
-          "A different terminal outcome is already committed for this job",
-        );
-      }
-      return this.#receiptByJob(jobId);
-    }
-    if (!["running", "dispatched", "uncertain"].includes(intent.status)) {
-      throw conflict(
-        "job_not_claimed",
-        "A job must be claimed or already uncertain before it can be reported",
+        "node_not_registered",
+        "Register before sending heartbeats",
       );
     }
     const timestamp = now();
-    const eventType =
-      report.status === "completed"
-        ? "dispatch.completed"
-        : report.status === "failed"
-          ? "dispatch.failed"
-          : "dispatch.uncertain";
+    this.#validateReportedWorkspaces(input.nodeId, input.workspaces);
     this.database.transaction(() => {
+      this.#requireNode(session, input.nodeId);
+      this.#storeReportedWorkspaces(input.nodeId, input.workspaces);
       this.database.exec(
-        "UPDATE dispatch_intents SET status = ?, outcome = ?, updated_at = ? WHERE job_id = ?",
-        [report.status, report.detail ?? null, timestamp, jobId],
+        "UPDATE execution_node_state SET capabilities_json = ?, last_seen_at = ? WHERE node_id = ?",
+        [encode(input.capabilities), timestamp, input.nodeId],
+      );
+      this.database.exec(
+        "UPDATE nodes SET availability = 'online', last_seen_at = ? WHERE node_id = ?",
+        [timestamp, input.nodeId],
       );
       this.#event(
-        eventType,
+        "node.heartbeat",
         session.actor,
-        intent.project_id,
-        intent.thread_id,
-        intent.request_id,
-        { jobId, detail: report.detail ?? null },
+        null,
+        null,
+        null,
+        { nodeId: input.nodeId, workspaceCount: input.workspaces.length },
         timestamp,
       );
     });
-    return this.#receiptByJob(jobId);
+    return executionHeartbeatResponseSchema.parse({
+      contractVersion: EXECUTION_CONTRACT_VERSION,
+      nodeId: input.nodeId,
+      receivedAt: timestamp,
+    });
+  }
+
+  claimExecutionJob(
+    session: FactorySession,
+    nodeId: string,
+  ): ExecutionJob | null {
+    this.#requireNode(session, nodeId);
+    return this.database.transaction(() => {
+      this.#requireNode(session, nodeId);
+      const node = this.database.all<NodeRow>(
+        "SELECT node_id, name, availability, last_seen_at FROM nodes WHERE node_id = ?",
+        [nodeId],
+      )[0];
+      const runtime = this.database.all<ExecutionNodeStateRow>(
+        "SELECT node_id, daemon_version, capabilities_json, registered_at, last_seen_at FROM execution_node_state WHERE node_id = ?",
+        [nodeId],
+      )[0];
+      if (!node || !runtime || !this.#isNodeOnline(node)) return null;
+
+      const generation = this.#ownershipGeneration();
+      const activeAssignment = this.database.all<ExecutionJobRow>(
+        "SELECT * FROM execution_jobs WHERE node_id = ? AND status = 'claimed' ORDER BY claimed_at, job_id LIMIT 1",
+        [nodeId],
+      )[0];
+      const job =
+        activeAssignment ??
+        this.database.all<ExecutionJobRow>(
+          `SELECT jobs.* FROM execution_jobs AS jobs
+           JOIN execution_node_workspaces AS workspaces
+             ON workspaces.node_id = jobs.node_id AND workspaces.workspace_id = jobs.workspace_id
+           WHERE jobs.node_id = ? AND jobs.status = 'queued'
+             AND jobs.ownership_generation = ?
+             AND workspaces.ownership_generation = jobs.ownership_generation
+             AND workspaces.state = 'active'
+           ORDER BY jobs.accepted_at, jobs.job_id LIMIT 1`,
+          [nodeId, generation],
+        )[0];
+      if (!job) return null;
+      if (
+        job.ownership_generation !== generation ||
+        !this.#hasActiveWorkspaceReport(
+          nodeId,
+          job.workspace_id,
+          job.ownership_generation,
+        )
+      ) {
+        if (job.status === "queued") {
+          this.database.exec(
+            "UPDATE execution_jobs SET status = 'failed', finished_at = ?, error_code = 'stale_ownership_generation' WHERE job_id = ? AND status = 'queued'",
+            [now(), job.job_id],
+          );
+        }
+        return null;
+      }
+      const claimNumber =
+        this.database.all<{ claim_count: number }>(
+          "SELECT COUNT(*) AS claim_count FROM execution_job_claims WHERE job_id = ?",
+          [job.job_id],
+        )[0]?.claim_count ?? 0;
+      const timestamp = now();
+      if (job.status === "queued") {
+        this.database.exec(
+          "UPDATE execution_jobs SET status = 'claimed', claimed_at = ? WHERE job_id = ? AND status = 'queued'",
+          [timestamp, job.job_id],
+        );
+      }
+      this.database.exec(
+        "INSERT INTO execution_job_claims(job_id, claim_number, node_id, payload_sha256, claimed_at) VALUES (?, ?, ?, ?, ?)",
+        [job.job_id, claimNumber + 1, nodeId, job.payload_sha256, timestamp],
+      );
+      return executionJobSchema.parse(JSON.parse(job.payload_json));
+    });
+  }
+
+  async reportExecutionJob(
+    session: FactorySession,
+    nodeId: string,
+    jobId: string,
+    report: ExecutionJobReport,
+  ) {
+    const input = executionJobReportSchema.parse(report);
+    this.#requireNode(session, nodeId);
+    if (input.nodeId !== nodeId || input.jobId !== jobId) {
+      throw conflict(
+        "assignment_mismatch",
+        "Report path and body identities differ",
+      );
+    }
+    const job = this.#executionJob(jobId);
+    if (!job) throw notFound("Assigned execution job");
+    const payload = executionJobSchema.parse(JSON.parse(job.payload_json));
+    if (
+      job.node_id !== nodeId ||
+      payload.target.nodeId !== input.target.nodeId ||
+      job.workspace_id !== input.target.workspaceId ||
+      job.ownership_generation !== input.ownershipGeneration ||
+      job.payload_sha256 !== input.payloadSha256 ||
+      (input.result !== undefined &&
+        input.result.operation !== payload.operation)
+    ) {
+      throw conflict(
+        "assignment_mismatch",
+        "Report does not match the persisted job target, generation, or payload",
+      );
+    }
+    const reportJson = encode(input);
+    const reportHash = await sha256(stableJson(input));
+    if (job.report_json !== null) {
+      if (job.report_sha256 !== reportHash) {
+        throw conflict(
+          "report_conflict",
+          "A different report is already committed",
+        );
+      }
+      return this.#executionReportAcknowledgement(nodeId, jobId, input.status);
+    }
+    if (job.status !== "claimed") {
+      throw conflict(
+        "job_not_claimed",
+        "The execution job has no persisted claim",
+      );
+    }
+    this.database.transaction(() => {
+      this.#requireNode(session, nodeId);
+      const current = this.#executionJob(jobId);
+      if (!current) throw notFound("Assigned execution job");
+      if (current.report_json !== null) {
+        if (current.report_sha256 !== reportHash) {
+          throw conflict(
+            "report_conflict",
+            "A different report is already committed",
+          );
+        }
+        return;
+      }
+      if (current.status !== "claimed") {
+        throw conflict(
+          "job_not_claimed",
+          "The execution job has no persisted claim",
+        );
+      }
+      this.database.exec(
+        `UPDATE execution_jobs SET status = ?, finished_at = ?, report_json = ?,
+          report_sha256 = ?, error_code = ? WHERE job_id = ? AND status = 'claimed'`,
+        [
+          input.status,
+          input.finishedAt,
+          reportJson,
+          reportHash,
+          input.errorCode ?? null,
+          jobId,
+        ],
+      );
+    });
+    return this.#executionReportAcknowledgement(nodeId, jobId, input.status);
+  }
+
+  /** Trusted in-process admission seam for the managed remote-tool bridge; no HTTP injection route exists. */
+  async enqueueRemoteExecution(input: unknown): Promise<ExecutionReceipt> {
+    const job = executionJobSchema.parse(input);
+    const payloadJson = encode(job);
+    const payloadHash = await sha256(stableJson(job));
+    const existing = this.#executionJob(job.jobId);
+    if (existing) {
+      if (existing.payload_sha256 !== payloadHash) {
+        throw conflict(
+          "job_id_payload_conflict",
+          "Job ID is bound to another payload",
+        );
+      }
+      return this.#executionReceipt(existing);
+    }
+    this.#assertRemoteExecutionAdmission(job);
+    const timestamp = now();
+    this.database.transaction(() => {
+      const raced = this.#executionJob(job.jobId);
+      if (raced) {
+        if (raced.payload_sha256 !== payloadHash) {
+          throw conflict(
+            "job_id_payload_conflict",
+            "Job ID is bound to another payload",
+          );
+        }
+        return;
+      }
+      this.#assertRemoteExecutionAdmission(job);
+      this.database.exec(
+        `INSERT INTO execution_jobs(job_id, node_id, workspace_id, ownership_generation,
+          operation, payload_json, payload_sha256, status, accepted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)`,
+        [
+          job.jobId,
+          job.nodeId,
+          job.target.workspaceId,
+          job.ownershipGeneration,
+          job.operation,
+          payloadJson,
+          payloadHash,
+          timestamp,
+        ],
+      );
+    });
+    const admitted = this.#executionJob(job.jobId);
+    if (!admitted) throw new FactoryError(500, "execution_admission_lost");
+    return this.#executionReceipt(admitted);
+  }
+
+  /** Read-only result lookup for the trusted in-process managed-tool adapter. */
+  getRemoteExecutionReceipt(jobId: string): ExecutionReceipt | null {
+    const row = this.#executionJob(jobId);
+    return row ? this.#executionReceipt(row) : null;
   }
 
   /** Dispatches one durable intent through the injected managed-runtime boundary. */
@@ -1041,6 +1265,179 @@ export class FactoryService {
       );
     });
     return this.#receiptByJob(intent.job_id);
+  }
+
+  #validateReportedWorkspaces(
+    nodeId: string,
+    reports: readonly ExecutionWorkspaceReport[],
+  ): void {
+    const reported = new Set<string>();
+    const generation = this.#ownershipGeneration();
+    for (const report of reports) {
+      if (reported.has(report.workspaceId)) {
+        throw new FactoryError(400, "duplicate_workspace_report");
+      }
+      reported.add(report.workspaceId);
+      const workspace = this.database.all<WorkspaceRow>(
+        "SELECT workspace_id, node_id, name FROM workspaces WHERE workspace_id = ?",
+        [report.workspaceId],
+      )[0];
+      if (!workspace || workspace.node_id !== nodeId) {
+        throw new FactoryError(
+          403,
+          "workspace_not_permitted",
+          "The owner has not assigned this workspace to the authenticated node",
+        );
+      }
+      if (report.ownershipGeneration !== generation) {
+        throw conflict(
+          "stale_ownership_generation",
+          "Workspace report does not match the controller ownership generation",
+        );
+      }
+    }
+  }
+
+  #storeReportedWorkspaces(
+    nodeId: string,
+    reports: readonly ExecutionWorkspaceReport[],
+  ): void {
+    this.database.exec(
+      "DELETE FROM execution_node_workspaces WHERE node_id = ?",
+      [nodeId],
+    );
+    for (const report of reports) {
+      this.database.exec(
+        "INSERT INTO execution_node_workspaces(node_id, workspace_id, ownership_generation, state) VALUES (?, ?, ?, ?)",
+        [nodeId, report.workspaceId, report.ownershipGeneration, report.state],
+      );
+    }
+  }
+
+  #hasActiveWorkspaceReport(
+    nodeId: string,
+    workspaceId: string,
+    generation: number,
+  ): boolean {
+    const row = this.database.all<ExecutionWorkspaceRow>(
+      "SELECT node_id, workspace_id, ownership_generation, state FROM execution_node_workspaces WHERE node_id = ? AND workspace_id = ?",
+      [nodeId, workspaceId],
+    )[0];
+    return Boolean(
+      row && row.state === "active" && row.ownership_generation === generation,
+    );
+  }
+
+  #assertRemoteExecutionAdmission(job: ExecutionJob): void {
+    const generation = this.#ownershipGeneration();
+    if (job.ownershipGeneration !== generation) {
+      throw conflict(
+        "stale_ownership_generation",
+        "Remote execution admission does not match current ownership",
+      );
+    }
+    const node = this.database.all<NodeRow>(
+      "SELECT node_id, name, availability, last_seen_at FROM nodes WHERE node_id = ?",
+      [job.nodeId],
+    )[0];
+    if (!node || job.target.nodeId !== node.node_id) {
+      throw new FactoryError(403, "target_node_mismatch");
+    }
+    if (!this.#isNodeOnline(node)) {
+      throw new FactoryError(
+        503,
+        "node_offline",
+        "The explicitly selected execution node is offline",
+      );
+    }
+    const workspace = this.database.all<WorkspaceRow>(
+      "SELECT workspace_id, node_id, name FROM workspaces WHERE workspace_id = ?",
+      [job.target.workspaceId],
+    )[0];
+    if (!workspace || workspace.node_id !== job.nodeId) {
+      throw new FactoryError(403, "workspace_not_permitted");
+    }
+    if (
+      !this.#hasActiveWorkspaceReport(
+        job.nodeId,
+        job.target.workspaceId,
+        job.ownershipGeneration,
+      )
+    ) {
+      throw conflict(
+        "workspace_unavailable",
+        "The node has not reported this workspace active at the requested generation",
+      );
+    }
+    const runtime = this.database.all<ExecutionNodeStateRow>(
+      "SELECT node_id, daemon_version, capabilities_json, registered_at, last_seen_at FROM execution_node_state WHERE node_id = ?",
+      [job.nodeId],
+    )[0];
+    if (!runtime) {
+      throw conflict(
+        "node_not_registered",
+        "The node has not registered its executor",
+      );
+    }
+    const capability =
+      job.operation === "read-file"
+        ? "fileRead"
+        : job.operation === "write-file"
+          ? "fileWrite"
+          : "argvCommand";
+    if (JSON.parse(runtime.capabilities_json)[capability] !== true) {
+      throw conflict(
+        "unsupported_capability",
+        `Node does not support ${capability}`,
+      );
+    }
+  }
+
+  #executionJob(jobId: string): ExecutionJobRow | undefined {
+    return this.database.all<ExecutionJobRow>(
+      "SELECT * FROM execution_jobs WHERE job_id = ?",
+      [jobId],
+    )[0];
+  }
+
+  #executionReceipt(row: ExecutionJobRow): ExecutionReceipt {
+    const report = row.report_json
+      ? (JSON.parse(row.report_json) as ExecutionJobReport)
+      : undefined;
+    return executionReceiptSchema.parse({
+      contractVersion: EXECUTION_CONTRACT_VERSION,
+      jobId: row.job_id,
+      nodeId: row.node_id,
+      target: { nodeId: row.node_id, workspaceId: row.workspace_id },
+      ownershipGeneration: row.ownership_generation,
+      operation: row.operation,
+      payloadSha256: row.payload_sha256,
+      status: row.status === "claimed" ? "running" : row.status,
+      acceptedAt: row.accepted_at,
+      ...(row.claimed_at ? { startedAt: row.claimed_at } : {}),
+      ...(report ? { finishedAt: report.finishedAt } : {}),
+      ...(report?.result ? { result: report.result } : {}),
+      ...(report?.errorCode ? { errorCode: report.errorCode } : {}),
+      ...(report?.reconciliationEvidence
+        ? { reconciliationEvidence: report.reconciliationEvidence }
+        : {}),
+      ...(!report && row.error_code ? { errorCode: row.error_code } : {}),
+      ...(!report && row.finished_at ? { finishedAt: row.finished_at } : {}),
+    });
+  }
+
+  #executionReportAcknowledgement(
+    nodeId: string,
+    jobId: string,
+    status: ExecutionJobReport["status"],
+  ) {
+    return executionReportResponseSchema.parse({
+      contractVersion: EXECUTION_CONTRACT_VERSION,
+      nodeId,
+      jobId,
+      accepted: true,
+      status,
+    });
   }
 
   #requireOwner(session: FactorySession): string {
@@ -1254,31 +1651,6 @@ export class FactoryService {
         createdAt,
       ],
     );
-  }
-
-  #touchNode(
-    actor: FactoryActor,
-    nodeId: string,
-    eventType: "node.registered" | "node.heartbeat",
-  ) {
-    const timestamp = now();
-    const node = this.database.all<NodeRow>(
-      "SELECT node_id, name, availability, last_seen_at FROM nodes WHERE node_id = ?",
-      [nodeId],
-    )[0];
-    if (!node) throw notFound("Execution node");
-    this.database.transaction(() => {
-      this.database.exec(
-        "UPDATE nodes SET availability = 'online', last_seen_at = ? WHERE node_id = ?",
-        [timestamp, nodeId],
-      );
-      this.#event(eventType, actor, null, null, null, { nodeId }, timestamp);
-    });
-    return this.#node({
-      ...node,
-      availability: "online",
-      last_seen_at: timestamp,
-    });
   }
 
   #markInterruptedDispatchesUncertain(): void {

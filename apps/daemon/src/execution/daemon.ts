@@ -261,7 +261,8 @@ export class ExecutionDaemon {
         finished_at TEXT,
         result_json TEXT,
         error_code TEXT,
-        reconciliation_evidence TEXT
+        reconciliation_evidence TEXT,
+        reported_at TEXT
       );
       CREATE INDEX IF NOT EXISTS execution_jobs_workspace_status
         ON execution_jobs(workspace_id, status);
@@ -283,6 +284,12 @@ export class ExecutionDaemon {
       CREATE INDEX IF NOT EXISTS execution_rex_workspace_status
         ON execution_rex_processes(workspace_id, status);
     `);
+      const jobColumns = this.#db
+        .query<{ name: string }, []>("PRAGMA table_info(execution_jobs)")
+        .all();
+      if (!jobColumns.some((column) => column.name === "reported_at")) {
+        this.#db.exec("ALTER TABLE execution_jobs ADD COLUMN reported_at TEXT");
+      }
 
       this.#bindMetadata("node_id", options.nodeId);
       this.#bindMetadata(
@@ -514,6 +521,34 @@ export class ExecutionDaemon {
       result: receipt.result,
       errorCode: receipt.errorCode,
       reconciliationEvidence: receipt.reconciliationEvidence,
+    });
+  }
+
+  pendingReports(limit = 100): ExecutionJobReport[] {
+    this.#assertOpen();
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) {
+      throw new ExecutionError("invalid_report_limit");
+    }
+    const rows = this.#db
+      .query<{ job_id: string }, [number]>(
+        "SELECT job_id FROM execution_jobs WHERE status IN ('completed', 'failed', 'uncertain') AND reported_at IS NULL ORDER BY finished_at, job_id LIMIT ?",
+      )
+      .all(limit);
+    return rows.map((row) => this.reportFor(row.job_id));
+  }
+
+  markReported(jobId: string, status: ExecutionJobReport["status"]): void {
+    this.#assertOpen();
+    this.#transaction(() => {
+      const row = this.#jobRow(jobId);
+      if (!row || row.status !== status) {
+        throw new ExecutionError("report_acknowledgement_mismatch");
+      }
+      this.#db
+        .query(
+          "UPDATE execution_jobs SET reported_at = COALESCE(reported_at, ?) WHERE job_id = ?",
+        )
+        .run(new Date().toISOString(), jobId);
     });
   }
 

@@ -9,7 +9,6 @@ import {
   executionReportResponseSchema,
   type ExecutionJob,
 } from "@uzina/contracts/execution";
-import { executionPayloadSha256 } from "./payload";
 
 export class ControllerHttpError extends Error {
   constructor(
@@ -45,11 +44,6 @@ export class HttpExecutionControllerConnector implements ExecutionControllerConn
   readonly #baseUrl: string;
   readonly #nodeId: string;
   readonly #credential: string;
-  readonly #claimedJobs = new Map<string, ExecutionJob>();
-  readonly #reportedStatuses = new Map<
-    string,
-    "completed" | "failed" | "uncertain"
-  >();
 
   constructor(options: HttpExecutionControllerConnectorOptions) {
     const url = new URL(options.controllerUrl);
@@ -105,17 +99,6 @@ export class HttpExecutionControllerConnector implements ExecutionControllerConn
     if (response.job) {
       this.#assertNode(response.job.nodeId);
       this.#assertNode(response.job.target.nodeId);
-      const previous = this.#claimedJobs.get(response.job.jobId);
-      if (
-        previous &&
-        executionPayloadSha256(previous) !==
-          executionPayloadSha256(response.job)
-      ) {
-        throw new ControllerProtocolError(
-          "Controller changed a claimed job payload",
-        );
-      }
-      this.#claimedJobs.set(response.job.jobId, response.job);
     }
     return response.job;
   }
@@ -124,21 +107,6 @@ export class HttpExecutionControllerConnector implements ExecutionControllerConn
     const body = executionJobReportSchema.parse(report);
     this.#assertNode(body.nodeId);
     this.#assertNode(body.target.nodeId);
-    const assigned = this.#claimedJobs.get(body.jobId);
-    if (
-      !assigned ||
-      assigned.nodeId !== body.nodeId ||
-      assigned.target.nodeId !== body.target.nodeId ||
-      assigned.target.workspaceId !== body.target.workspaceId ||
-      assigned.ownershipGeneration !== body.ownershipGeneration ||
-      executionPayloadSha256(assigned) !== body.payloadSha256
-    ) {
-      throw new ControllerProtocolError("Report does not match a claimed job");
-    }
-    const priorStatus = this.#reportedStatuses.get(body.jobId);
-    if (priorStatus && priorStatus !== body.status) {
-      throw new ControllerProtocolError("Conflicting report for claimed job");
-    }
     const response = await this.#post(
       `/v1/nodes/${this.#nodeId}/jobs/${body.jobId}/report`,
       body,
@@ -153,7 +121,6 @@ export class HttpExecutionControllerConnector implements ExecutionControllerConn
         "Controller report acknowledgement mismatch",
       );
     }
-    this.#reportedStatuses.set(body.jobId, body.status);
   }
 
   async #post<T>(

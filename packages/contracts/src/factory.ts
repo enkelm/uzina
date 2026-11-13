@@ -56,17 +56,6 @@ export const submitInputRequestSchema = z
     text: z.string().min(1).max(100_000),
   })
   .strict();
-export const registerNodeRequestSchema = z.object({}).strict();
-export const heartbeatNodeRequestSchema = z.object({}).strict();
-export const reportNodeJobRequestSchema = z
-  .object({
-    workspaceId: identifier,
-    ownershipGeneration: z.number().int().nonnegative().safe(),
-    status: z.enum(["completed", "failed", "uncertain"]),
-    detail: z.string().max(4_000).optional(),
-  })
-  .strict();
-
 export const provisionedCredentialSchema = z.object({
   contractVersion: z.literal(CONTRACT_VERSION),
   credentialId: identifier,

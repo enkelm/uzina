@@ -75,6 +75,16 @@ describe("outbound execution controller connector", () => {
       if (route.endsWith("/jobs/claim")) {
         return Response.json({ contractVersion: 1, job });
       }
+      const report = body as Record<string, unknown>;
+      if (
+        report.jobId !== "job:controller" ||
+        report.payloadSha256 !== executionPayloadSha256(job) ||
+        report.ownershipGeneration !== job.ownershipGeneration ||
+        (report.target as { workspaceId?: string } | undefined)?.workspaceId !==
+          job.target.workspaceId
+      ) {
+        return Response.json({ error: "assignment_mismatch" }, { status: 409 });
+      }
       return Response.json({
         ...common,
         jobId: "job:controller",
@@ -109,24 +119,32 @@ describe("outbound execution controller connector", () => {
     };
     await expect(
       connector.report({ ...report, jobId: "job:other" }),
-    ).rejects.toBeInstanceOf(ControllerProtocolError);
+    ).rejects.toMatchObject({ status: 409 });
     await expect(
       connector.report({
         ...report,
         target: { nodeId: "node:test", workspaceId: "workspace:wrong" },
       }),
-    ).rejects.toBeInstanceOf(ControllerProtocolError);
+    ).rejects.toMatchObject({ status: 409 });
     await expect(
       connector.report({ ...report, ownershipGeneration: 1 }),
-    ).rejects.toBeInstanceOf(ControllerProtocolError);
+    ).rejects.toMatchObject({ status: 409 });
     await connector.report(report);
+    const restartedConnector = new HttpExecutionControllerConnector({
+      controllerUrl: server.url.toString(),
+      nodeId: "node:test",
+      credential: "controller-node-secret",
+    });
+    await restartedConnector.report(report);
 
-    expect(requests.map(({ route }) => route)).toEqual([
+    expect(requests.slice(0, 3).map(({ route }) => route)).toEqual([
       "/v1/nodes/node:test/register",
       "/v1/nodes/node:test/heartbeat",
       "/v1/nodes/node:test/jobs/claim",
-      "/v1/nodes/node:test/jobs/job:controller/report",
     ]);
+    expect(requests.at(-1)?.route).toBe(
+      "/v1/nodes/node:test/jobs/job:controller/report",
+    );
     expect(
       requests.every(
         ({ authorization }) =>
@@ -137,7 +155,7 @@ describe("outbound execution controller connector", () => {
       contractVersion: 1,
       nodeId: "node:test",
     });
-    expect(requests[3]?.body).toMatchObject({
+    expect(requests.at(-1)?.body).toMatchObject({
       jobId: "job:controller",
       target: { nodeId: "node:test", workspaceId: "workspace:test" },
       ownershipGeneration: 2,
