@@ -7,7 +7,7 @@ import {
   type CapturedManagedWorkBundle,
 } from "@uzina/checkpoints";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   createManagedRemoteToolExecutor,
   type ManagedModels,
@@ -56,6 +56,17 @@ export type StandaloneFactoryOptions = {
 
 function stableFilePart(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function workspaceRootsOverlap(left: string, right: string): boolean {
+  const contains = (parent: string, child: string) => {
+    const path = relative(parent, child);
+    return (
+      path === "" ||
+      (!isAbsolute(path) && path !== ".." && !path.startsWith(`..${sep}`))
+    );
+  };
+  return contains(left, right) || contains(right, left);
 }
 
 export function localFactoryDefaults() {
@@ -283,13 +294,13 @@ export async function createStandaloneFactoryServer(
           for (const [workspaceId, mappedPath] of Object.entries(
             options.workspaceDirectories ?? {},
           )) {
-            if (
-              workspaceId !== thread.target.workspaceId &&
-              (await realpath(mappedPath)) === physicalWorkspace
-            ) {
-              throw new Error(
-                `Workspace ${thread.target.workspaceId} shares a local directory with ${workspaceId}`,
-              );
+            if (workspaceId !== thread.target.workspaceId) {
+              const mappedWorkspace = await realpath(mappedPath);
+              if (workspaceRootsOverlap(mappedWorkspace, physicalWorkspace)) {
+                throw new Error(
+                  `Workspace ${thread.target.workspaceId} overlaps a local directory with ${workspaceId}`,
+                );
+              }
             }
           }
           if (!options.workspaceCaptureQuiescence) {

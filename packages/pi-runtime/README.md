@@ -46,7 +46,7 @@ Tool results are correlated from the immutable node receipt into the Pi tool-res
 
 ## Logical checkpoint support
 
-`@uzina/pi-runtime/checkpoint` exports `exportManagedWorkCheckpoint()`, `validateManagedWorkCheckpoint()`, and `importManagedWorkCheckpoint()` for the versioned profile `quiescent-current-documents-no-forks-v1`. `ManagedPiWork.exportCheckpoint()` reads this supported logical profile from its public `Storage` without opening or resuming a task. The composite `@uzina/checkpoints` API places that exported artifact and the workspace packer in one validated bundle.
+`@uzina/pi-runtime/checkpoint` exports `exportManagedWorkCheckpoint()`, `validateManagedWorkCheckpoint()`, `importManagedWorkCheckpoint()`, and `verifyManagedWorkCheckpointStorage()` for the versioned profile `quiescent-current-documents-no-forks-v1`. The storage verifier compares the complete current public record/document state with a validated checkpoint using bounded scans. `ManagedPiWork.exportCheckpoint()` reads this supported logical profile from its public `Storage` without opening or resuming a task. The composite `@uzina/checkpoints` API places that exported artifact and the workspace packer in one validated bundle.
 
 - Export is limited to the upstream reserved `ROOT_CONVERSATION_ID` (1), which is unowned and has no parent, and its owned conversation/task closure. Other ownerless conversations are not managed roots. Task records must be terminal, submission receipts settled, and no session-scoped document may be present.
 - Export refuses active, sleeping, parked, or otherwise uncertain tasks and rejects conversations that are forked or have parent-history dependencies.

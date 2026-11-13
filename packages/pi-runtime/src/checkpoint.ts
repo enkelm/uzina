@@ -12,10 +12,10 @@ import {
   type EntryRecord,
   type Page,
   type Storage,
+  type TaskId,
   type StorageWrite,
   type SubmissionId,
   type SubmissionRecord,
-  type TaskId,
   type TaskRecord,
 } from "@earendil-works/pi-durable";
 
@@ -462,6 +462,152 @@ export async function validateManagedWorkCheckpoint(
   }
   validateCheckpointGraph(value);
   return value;
+}
+
+async function scanPagesAtMost<T>(
+  expectedCount: number,
+  scan: (limit: number, cursor?: Cursor) => Promise<Page<T, Cursor>>,
+): Promise<T[]> {
+  const items: T[] = [];
+  let cursor: Cursor | undefined;
+  do {
+    const page = await scan(
+      Math.max(1, Math.min(PAGE_SIZE, expectedCount + 1 - items.length)),
+      cursor,
+    );
+    items.push(...page.items);
+    if (items.length > expectedCount) {
+      throw new Error("Prepared managed-work runtime has unexpected records");
+    }
+    cursor = page.next;
+  } while (cursor !== undefined);
+  return items;
+}
+
+/** Compare every current Pi Durable record to a validated inactive checkpoint. */
+export async function verifyManagedWorkCheckpointStorage(
+  storage: Storage,
+  value: unknown,
+): Promise<void> {
+  const expected = await validateManagedWorkCheckpoint(value);
+  const [conversations, tasks, submissions, sessionDocuments] =
+    await Promise.all([
+      scanPagesAtMost(expected.conversations.length, (limit, cursor) =>
+        storage.scanConversations(
+          { order: "ascending" },
+          limit,
+          cursor,
+          BACKGROUND_CONTEXT,
+        ),
+      ),
+      scanPagesAtMost(expected.tasks.length, (limit, cursor) =>
+        storage.scanTasks({}, limit, cursor, BACKGROUND_CONTEXT),
+      ),
+      scanPagesAtMost(expected.submissions.length, (limit, cursor) =>
+        storage.scanSubmissions({}, limit, cursor, BACKGROUND_CONTEXT),
+      ),
+      scanPagesAtMost(0, (limit, cursor) =>
+        storage.scanDocuments(
+          { scope: { kind: "session" }, at: "current" },
+          limit,
+          cursor,
+          BACKGROUND_CONTEXT,
+        ),
+      ),
+    ]);
+  conversations.sort((left, right) => Number(left.id) - Number(right.id));
+  tasks.sort((left, right) => Number(left.id) - Number(right.id));
+  submissions.sort((left, right) => Number(left.id) - Number(right.id));
+  const entries: EntryRecord[] = [];
+  for (const conversation of conversations) {
+    const remaining = expected.entries.length - entries.length;
+    entries.push(
+      ...(await scanPagesAtMost(remaining, (limit, cursor) =>
+        storage.scanEntries(
+          { conversationId: conversation.id, order: "ascending" },
+          limit,
+          cursor,
+          BACKGROUND_CONTEXT,
+        ),
+      )),
+    );
+  }
+  entries.sort((left, right) => Number(left.id) - Number(right.id));
+  if (
+    sessionDocuments.length > 0 ||
+    canonicalJson(conversations) !==
+      canonicalJson(
+        [...expected.conversations].sort((a, b) => Number(a.id) - Number(b.id)),
+      ) ||
+    canonicalJson(entries) !==
+      canonicalJson(
+        [...expected.entries].sort((a, b) => Number(a.id) - Number(b.id)),
+      ) ||
+    canonicalJson(tasks) !==
+      canonicalJson(
+        [...expected.tasks].sort((a, b) => Number(a.id) - Number(b.id)),
+      ) ||
+    canonicalJson(submissions) !==
+      canonicalJson(
+        [...expected.submissions].sort((a, b) => Number(a.id) - Number(b.id)),
+      )
+  ) {
+    throw new Error("Prepared managed-work runtime does not match bundle");
+  }
+
+  const documents: CheckpointDocument[] = [];
+  const collectDocuments = async (
+    scope:
+      | { kind: "conversation"; conversationId: ConversationId }
+      | { kind: "task"; taskId: TaskId },
+  ) => {
+    const remaining = expected.documents.length - documents.length;
+    const records = await scanPagesAtMost(remaining, (limit, cursor) =>
+      storage.scanDocuments(
+        { scope, at: "current" },
+        limit,
+        cursor,
+        BACKGROUND_CONTEXT,
+      ),
+    );
+    for (const record of records) {
+      const document = await storage.document(
+        record.id,
+        "current",
+        BACKGROUND_CONTEXT,
+      );
+      if (!document) {
+        throw new Error("Prepared managed-work document disappeared");
+      }
+      documents.push({
+        record: document.record,
+        version: document.version,
+        value: document.value,
+      });
+    }
+  };
+  for (const conversation of conversations) {
+    await collectDocuments({
+      kind: "conversation",
+      conversationId: conversation.id,
+    });
+  }
+  for (const task of tasks) {
+    await collectDocuments({ kind: "task", taskId: task.id });
+  }
+  documents.sort(
+    (left, right) => Number(left.record.id) - Number(right.record.id),
+  );
+  if (
+    canonicalJson(documents) !==
+    canonicalJson(
+      [...expected.documents].sort(
+        (left, right) => Number(left.record.id) - Number(right.record.id),
+      ),
+    )
+  ) {
+    throw new Error("Prepared managed-work runtime does not match bundle");
+  }
 }
 
 async function assertFreshStorage(

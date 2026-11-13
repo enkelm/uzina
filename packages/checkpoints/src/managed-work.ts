@@ -14,12 +14,15 @@ import { ROOT_CONVERSATION_ID, type Storage } from "@earendil-works/pi-durable";
 import {
   importManagedWorkCheckpoint,
   validateManagedWorkCheckpoint,
+  verifyManagedWorkCheckpointStorage,
   type ManagedWorkCheckpoint,
 } from "@uzina/pi-runtime/checkpoint";
 import {
   captureWorkspaceCheckpoint,
   restoreWorkspaceCheckpoint,
   validateWorkspaceCheckpoint,
+  verifyRestoredWorkspaceCheckpoint,
+  WORKSPACE_CHECKPOINT_MANIFEST_MAX_BYTES,
   type BlobTransport,
   type CheckpointAttachment,
   type CaptureLimits,
@@ -146,6 +149,21 @@ function assertBundle(
     value.profile !== MANAGED_WORK_PROFILE ||
     typeof value.sha256 !== "string" ||
     !isRecord(value.runtime) ||
+    Object.keys(value).some(
+      (key) =>
+        ![
+          "format",
+          "version",
+          "profile",
+          "runtime",
+          "workspaceManifestReference",
+          "workspace",
+          "sha256",
+        ].includes(key),
+    ) ||
+    Object.keys(value.runtime).some(
+      (key) => !["formatVersion", "mediaType", "requirements"].includes(key),
+    ) ||
     value.runtime.formatVersion !== 1 ||
     value.runtime.mediaType !== MANAGED_WORK_ARTIFACT_MEDIA_TYPE ||
     !Array.isArray(value.runtime.requirements) ||
@@ -164,6 +182,9 @@ async function readBundle(
     throw new Error("Managed-work bundle reference is not a SHA-256 digest");
   }
   const bytes = await transport.getBlob(manifestReference);
+  if (bytes.byteLength > WORKSPACE_CHECKPOINT_MANIFEST_MAX_BYTES) {
+    throw new Error("Managed-work bundle manifest exceeds its size limit");
+  }
   if (sha256(bytes) !== manifestReference) {
     throw new Error("Managed-work bundle manifest content hash mismatch");
   }
@@ -194,6 +215,9 @@ async function readBundle(
   const workspaceBytes = await transport.getBlob(
     value.workspaceManifestReference,
   );
+  if (workspaceBytes.byteLength > WORKSPACE_CHECKPOINT_MANIFEST_MAX_BYTES) {
+    throw new Error("Workspace manifest exceeds its size limit");
+  }
   if (sha256(workspaceBytes) !== value.workspaceManifestReference) {
     throw new Error("Workspace manifest content hash mismatch");
   }
@@ -331,6 +355,9 @@ export async function captureManagedWorkBundle(
   };
   const manifest = { ...body, sha256: bundleChecksum(body) };
   const bytes = Buffer.from(canonicalJson(manifest), "utf8");
+  if (bytes.byteLength > WORKSPACE_CHECKPOINT_MANIFEST_MAX_BYTES) {
+    throw new Error("Managed-work bundle manifest exceeds its size limit");
+  }
   const reference = await options.transport.putBlob(bytes);
   if (reference !== sha256(bytes)) {
     throw new Error(
@@ -444,6 +471,82 @@ async function preparedReceipt(
   }
 }
 
+async function verifyPreparedDestination(
+  destinationPath: string,
+  receipt: PreparedManagedWorkRestoreReceipt,
+  manifest: ManagedWorkBundleManifest,
+  managedWork: ManagedWorkCheckpoint,
+  transport: BlobTransport,
+  openStorage: RestoreManagedWorkBundleOptions["openStorage"],
+): Promise<void> {
+  await verifyRestoredWorkspaceCheckpoint(
+    manifest.workspace,
+    transport,
+    join(destinationPath, receipt.workspacePath),
+  );
+  const expectedAttachmentNames = manifest.workspace.attachments.map(
+    ({ name }) => name,
+  );
+  if (
+    JSON.stringify(receipt.attachmentNames) !==
+    JSON.stringify(expectedAttachmentNames)
+  ) {
+    throw new Error(
+      "Prepared restore attachment receipt does not match bundle",
+    );
+  }
+  let runtime: ManagedWorkRestoreStorage | undefined;
+  try {
+    runtime = await openStorage(join(destinationPath, receipt.runtimePath));
+    await verifyManagedWorkCheckpointStorage(runtime.storage, managedWork);
+  } finally {
+    await runtime?.close();
+  }
+
+  const attachmentDirectory = join(destinationPath, ".uzina", "attachments");
+  if (expectedAttachmentNames.length === 0) {
+    try {
+      await lstat(attachmentDirectory);
+      throw new Error("Prepared restore has unexpected attachments");
+    } catch (error) {
+      if (!isMissingFile(error)) throw error;
+    }
+    return;
+  }
+  const directory = await lstat(attachmentDirectory);
+  if (!directory.isDirectory() || directory.isSymbolicLink()) {
+    throw new Error("Prepared restore attachments are unavailable");
+  }
+  const actualNames = (await readdir(attachmentDirectory)).sort();
+  if (
+    JSON.stringify(actualNames) !==
+    JSON.stringify([...expectedAttachmentNames].sort())
+  ) {
+    throw new Error("Prepared restore attachments do not match bundle");
+  }
+  for (const attachment of manifest.workspace.attachments) {
+    const path = join(attachmentDirectory, attachment.name);
+    const details = await lstat(path);
+    if (!details.isFile() || details.isSymbolicLink()) {
+      throw new Error(
+        `Prepared attachment is not a regular file: ${attachment.name}`,
+      );
+    }
+    const expected = await transport.getBlob(attachment.blob.reference);
+    const actual = await readFile(path);
+    if (
+      expected.byteLength !== attachment.blob.size ||
+      sha256(expected) !== attachment.blob.sha256 ||
+      actual.byteLength !== expected.byteLength ||
+      sha256(actual) !== attachment.blob.sha256
+    ) {
+      throw new Error(
+        `Prepared attachment integrity mismatch: ${attachment.name}`,
+      );
+    }
+  }
+}
+
 async function assertEmptyOrMissingDestination(path: string): Promise<void> {
   try {
     const details = await lstat(path);
@@ -484,11 +587,24 @@ export async function restoreManagedWorkBundle(
     options.manifestReference,
     options.transport,
   );
+  const managedWork = await validateBundleResources(
+    manifest,
+    options.transport,
+    options.supportedRuntimeRequirements,
+  );
   const existingReceipt = await preparedReceipt(
     destinationPath,
     options.manifestReference,
   );
   if (existingReceipt) {
+    await verifyPreparedDestination(
+      destinationPath,
+      existingReceipt,
+      manifest,
+      managedWork,
+      options.transport,
+      options.openStorage,
+    );
     return {
       receipt: existingReceipt,
       destinationPath,
@@ -497,11 +613,6 @@ export async function restoreManagedWorkBundle(
       provenanceAttachments: [],
     };
   }
-  await validateBundleResources(
-    manifest,
-    options.transport,
-    options.supportedRuntimeRequirements,
-  );
   await assertEmptyOrMissingDestination(destinationPath);
 
   const parent = dirname(destinationPath);
@@ -591,6 +702,14 @@ export async function restoreManagedWorkBundle(
       options.manifestReference,
     );
     if (racedReceipt) {
+      await verifyPreparedDestination(
+        destinationPath,
+        racedReceipt,
+        manifest,
+        managedWork,
+        options.transport,
+        options.openStorage,
+      );
       return {
         receipt: racedReceipt,
         destinationPath,

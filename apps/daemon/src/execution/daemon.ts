@@ -657,6 +657,35 @@ export class ExecutionDaemon {
       const workspace = this.#workspaceRow(workspaceId);
       if (!workspace) throw new ExecutionError("workspace_not_found");
       this.#assertActiveRow(workspace, workspace.ownership_generation);
+      const physicalRoots = this.#db
+        .query<Pick<WorkspaceRow, "workspace_id" | "directory">, []>(
+          "SELECT workspace_id, directory FROM execution_workspaces",
+        )
+        .all()
+        .map((mapping) => {
+          try {
+            return {
+              workspaceId: mapping.workspace_id,
+              root: realpathSync(resolve(mapping.directory)),
+            };
+          } catch {
+            throw new ExecutionError("workspace_mapping_unavailable");
+          }
+        });
+      const selectedRoot = physicalRoots.find(
+        (mapping) => mapping.workspaceId === workspaceId,
+      );
+      if (!selectedRoot) throw new ExecutionError("workspace_not_found");
+      if (
+        physicalRoots.some(
+          (mapping) =>
+            mapping.workspaceId !== workspaceId &&
+            (within(selectedRoot.root, mapping.root) ||
+              within(mapping.root, selectedRoot.root)),
+        )
+      ) {
+        throw new ExecutionError("workspace_mappings_overlap");
+      }
       if (
         this.#db
           .query<{ status: string }, [string]>(

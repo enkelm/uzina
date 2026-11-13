@@ -61,6 +61,8 @@ const HARD_LIMITS = {
   attachmentBytes: 32 * 1024 * 1024,
 } as const;
 const MINIMUM_GIT_VERSION = "2.20.0";
+export const WORKSPACE_CHECKPOINT_MANIFEST_MAX_BYTES =
+  HARD_LIMITS.manifestBytes;
 const FORMAT_CAPABILITIES = new Set<string>(REQUIRED_CAPABILITIES);
 const globCache = new Map<string, RegExp>();
 
@@ -459,6 +461,9 @@ export async function captureWorkspaceCheckpoint(
     attachments,
   };
   const manifestBytes = Buffer.from(JSON.stringify(manifest));
+  if (manifestBytes.byteLength > WORKSPACE_CHECKPOINT_MANIFEST_MAX_BYTES) {
+    throw new Error("Checkpoint manifest exceeds its size limit");
+  }
   if (manifestBytes.byteLength + totalBytes > limits.maxCheckpointBytes) {
     throw new Error(
       "Checkpoint manifest exceeds the configured total byte limit",
@@ -568,6 +573,182 @@ export async function restoreWorkspaceCheckpoint(
         : null,
     attachments: loaded.attachments,
   };
+}
+
+/** Recheck the materialized workspace, Git index, and files against a checkpoint. */
+export async function verifyRestoredWorkspaceCheckpoint(
+  manifest: WorkspaceCheckpointManifest,
+  transport: BlobTransport,
+  destinationPath: string,
+): Promise<void> {
+  const loaded = await loadAndValidate(manifest, transport, {
+    supportedRuntimeFormats: manifest.runtimeArtifact
+      ? [manifest.runtimeArtifact.formatVersion]
+      : [],
+    supportedRuntimeRequirements:
+      manifest.runtimeArtifact?.compatibilityRequirements ?? [],
+  });
+  if (!loaded.validation.valid) {
+    throw new Error(
+      `Checkpoint validation failed: ${loaded.validation.issues.join("; ")}`,
+    );
+  }
+  const root = await realpath(destinationPath);
+  const gitRoot = await realpath(
+    restoreGitText(root, ["rev-parse", "--show-toplevel"]),
+  );
+  if (gitRoot !== root) {
+    throw new Error("Prepared workspace is not its Git worktree root");
+  }
+  const gitDirectory = await lstat(join(root, ".git"));
+  if (!gitDirectory.isDirectory() || gitDirectory.isSymbolicLink()) {
+    throw new Error("Prepared workspace Git metadata is not a directory");
+  }
+  rejectUnsupportedIndex(root);
+
+  const actual = await collectWorkspaceFiles(root, null, [], resolveLimits());
+  const expectedEntries = new Map(
+    manifest.workspace.entries.map((entry) => [entry.path, entry]),
+  );
+  if (actual.files.length !== expectedEntries.size) {
+    throw new Error("Prepared workspace entries do not match the checkpoint");
+  }
+  for (const file of actual.files) {
+    const expected = expectedEntries.get(file.path);
+    if (
+      !expected ||
+      expected.kind !== file.kind ||
+      expected.size !== file.size ||
+      (expected.kind === "file" && expected.executable !== file.executable) ||
+      (expected.kind === "symlink" && expected.linkTarget !== file.linkTarget)
+    ) {
+      throw new Error(`Prepared workspace entry changed: ${file.path}`);
+    }
+    const bytes =
+      file.kind === "file"
+        ? await readSafeWorkspaceFile(file)
+        : Buffer.from(file.linkTarget, "utf8");
+    if (sha256(bytes) !== expected.sha256) {
+      throw new Error(
+        `Prepared workspace entry integrity mismatch: ${file.path}`,
+      );
+    }
+  }
+  const expectedDirectories = new Set<string>();
+  for (const path of expectedEntries.keys()) {
+    const segments = path.split("/");
+    for (let index = 1; index < segments.length; index += 1) {
+      expectedDirectories.add(segments.slice(0, index).join("/"));
+    }
+  }
+  if (
+    JSON.stringify([...actual.directories].sort()) !==
+    JSON.stringify([...expectedDirectories].sort())
+  ) {
+    throw new Error(
+      "Prepared workspace directories do not match the checkpoint",
+    );
+  }
+
+  const expectedGit = await expectedGitCheckpointState(
+    manifest,
+    loaded.bundleBytes,
+    loaded.stagedPatchBytes,
+  );
+  const actualHead = restoreGitText(root, ["rev-parse", "--verify", "HEAD"]);
+  const actualBranch = restoreGitTryText(root, [
+    "symbolic-ref",
+    "-q",
+    "--short",
+    "HEAD",
+  ]);
+  const actualRefs = restoreGitRawText(root, [
+    "for-each-ref",
+    "--format=%(refname) %(objectname)",
+  ]);
+  const actualIndex = restoreGitRawText(root, ["ls-files", "--stage", "-z"]);
+  const actualStagedPaths = restoreGitRawText(root, [
+    "diff",
+    "--cached",
+    "--name-only",
+    "-z",
+    "--no-renames",
+    "HEAD",
+  ])
+    .split("\0")
+    .filter(Boolean)
+    .sort();
+  if (
+    actualHead !== manifest.source.head ||
+    actualBranch !== manifest.source.branch ||
+    actualRefs !== expectedGit.refs ||
+    actualIndex !== expectedGit.index ||
+    JSON.stringify(actualStagedPaths) !==
+      JSON.stringify([...manifest.git.stagedPaths].sort())
+  ) {
+    throw new Error("Prepared Git state does not match the checkpoint");
+  }
+}
+
+async function expectedGitCheckpointState(
+  manifest: WorkspaceCheckpointManifest,
+  bundleBytes: Uint8Array,
+  stagedPatchBytes: Uint8Array,
+): Promise<{ refs: string; index: string }> {
+  const temporary = await mkdtemp(join(tmpdir(), "uzina-checkpoint-verify-"));
+  const checkout = join(temporary, "checkout");
+  const bundlePath = join(temporary, "workspace.bundle");
+  try {
+    await mkdir(checkout);
+    await mkdir(join(temporary, "empty-template"));
+    await writeFile(bundlePath, bundleBytes, { flag: "wx" });
+    restoreGitText(checkout, [
+      "init",
+      "--quiet",
+      `--template=${join(temporary, "empty-template")}`,
+    ]);
+    restoreGitText(checkout, [
+      "fetch",
+      "--quiet",
+      "--no-tags",
+      bundlePath,
+      "+refs/*:refs/*",
+    ]);
+    restoreGitText(checkout, [
+      "checkout",
+      "--quiet",
+      "--detach",
+      manifest.source.head,
+    ]);
+    if (manifest.source.branch) {
+      restoreGitText(checkout, [
+        "symbolic-ref",
+        "HEAD",
+        `refs/heads/${manifest.source.branch}`,
+      ]);
+    }
+    if (stagedPatchBytes.byteLength > 0) {
+      execFileSync(
+        "git",
+        ["apply", "--cached", "--binary", "--whitespace=nowarn", "-"],
+        {
+          cwd: checkout,
+          input: stagedPatchBytes,
+          maxBuffer: HARD_LIMITS.checkpointBytes,
+          env: safeRestoreEnvironment(),
+        },
+      );
+    }
+    return {
+      refs: restoreGitRawText(checkout, [
+        "for-each-ref",
+        "--format=%(refname) %(objectname)",
+      ]),
+      index: restoreGitRawText(checkout, ["ls-files", "--stage", "-z"]),
+    };
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
 }
 
 async function inspectEmptyDestination(destinationPath: string): Promise<{
@@ -989,10 +1170,12 @@ async function collectWorkspaceFiles(
   limits: ReturnType<typeof resolveLimits>,
 ): Promise<{
   files: CapturedFile[];
+  directories: string[];
   omissions: CheckpointOmission[];
   omittedPaths: Set<string>;
 }> {
   const files: CapturedFile[] = [];
+  const directories: string[] = [];
   const omissions: CheckpointOmission[] = [];
   const omittedPaths = new Set<string>();
   let traversed = 0;
@@ -1046,6 +1229,7 @@ async function collectWorkspaceFiles(
         continue;
       }
       if (stat.isDirectory()) {
+        directories.push(path);
         await visit(absolutePath, path);
       } else if (stat.isSymbolicLink()) {
         const target = await readlinkString(absolutePath);
@@ -1093,7 +1277,7 @@ async function collectWorkspaceFiles(
     if (file.kind === "symlink")
       assertNoSymlinkTraversal(root, file.path, file.linkTarget, symlinks);
   }
-  return { files, omissions, omittedPaths };
+  return { files, directories, omissions, omittedPaths };
 }
 
 function validateManifestShape(
@@ -1102,6 +1286,24 @@ function validateManifestShape(
 ): string | null {
   if (!manifest || typeof manifest !== "object" || Array.isArray(manifest))
     return "checkpoint manifest must be an object";
+  if (
+    Object.keys(manifest).some(
+      (key) =>
+        ![
+          "format",
+          "version",
+          "createdAt",
+          "requirements",
+          "source",
+          "policy",
+          "workspace",
+          "git",
+          "runtimeArtifact",
+          "attachments",
+        ].includes(key),
+    )
+  )
+    return "checkpoint manifest contains unrecognized fields";
   let serializedSize: number;
   try {
     serializedSize = Buffer.byteLength(JSON.stringify(manifest));
@@ -1706,6 +1908,16 @@ function restoreGitText(cwd: string, args: string[]): string {
     maxBuffer: HARD_LIMITS.checkpointBytes,
     env: safeRestoreEnvironment(),
   }).trim();
+}
+
+function restoreGitTryText(cwd: string, args: string[]): string | null {
+  try {
+    return restoreGitText(cwd, args);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException & { status?: number }).status;
+    if (code === 1) return null;
+    throw error;
+  }
 }
 
 function safeRestoreEnvironment(): NodeJS.ProcessEnv {

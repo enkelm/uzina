@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import {
   chmodSync,
+  existsSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -460,6 +461,165 @@ describe("persistent execution daemon", () => {
       job({ jobId: "job:generation-one", ownershipGeneration: 1 }),
     );
     expect(generationOne.status).toBe("completed");
+  });
+
+  test("refuses captures for overlapping persisted workspace roots without blocking ordinary execution", async () => {
+    const root = mkdtempSync(join(tmpdir(), "uzina-overlapping-workspaces-"));
+    const parent = join(root, "repo");
+    const child = join(parent, "nested");
+    const sibling = join(root, "repo2");
+    mkdirSync(child, { recursive: true });
+    mkdirSync(sibling);
+    const databasePath = join(root, "node.sqlite");
+    const nodeOptions = {
+      databasePath,
+      nodeId: "node:test",
+      nodeCredential: "node-secret-fixture",
+    };
+    const first = new ExecutionDaemon({
+      ...nodeOptions,
+      workspaces: [
+        { workspaceId: "workspace:parent", directory: parent },
+        { workspaceId: "workspace:child", directory: child },
+        { workspaceId: "workspace:sibling", directory: sibling },
+      ],
+    });
+    fixtures.push({ root, daemon: first });
+
+    const ready = join(child, "command-ready.txt");
+    const changedParentFile = join(parent, "delayed-child-write.txt");
+    expect(() =>
+      first.beginWorkspaceCapture(
+        "workspace:parent",
+        "capture:parent-before-child",
+      ),
+    ).toThrow("workspace_mappings_overlap");
+    const childCommand = first.executeJob(
+      job({
+        jobId: "job:delayed-child-write",
+        target: { nodeId: "node:test", workspaceId: "workspace:child" },
+        operation: "argv-command",
+        argv: [
+          process.execPath,
+          "-e",
+          `require('node:fs').writeFileSync(${JSON.stringify(ready)}, 'ready'); await Bun.sleep(100); require('node:fs').writeFileSync(${JSON.stringify(changedParentFile)}, 'changed')`,
+        ],
+        timeoutMs: 5_000,
+        maxOutputBytes: 64,
+      }),
+    );
+    const deadline = Date.now() + 5_000;
+    while (!existsSync(ready) && Date.now() < deadline) await Bun.sleep(10);
+    expect(existsSync(ready)).toBe(true);
+    expect(() =>
+      first.beginWorkspaceCapture(
+        "workspace:parent",
+        "capture:parent-during-child",
+      ),
+    ).toThrow("workspace_mappings_overlap");
+    expect(() =>
+      first.beginWorkspaceCapture(
+        "workspace:child",
+        "capture:child-during-child",
+      ),
+    ).toThrow("workspace_mappings_overlap");
+
+    first.beginWorkspaceCapture("workspace:sibling", "capture:sibling");
+    first.endWorkspaceCapture("capture:sibling");
+    const siblingWrite = await first.executeJob(
+      job({
+        jobId: "job:sibling-after-capture",
+        target: { nodeId: "node:test", workspaceId: "workspace:sibling" },
+      }),
+    );
+    expect(siblingWrite.status).toBe("completed");
+    expect((await childCommand).status).toBe("completed");
+    expect(readFileSync(changedParentFile, "utf8")).toBe("changed");
+
+    first.close();
+    fixtures[fixtures.length - 1]!.daemon = undefined;
+    const reopened = new ExecutionDaemon({
+      ...nodeOptions,
+      workspaces: [
+        { workspaceId: "workspace:parent", directory: parent },
+        { workspaceId: "workspace:sibling", directory: sibling },
+      ],
+    });
+    fixtures.push({ root, daemon: reopened });
+    expect(() =>
+      reopened.beginWorkspaceCapture(
+        "workspace:parent",
+        "capture:persisted-child",
+      ),
+    ).toThrow("workspace_mappings_overlap");
+    expect(() =>
+      reopened.beginWorkspaceCapture(
+        "workspace:sibling",
+        "capture:sibling-after-reopen",
+      ),
+    ).not.toThrow();
+    reopened.endWorkspaceCapture("capture:sibling-after-reopen");
+    reopened.close();
+    fixtures[fixtures.length - 1]!.daemon = undefined;
+    rmSync(child, { recursive: true, force: true });
+    const unavailable = new ExecutionDaemon({
+      ...nodeOptions,
+      workspaces: [
+        { workspaceId: "workspace:parent", directory: parent },
+        { workspaceId: "workspace:sibling", directory: sibling },
+      ],
+    });
+    fixtures.push({ root, daemon: unavailable });
+    expect(() =>
+      unavailable.beginWorkspaceCapture(
+        "workspace:parent",
+        "capture:unavailable-child",
+      ),
+    ).toThrow("workspace_mapping_unavailable");
+  });
+
+  test("uses canonical symlink roots and segment-aware boundaries for capture preflight", async () => {
+    const root = mkdtempSync(join(tmpdir(), "uzina-workspace-root-alias-"));
+    const workspace = join(root, "repo");
+    const sibling = join(root, "repo2");
+    const alias = join(root, "repo-alias");
+    mkdirSync(workspace);
+    mkdirSync(sibling);
+    symlinkSync(workspace, alias);
+    const aliasDaemon = new ExecutionDaemon({
+      databasePath: join(root, "alias.sqlite"),
+      nodeId: "node:test",
+      nodeCredential: "node-secret-fixture",
+      workspaces: [
+        { workspaceId: "workspace:real", directory: workspace },
+        { workspaceId: "workspace:alias", directory: alias },
+      ],
+    });
+    fixtures.push({ root, daemon: aliasDaemon });
+    expect(() =>
+      aliasDaemon.beginWorkspaceCapture("workspace:real", "capture:real-alias"),
+    ).toThrow("workspace_mappings_overlap");
+
+    aliasDaemon.close();
+    fixtures[fixtures.length - 1]!.daemon = undefined;
+    const siblingDaemon = new ExecutionDaemon({
+      databasePath: join(root, "sibling.sqlite"),
+      nodeId: "node:test",
+      nodeCredential: "node-secret-fixture",
+      workspaces: [
+        { workspaceId: "workspace:repo", directory: workspace },
+        { workspaceId: "workspace:repo2", directory: sibling },
+      ],
+    });
+    fixtures.push({ root, daemon: siblingDaemon });
+    expect(() =>
+      siblingDaemon.beginWorkspaceCapture("workspace:repo", "capture:repo"),
+    ).not.toThrow();
+    siblingDaemon.endWorkspaceCapture("capture:repo");
+    expect(() =>
+      siblingDaemon.beginWorkspaceCapture("workspace:repo2", "capture:repo2"),
+    ).not.toThrow();
+    siblingDaemon.endWorkspaceCapture("capture:repo2");
   });
 
   test("creates and stops only persisted Rex resources using structured inspection", async () => {

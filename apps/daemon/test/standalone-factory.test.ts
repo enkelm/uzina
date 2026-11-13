@@ -1,4 +1,6 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { Database } from "bun:sqlite";
 import {
   chmod,
   mkdtemp,
@@ -7,17 +9,20 @@ import {
   readdir,
   rm,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { ManagedPiWork, type ManagedModels } from "@uzina/pi-runtime";
 import {
+  captureManagedWorkBundle,
   FileBlobTransport,
   restoreManagedWorkBundle,
   validateManagedWorkBundle,
+  WORKSPACE_CHECKPOINT_MANIFEST_MAX_BYTES,
   type BlobTransport,
 } from "@uzina/checkpoints";
 import {
@@ -34,8 +39,51 @@ import { deterministicFailingModels } from "../../../packages/pi-runtime/test-su
 import { deterministicToolModels } from "../../../packages/pi-runtime/test-support/deterministic-tool-model";
 import { openBunSqliteStorage } from "../src/runtime/sqlite";
 
+setDefaultTimeout(30_000);
+
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object")
+    return JSON.stringify(value)!;
+  if (Array.isArray(value))
+    return `[${value.map((entry) => canonicalJson(entry)).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+    .join(",")}}`;
+}
+
+function sha256(bytes: Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function resignedBundle(value: Record<string, unknown>): {
+  reference: string;
+  bytes: Buffer;
+} {
+  const { sha256: _oldChecksum, ...body } = value;
+  const manifest = {
+    ...body,
+    sha256: sha256(Buffer.from(canonicalJson(body), "utf8")),
+  };
+  const bytes = Buffer.from(canonicalJson(manifest), "utf8");
+  return { reference: sha256(bytes), bytes };
+}
+
+function overlayTransport(
+  base: BlobTransport,
+  blobs: ReadonlyMap<string, Uint8Array>,
+): BlobTransport {
+  return {
+    putBlob: (bytes) => base.putBlob(bytes),
+    async getBlob(reference) {
+      return blobs.get(reference) ?? base.getBlob(reference);
+    },
+  };
 }
 
 const fixtures: Array<{ directory: string; close(): Promise<void> }> = [];
@@ -82,10 +130,35 @@ async function scenario(options: {
   modelId: string;
   directoryPrefix: string;
   deferExecutor?: boolean;
+  extraWorkspaceDirectories?: Readonly<Record<string, string>>;
+  extraWorkspaceSubdirectories?: Readonly<Record<string, string>>;
+  extraWorkspaceAliases?: readonly string[];
 }) {
   const directory = await mkdtemp(join(tmpdir(), options.directoryPrefix));
   const workspaceDirectory = join(directory, "workspace");
   await mkdir(workspaceDirectory);
+  for (const workspacePath of Object.values(
+    options.extraWorkspaceDirectories ?? {},
+  )) {
+    await mkdir(workspacePath, { recursive: true });
+  }
+  const extraWorkspaceMappings = {
+    ...options.extraWorkspaceDirectories,
+  };
+  for (const [workspaceId, relativePath] of Object.entries(
+    options.extraWorkspaceSubdirectories ?? {},
+  )) {
+    const workspacePath = join(workspaceDirectory, relativePath);
+    await mkdir(workspacePath, { recursive: true });
+    extraWorkspaceMappings[workspaceId] = workspacePath;
+  }
+  for (const [index, workspaceId] of (
+    options.extraWorkspaceAliases ?? []
+  ).entries()) {
+    const aliasPath = join(directory, `workspace-alias-${index}`);
+    await symlink(workspaceDirectory, aliasPath);
+    extraWorkspaceMappings[workspaceId] = aliasPath;
+  }
   let host: StandaloneFactoryServer | undefined;
   let execution: ExecutionDaemon | undefined;
   let abort: AbortController | undefined;
@@ -99,7 +172,10 @@ async function scenario(options: {
       models: options.models,
       modelProvider: options.modelProvider,
       modelId: options.modelId,
-      workspaceDirectories: { "workspace:local-proof": workspaceDirectory },
+      workspaceDirectories: {
+        "workspace:local-proof": workspaceDirectory,
+        ...extraWorkspaceMappings,
+      },
       workspaceCaptureQuiescence: {
         async acquire(workspaceId, captureId) {
           if (!execution)
@@ -538,12 +614,145 @@ describe("standalone local Factory managed Pi composition", () => {
     );
     expect(local.host.factory.listManagedWorkCaptures(session)).toHaveLength(0);
 
+    const capturedRecord = captured.manifest as unknown as Record<
+      string,
+      unknown
+    >;
+    const oversizedOuter = resignedBundle({
+      ...capturedRecord,
+      padding: "x".repeat(WORKSPACE_CHECKPOINT_MANIFEST_MAX_BYTES + 128),
+    });
+    expect(oversizedOuter.bytes.byteLength).toBeGreaterThan(
+      WORKSPACE_CHECKPOINT_MANIFEST_MAX_BYTES,
+    );
+    const oversizedTransport = overlayTransport(
+      blobs,
+      new Map([[oversizedOuter.reference, oversizedOuter.bytes]]),
+    );
+    await expect(
+      validateManagedWorkBundle(oversizedOuter.reference, oversizedTransport),
+    ).rejects.toThrow("Managed-work bundle manifest exceeds its size limit");
+    const untouchedOversizedDestination = join(
+      local.directory,
+      "untouched-oversized-destination",
+    );
+    await mkdir(untouchedOversizedDestination);
+    await writeFile(join(untouchedOversizedDestination, "keep.txt"), "keep me");
+    await expect(
+      restoreManagedWorkBundle({
+        manifestReference: oversizedOuter.reference,
+        transport: oversizedTransport,
+        destinationPath: untouchedOversizedDestination,
+        supportedRuntimeRequirements: [
+          "model:uzina-test/fixed-model",
+          "tool:remote_read_file:v1",
+          "tool:remote_write_file:v1",
+          "tool:remote_run_command:v1",
+        ],
+        async openStorage() {
+          throw new Error("oversized manifest must fail before storage open");
+        },
+      }),
+    ).rejects.toThrow("Managed-work bundle manifest exceeds its size limit");
+    expect(
+      await readFile(join(untouchedOversizedDestination, "keep.txt"), "utf8"),
+    ).toBe("keep me");
+
+    const unknownOuter = resignedBundle({
+      ...capturedRecord,
+      futureField: true,
+    });
+    expect(unknownOuter.bytes.byteLength).toBeLessThan(
+      WORKSPACE_CHECKPOINT_MANIFEST_MAX_BYTES,
+    );
+    const unknownOuterTransport = overlayTransport(
+      blobs,
+      new Map([[unknownOuter.reference, unknownOuter.bytes]]),
+    );
+    await expect(
+      validateManagedWorkBundle(unknownOuter.reference, unknownOuterTransport),
+    ).rejects.toThrow("Unsupported or malformed coherent managed-work bundle");
+
+    const unknownRuntime = resignedBundle({
+      ...capturedRecord,
+      runtime: {
+        ...(capturedRecord.runtime as Record<string, unknown>),
+        futureField: true,
+      },
+    });
+    await expect(
+      validateManagedWorkBundle(
+        unknownRuntime.reference,
+        overlayTransport(
+          blobs,
+          new Map([[unknownRuntime.reference, unknownRuntime.bytes]]),
+        ),
+      ),
+    ).rejects.toThrow("Unsupported or malformed coherent managed-work bundle");
+
+    const oversizedWorkspaceValue = {
+      ...captured.manifest.workspace,
+      padding: "w".repeat(WORKSPACE_CHECKPOINT_MANIFEST_MAX_BYTES + 128),
+    } as unknown as Record<string, unknown>;
+    const oversizedWorkspaceBytes = Buffer.from(
+      canonicalJson(oversizedWorkspaceValue),
+      "utf8",
+    );
+    const oversizedWorkspaceReference = sha256(oversizedWorkspaceBytes);
+    const oversizedWorkspaceOuter = resignedBundle({
+      ...capturedRecord,
+      workspaceManifestReference: oversizedWorkspaceReference,
+    });
+    await expect(
+      validateManagedWorkBundle(
+        oversizedWorkspaceOuter.reference,
+        overlayTransport(
+          blobs,
+          new Map([
+            [oversizedWorkspaceOuter.reference, oversizedWorkspaceOuter.bytes],
+            [oversizedWorkspaceReference, oversizedWorkspaceBytes],
+          ]),
+        ),
+      ),
+    ).rejects.toThrow("Workspace manifest exceeds its size limit");
+
     const destinationRequirements = [
       "model:uzina-test/fixed-model",
       "tool:remote_read_file:v1",
       "tool:remote_write_file:v1",
       "tool:remote_run_command:v1",
     ];
+    const validatedSource = await validateManagedWorkBundle(
+      captured.manifestReference,
+      blobs,
+      { supportedRuntimeRequirements: destinationRequirements },
+    );
+    const outerCaptureRequirements = Array.from(
+      { length: 36_000 },
+      (_, index) =>
+        `capture-${String(index).padStart(5, "0")}-${"r".repeat(235)}`,
+    );
+    await expect(
+      captureManagedWorkBundle({
+        managedWork: validatedSource.managedWork,
+        compatibilityRequirements: outerCaptureRequirements,
+        workspacePath: workspace,
+        transport: blobs,
+      }),
+    ).rejects.toThrow("Managed-work bundle manifest exceeds its size limit");
+    const oversizedWorkspaceRequirements = Array.from(
+      { length: 75_000 },
+      (_, index) =>
+        `workspace-${String(index).padStart(5, "0")}-${"r".repeat(235)}`,
+    );
+    await expect(
+      captureManagedWorkBundle({
+        managedWork: validatedSource.managedWork,
+        compatibilityRequirements: oversizedWorkspaceRequirements,
+        workspacePath: workspace,
+        transport: blobs,
+      }),
+    ).rejects.toThrow("Checkpoint manifest exceeds its size limit");
     await expect(
       validateManagedWorkBundle(captured.manifestReference, blobs),
     ).rejects.toThrow("Unsupported runtime requirements");
@@ -675,18 +884,223 @@ describe("standalone local Factory managed Pi composition", () => {
       await restoredWork.close();
     }
 
+    let retryStorageOpens = 0;
+    const openPreparedStorage = async (path: string) => {
+      retryStorageOpens += 1;
+      const storage = await openBunSqliteStorage(path);
+      return {
+        storage,
+        close: () => storage.close(BACKGROUND_CONTEXT),
+      };
+    };
+    const providerCallsAfterRestore = provider.requests();
     const retried = await restoreManagedWorkBundle({
       manifestReference: captured.manifestReference,
       transport: blobs,
       destinationPath: destination,
       supportedRuntimeRequirements: destinationRequirements,
-      async openStorage() {
-        throw new Error(
-          "prepared receipt retry must not reopen runtime storage",
-        );
-      },
+      openStorage: openPreparedStorage,
     });
     expect(retried.receipt).toEqual(restored.receipt);
+    expect(retryStorageOpens).toBe(1);
+    expect(provider.requests()).toBe(providerCallsAfterRestore);
+    expect(toolCalls).toBe(0);
+
+    const originalWorkspaceBytes = await readFile(
+      join(destination, "workspace", "notes.txt"),
+    );
+    const changedWorkspaceBytes = "x".repeat(originalWorkspaceBytes.byteLength);
+    await writeFile(
+      join(destination, "workspace", "notes.txt"),
+      changedWorkspaceBytes,
+    );
+    await expect(
+      restoreManagedWorkBundle({
+        manifestReference: captured.manifestReference,
+        transport: blobs,
+        destinationPath: destination,
+        supportedRuntimeRequirements: destinationRequirements,
+        openStorage: openPreparedStorage,
+      }),
+    ).rejects.toThrow("Prepared workspace entry integrity mismatch: notes.txt");
+    expect(
+      await readFile(join(destination, "workspace", "notes.txt"), "utf8"),
+    ).toBe(changedWorkspaceBytes);
+
+    const modeDestination = join(local.directory, "tampered-mode-restore");
+    const modeRestore = await restoreManagedWorkBundle({
+      manifestReference: captured.manifestReference,
+      transport: blobs,
+      destinationPath: modeDestination,
+      supportedRuntimeRequirements: destinationRequirements,
+      openStorage: openPreparedStorage,
+    });
+    await chmod(join(modeRestore.workspacePath, "run.sh"), 0o644);
+    await expect(
+      restoreManagedWorkBundle({
+        manifestReference: captured.manifestReference,
+        transport: blobs,
+        destinationPath: modeDestination,
+        supportedRuntimeRequirements: destinationRequirements,
+        openStorage: openPreparedStorage,
+      }),
+    ).rejects.toThrow("Prepared workspace entry changed: run.sh");
+    expect(
+      (await stat(join(modeRestore.workspacePath, "run.sh"))).mode & 0o111,
+    ).toBe(0);
+
+    const indexDestination = join(local.directory, "tampered-index-restore");
+    const indexRestore = await restoreManagedWorkBundle({
+      manifestReference: captured.manifestReference,
+      transport: blobs,
+      destinationPath: indexDestination,
+      supportedRuntimeRequirements: destinationRequirements,
+      openStorage: openPreparedStorage,
+    });
+    git(
+      indexRestore.workspacePath,
+      "update-index",
+      "--assume-unchanged",
+      "notes.txt",
+    );
+    await expect(
+      restoreManagedWorkBundle({
+        manifestReference: captured.manifestReference,
+        transport: blobs,
+        destinationPath: indexDestination,
+        supportedRuntimeRequirements: destinationRequirements,
+        openStorage: openPreparedStorage,
+      }),
+    ).rejects.toThrow(
+      "Assume-unchanged and skip-worktree index entries are not supported",
+    );
+    expect(
+      git(indexRestore.workspacePath, "ls-files", "-v", "notes.txt"),
+    ).toMatch(/^h /);
+
+    const runtimeDestination = join(
+      local.directory,
+      "tampered-runtime-restore",
+    );
+    const runtimeRestore = await restoreManagedWorkBundle({
+      manifestReference: captured.manifestReference,
+      transport: blobs,
+      destinationPath: runtimeDestination,
+      supportedRuntimeRequirements: destinationRequirements,
+      openStorage: openPreparedStorage,
+    });
+    const runtimeDatabase = new Database(runtimeRestore.runtimePath);
+    const entryRow = runtimeDatabase
+      .query<{ id: number; record: string }, []>(
+        "SELECT id, record FROM entries ORDER BY id LIMIT 1",
+      )
+      .get();
+    expect(entryRow).toBeDefined();
+    const changedEntry = JSON.parse(entryRow!.record) as Record<
+      string,
+      unknown
+    >;
+    changedEntry.kind = `${String(changedEntry.kind)}-tampered`;
+    runtimeDatabase
+      .query("UPDATE entries SET record = ? WHERE id = ?")
+      .run(JSON.stringify(changedEntry), entryRow!.id);
+    runtimeDatabase.close();
+    await expect(
+      restoreManagedWorkBundle({
+        manifestReference: captured.manifestReference,
+        transport: blobs,
+        destinationPath: runtimeDestination,
+        supportedRuntimeRequirements: destinationRequirements,
+        openStorage: openPreparedStorage,
+      }),
+    ).rejects.toThrow("Prepared managed-work runtime does not match bundle");
+    const preservedRuntimeDatabase = new Database(runtimeRestore.runtimePath);
+    expect(
+      JSON.parse(
+        preservedRuntimeDatabase
+          .query<{ record: string }, [number]>(
+            "SELECT record FROM entries WHERE id = ?",
+          )
+          .get(entryRow!.id)!.record,
+      ).kind,
+    ).toBe(changedEntry.kind);
+    preservedRuntimeDatabase.close();
+
+    const attachmentDestination = join(
+      local.directory,
+      "tampered-attachment-restore",
+    );
+    await restoreManagedWorkBundle({
+      manifestReference: captured.manifestReference,
+      transport: blobs,
+      destinationPath: attachmentDestination,
+      supportedRuntimeRequirements: destinationRequirements,
+      openStorage: openPreparedStorage,
+    });
+    const attachmentPath = join(
+      attachmentDestination,
+      ".uzina",
+      "attachments",
+      "factory-provenance.json",
+    );
+    const changedAttachmentBytes = "tampered provenance\n";
+    await writeFile(attachmentPath, changedAttachmentBytes);
+    await expect(
+      restoreManagedWorkBundle({
+        manifestReference: captured.manifestReference,
+        transport: blobs,
+        destinationPath: attachmentDestination,
+        supportedRuntimeRequirements: destinationRequirements,
+        openStorage: openPreparedStorage,
+      }),
+    ).rejects.toThrow(
+      "Prepared attachment integrity mismatch: factory-provenance.json",
+    );
+    expect(await readFile(attachmentPath, "utf8")).toBe(changedAttachmentBytes);
+    expect(provider.requests()).toBe(providerCallsAfterRestore);
+    expect(toolCalls).toBe(0);
+  });
+
+  test("capture preflight rejects symlink aliases before invoking the writer quiescence adapter", async () => {
+    const local = await scenario({
+      models: deterministicFailingModels(),
+      modelProvider: "uzina-test-failure",
+      modelId: "fixed-model",
+      directoryPrefix: "uzina-capture-alias-",
+      deferExecutor: true,
+      extraWorkspaceAliases: ["workspace:alias"],
+    });
+    await expect(
+      local.host.captureManagedWorkCheckpoint({
+        credential: local.owner,
+        threadId: local.threadId,
+        transport: new FileBlobTransport(join(local.directory, "unused-blobs")),
+      }),
+    ).rejects.toThrow("overlaps a local directory with workspace:alias");
+    const session = await local.host.factory.authenticate(local.owner);
+    expect(local.host.factory.listManagedWorkCaptures(session)).toHaveLength(0);
+  });
+
+  test("capture preflight rejects canonical ancestor and descendant workspaces", async () => {
+    const local = await scenario({
+      models: deterministicFailingModels(),
+      modelProvider: "uzina-test-failure",
+      modelId: "fixed-model",
+      directoryPrefix: "uzina-capture-nested-roots-",
+      deferExecutor: true,
+      extraWorkspaceSubdirectories: {
+        "workspace:nested": "nested-workspace",
+      },
+    });
+    await expect(
+      local.host.captureManagedWorkCheckpoint({
+        credential: local.owner,
+        threadId: local.threadId,
+        transport: new FileBlobTransport(join(local.directory, "unused-blobs")),
+      }),
+    ).rejects.toThrow("overlaps a local directory with workspace:nested");
+    const session = await local.host.factory.authenticate(local.owner);
+    expect(local.host.factory.listManagedWorkCaptures(session)).toHaveLength(0);
   });
 
   test("refuses unavailable and uncertain work instead of pausing it", async () => {
