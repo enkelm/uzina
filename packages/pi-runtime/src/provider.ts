@@ -1,5 +1,6 @@
 import type { CredentialStore, Models } from "@earendil-works/pi-ai";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
+import { redactProviderErrors } from "./provider-errors";
 import {
   managedApiKeyCredential,
   managedModelAuthContext,
@@ -47,6 +48,7 @@ export async function createConfiguredModels(
   });
   const provider = models.getProvider(config.provider);
   if (!provider) throw new Error("Configured Pi AI provider is not supported");
+  models.setProvider(redactProviderErrors(provider, config.apiKey));
   const model = models.getModel(config.provider, config.modelId);
   if (!model)
     throw new Error("Configured model is not in the Pi AI provider catalog");

@@ -120,36 +120,36 @@ export class ManagedWork {
         "Managed input does not match accepted persisted Factory work",
       );
     }
-    return this.run(async (work) => {
+    const accepted = await this.run(async (work) => {
       await work.create();
-      const accepted = await work.submit(input.requestId, input.input.text);
-      if (accepted.status.status === "unanswered") {
-        return {
-          status: "failed",
-          detail: `Managed Pi submission ended unanswered: ${accepted.status.reason}`,
-        };
-      }
-      try {
-        const settled = await work.waitForSubmission(input.requestId);
-        return settled.status === "done"
-          ? {
-              status: "completed",
-              detail: `Pi submission ${settled.id} settled with assistant entry ${settled.answer}`,
-            }
-          : {
-              status: "failed",
-              detail: `Managed Pi submission ended unanswered: ${settled.reason}`,
-            };
-      } catch (error) {
-        return {
-          status: "uncertain",
-          detail:
-            error instanceof Error
-              ? `Managed Pi completion is uncertain: ${error.message}`
-              : "Managed Pi completion is uncertain",
-        };
-      }
+      return work.submit(input.requestId, input.input.text);
     });
+    if (accepted.status.status === "unanswered") {
+      return {
+        status: "failed",
+        detail: `Managed Pi submission ended unanswered: ${accepted.status.reason}`,
+      };
+    }
+    try {
+      const settled = await this.waitForSubmission(input.requestId);
+      return settled.status === "done"
+        ? {
+            status: "completed",
+            detail: `Pi submission ${settled.id} settled with assistant entry ${settled.answer}`,
+          }
+        : {
+            status: "failed",
+            detail: `Managed Pi submission ended unanswered: ${settled.reason}`,
+          };
+    } catch (error) {
+      return {
+        status: "uncertain",
+        detail:
+          error instanceof Error
+            ? `Managed Pi completion is uncertain: ${error.message}`
+            : "Managed Pi completion is uncertain",
+      };
+    }
   }
 
   async context() {
@@ -204,6 +204,14 @@ export class ManagedWork {
       const work = this.work ?? (await this.openWork());
       return operation(work);
     });
+  }
+
+  private async waitForSubmission(requestId: string) {
+    await this.ready;
+    if (this.closed)
+      throw new Error("Managed Pi work Durable Object is closed");
+    const work = this.work ?? (await this.openWork());
+    return work.waitForSubmission(requestId);
   }
 
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {

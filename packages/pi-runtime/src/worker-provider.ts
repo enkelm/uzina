@@ -1,6 +1,7 @@
 import { createModels } from "@earendil-works/pi-ai/models";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
+import { redactProviderErrors } from "./provider-errors";
 import type { Models } from "@earendil-works/pi-ai";
 import {
   managedApiKeyCredential,
@@ -38,7 +39,7 @@ export async function createWorkerConfiguredModels(
     credentials,
     authContext: managedModelAuthContext,
   });
-  models.setProvider(openaiProvider());
+  models.setProvider(redactProviderErrors(openaiProvider(), config.apiKey));
   const model = models.getModel("openai", config.modelId);
   if (!model) {
     throw new Error("Configured model is not in the OpenAI Pi AI catalog");
