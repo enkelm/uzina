@@ -85,10 +85,164 @@ function canonicalJson(value: unknown): string {
 
 async function checksum(value: unknown): Promise<string> {
   const bytes = new TextEncoder().encode(canonicalJson(value));
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return checksumBytes(bytes);
+}
+
+async function checksumBytes(bytes: Uint8Array): Promise<string> {
+  const input = new Uint8Array(bytes.byteLength);
+  input.set(bytes);
+  const digest = await crypto.subtle.digest("SHA-256", input.buffer);
   return [...new Uint8Array(digest)]
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("");
+}
+
+function utf8ByteLength(value: string): number {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        index += 1;
+      } else {
+        bytes += 3;
+      }
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
+}
+
+function jsonStringByteLength(value: string): number {
+  let bytes = 2;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code === 0x22 || code === 0x5c) bytes += 2;
+    else if (
+      code === 0x08 ||
+      code === 0x09 ||
+      code === 0x0a ||
+      code === 0x0c ||
+      code === 0x0d
+    ) {
+      bytes += 2;
+    } else if (code < 0x20) {
+      bytes += 6;
+    } else if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        index += 1;
+      } else {
+        bytes += 6;
+      }
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      bytes += 6;
+    } else if (code < 0x80) {
+      bytes += 1;
+    } else if (code < 0x800) {
+      bytes += 2;
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
+}
+
+function boundedCanonicalJsonBytes(
+  value: unknown,
+  maxBytes: number,
+): Uint8Array {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
+    throw new Error("Managed-work artifact byte limit must be positive");
+  }
+  type Task =
+    | { type: "value"; value: unknown }
+    | { type: "text"; value: string }
+    | { type: "string"; value: string }
+    | { type: "leave"; value: object };
+  const tasks: Task[] = [{ type: "value", value }];
+  const active = new Set<object>();
+  const parts: string[] = [];
+  let byteLength = 0;
+  const append = (text: string) => {
+    byteLength += utf8ByteLength(text);
+    if (byteLength > maxBytes) {
+      throw new Error("Managed-work runtime artifact exceeds its size limit");
+    }
+    parts.push(text);
+  };
+  const appendString = (text: string) => {
+    const encodedLength = jsonStringByteLength(text);
+    if (byteLength + encodedLength > maxBytes) {
+      throw new Error("Managed-work runtime artifact exceeds its size limit");
+    }
+    const encoded = JSON.stringify(text);
+    if (encoded === undefined)
+      throw new Error("Checkpoint contains non-JSON data");
+    byteLength += encodedLength;
+    parts.push(encoded);
+  };
+
+  while (tasks.length > 0) {
+    const task = tasks.pop()!;
+    if (task.type === "text") {
+      append(task.value);
+      continue;
+    }
+    if (task.type === "string") {
+      appendString(task.value);
+      continue;
+    }
+    if (task.type === "leave") {
+      active.delete(task.value);
+      continue;
+    }
+    const item = task.value;
+    if (item === null) {
+      append("null");
+    } else if (typeof item === "string") {
+      appendString(item);
+    } else if (typeof item === "number" || typeof item === "boolean") {
+      const encoded = JSON.stringify(item);
+      if (encoded === undefined)
+        throw new Error("Checkpoint contains non-JSON data");
+      append(encoded);
+    } else if (Array.isArray(item)) {
+      if (active.has(item)) throw new Error("Checkpoint contains cyclic data");
+      active.add(item);
+      tasks.push({ type: "leave", value: item }, { type: "text", value: "]" });
+      for (let index = item.length - 1; index >= 0; index -= 1) {
+        tasks.push({ type: "value", value: item[index] });
+        if (index > 0) tasks.push({ type: "text", value: "," });
+      }
+      tasks.push({ type: "text", value: "[" });
+    } else if (typeof item === "object") {
+      if (active.has(item)) throw new Error("Checkpoint contains cyclic data");
+      active.add(item);
+      const record = item as Record<string, unknown>;
+      const keys = Object.keys(record).sort();
+      tasks.push({ type: "leave", value: item }, { type: "text", value: "}" });
+      for (let index = keys.length - 1; index >= 0; index -= 1) {
+        const key = keys[index]!;
+        tasks.push(
+          { type: "value", value: record[key] },
+          { type: "text", value: ":" },
+          { type: "string", value: key },
+        );
+        if (index > 0) tasks.push({ type: "text", value: "," });
+      }
+      tasks.push({ type: "text", value: "{" });
+    } else {
+      throw new Error("Checkpoint contains non-JSON data");
+    }
+  }
+  return new TextEncoder().encode(parts.join(""));
 }
 
 async function scanAllConversations(storage: Storage, context: Context) {
@@ -452,16 +606,37 @@ function validateCheckpointGraph(checkpoint: ManagedWorkCheckpoint): void {
  * `mintId` proves the global ID space has no prior allocation above reserved ID 1;
  * inspect ID 1 separately because it is not returned by the allocator.
  */
-export async function validateManagedWorkCheckpoint(
+async function validateManagedWorkCheckpointValue(
   value: unknown,
+  maxBytes?: number,
 ): Promise<ManagedWorkCheckpoint> {
   assertCheckpoint(value);
   const { sha256, ...body } = value;
-  if ((await checksum(body)) !== sha256) {
+  const bodyBytes =
+    maxBytes === undefined
+      ? new TextEncoder().encode(canonicalJson(body))
+      : boundedCanonicalJsonBytes(body, maxBytes);
+  if ((await checksumBytes(bodyBytes)) !== sha256) {
     throw new Error("Managed-work checkpoint checksum mismatch");
   }
   validateCheckpointGraph(value);
   return value;
+}
+
+export async function validateManagedWorkCheckpoint(
+  value: unknown,
+): Promise<ManagedWorkCheckpoint> {
+  return validateManagedWorkCheckpointValue(value);
+}
+
+/** Validate once and return the bounded v1 artifact bytes for bundle composition. */
+export async function prepareManagedWorkCheckpointArtifact(
+  value: unknown,
+  maxBytes: number,
+): Promise<{ checkpoint: ManagedWorkCheckpoint; bytes: Uint8Array }> {
+  const checkpoint = await validateManagedWorkCheckpointValue(value, maxBytes);
+  const bytes = boundedCanonicalJsonBytes(checkpoint, maxBytes);
+  return { checkpoint, bytes };
 }
 
 async function scanPagesAtMost<T>(

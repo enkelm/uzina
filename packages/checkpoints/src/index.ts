@@ -35,6 +35,15 @@ import {
   workspacePathMatchesAny as matchesAny,
   workspacePathMatchesPolicy as matchesPolicy,
   WORKSPACE_CHECKPOINT_DEFAULT_EXCLUSIONS as DEFAULT_EXCLUSIONS,
+  PORTABLE_WORKSPACE_ATTACHMENT_MAX_BYTES,
+  PORTABLE_WORKSPACE_FILE_MAX_BYTES,
+  PORTABLE_WORKSPACE_MANIFEST_MAX_BYTES,
+  PORTABLE_WORKSPACE_MAX_FILES,
+  PORTABLE_WORKSPACE_MAX_OMISSIONS,
+  PORTABLE_WORKSPACE_RUNTIME_MAX_BYTES,
+  PORTABLE_WORKSPACE_TOTAL_MAX_BYTES,
+  validatePortableAttachmentName as validateAttachmentName,
+  validatePortableMediaType as validateMediaType,
 } from "./portable";
 
 export const WORKSPACE_CHECKPOINT_FORMAT =
@@ -47,14 +56,14 @@ const REQUIRED_CAPABILITIES = [
   "git-index-patch-v1",
 ] as const;
 const HARD_LIMITS = {
-  files: 100_000,
-  manifestBytes: 16 * 1024 * 1024,
+  files: PORTABLE_WORKSPACE_MAX_FILES,
+  manifestBytes: PORTABLE_WORKSPACE_MANIFEST_MAX_BYTES,
   traversedPaths: 200_000,
-  omissions: 10_000,
-  fileBytes: 64 * 1024 * 1024,
-  checkpointBytes: 512 * 1024 * 1024,
-  runtimeBytes: 32 * 1024 * 1024,
-  attachmentBytes: 32 * 1024 * 1024,
+  omissions: PORTABLE_WORKSPACE_MAX_OMISSIONS,
+  fileBytes: PORTABLE_WORKSPACE_FILE_MAX_BYTES,
+  checkpointBytes: PORTABLE_WORKSPACE_TOTAL_MAX_BYTES,
+  runtimeBytes: PORTABLE_WORKSPACE_RUNTIME_MAX_BYTES,
+  attachmentBytes: PORTABLE_WORKSPACE_ATTACHMENT_MAX_BYTES,
 } as const;
 const MINIMUM_GIT_VERSION = "2.20.0";
 export const WORKSPACE_CHECKPOINT_MANIFEST_MAX_BYTES =
@@ -209,6 +218,7 @@ export interface CaptureWorkspaceOptions {
 export interface CapturedWorkspaceCheckpoint {
   manifest: WorkspaceCheckpointManifest;
   manifestReference: string;
+  manifestBytes: Uint8Array;
 }
 
 export interface CheckpointPreview {
@@ -467,7 +477,11 @@ export async function captureWorkspaceCheckpoint(
     );
   }
   const manifestReference = await storeBlob(options.transport, manifestBytes);
-  return { manifest, manifestReference: manifestReference.reference };
+  return {
+    manifest,
+    manifestReference: manifestReference.reference,
+    manifestBytes,
+  };
 }
 
 /** Validate all metadata, compatibility declarations, and content before a restore. */
@@ -2052,31 +2066,6 @@ function isValidBranchName(branch: unknown): branch is string {
       (part) =>
         part.length > 0 && !part.startsWith(".") && !part.endsWith(".lock"),
     );
-}
-
-function validateAttachmentName(name: string): void {
-  if (
-    typeof name !== "string" ||
-    !name ||
-    name.length > 256 ||
-    name.includes("/") ||
-    name.includes("\\") ||
-    name === "." ||
-    name === ".."
-  ) {
-    throw new Error(`invalid checkpoint attachment name: ${String(name)}`);
-  }
-}
-
-function validateMediaType(mediaType: string): string {
-  if (
-    typeof mediaType !== "string" ||
-    mediaType.length > 128 ||
-    !/^[A-Za-z0-9][A-Za-z0-9.+-]*\/[A-Za-z0-9][A-Za-z0-9.+-]*$/.test(mediaType)
-  ) {
-    throw new Error(`invalid media type: ${String(mediaType)}`);
-  }
-  return mediaType;
 }
 
 function positiveInteger(value: number, name: string): number {

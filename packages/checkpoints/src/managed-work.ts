@@ -28,17 +28,29 @@ import {
   WORKSPACE_CHECKPOINT_MANIFEST_MAX_BYTES,
   type BlobTransport,
   type CheckpointAttachment,
-  type CaptureLimits,
-  type WorkspaceCheckpointManifest,
 } from "./index";
+import {
+  composeManagedWorkBundleFromWorkspace,
+  prepareManagedWorkBundleComposition,
+  MANAGED_WORK_ARTIFACT_MEDIA_TYPE,
+  MANAGED_WORK_BUNDLE_FORMAT,
+  MANAGED_WORK_BUNDLE_VERSION,
+  MANAGED_WORK_PROFILE,
+  type CapturedManagedWorkBundle,
+  type ManagedWorkBundleCompositionOptions,
+  type ManagedWorkBundleManifest,
+} from "./managed-work-composition";
 
-export const MANAGED_WORK_BUNDLE_FORMAT =
-  "uzina-coherent-managed-work-checkpoint" as const;
-export const MANAGED_WORK_BUNDLE_VERSION = 1 as const;
-export const MANAGED_WORK_PROFILE =
-  "quiescent-current-documents-no-forks-v1" as const;
-export const MANAGED_WORK_ARTIFACT_MEDIA_TYPE =
-  "application/vnd.uzina.managed-work+json" as const;
+export {
+  MANAGED_WORK_ARTIFACT_MEDIA_TYPE,
+  MANAGED_WORK_BUNDLE_FORMAT,
+  MANAGED_WORK_BUNDLE_VERSION,
+  MANAGED_WORK_PROFILE,
+} from "./managed-work-composition";
+export type {
+  CapturedManagedWorkBundle,
+  ManagedWorkBundleManifest,
+} from "./managed-work-composition";
 
 const RUNTIME_REQUIREMENTS = [
   "managed-work-profile:quiescent-current-documents-no-forks-v1",
@@ -46,36 +58,12 @@ const RUNTIME_REQUIREMENTS = [
 ] as const;
 const PREPARED_RECEIPT_FORMAT = "uzina-prepared-managed-work-restore" as const;
 
-export interface ManagedWorkBundleManifest {
-  format: typeof MANAGED_WORK_BUNDLE_FORMAT;
-  version: typeof MANAGED_WORK_BUNDLE_VERSION;
-  profile: typeof MANAGED_WORK_PROFILE;
-  runtime: {
-    formatVersion: 1;
-    mediaType: typeof MANAGED_WORK_ARTIFACT_MEDIA_TYPE;
-    requirements: string[];
-  };
-  workspaceManifestReference: string;
-  workspace: WorkspaceCheckpointManifest;
-  sha256: string;
-}
-
-type ManagedWorkBundleBody = Omit<ManagedWorkBundleManifest, "sha256">;
-
-export interface ManagedWorkBundleCaptureOptions {
+export interface ManagedWorkBundleCaptureOptions extends ManagedWorkBundleCompositionOptions {
   managedWork: ManagedWorkCheckpoint;
-  compatibilityRequirements?: string[];
   workspacePath: string;
   transport: BlobTransport;
-  attachments?: Array<{ name: string; mediaType: string; bytes: Uint8Array }>;
   includeGlobs?: string[];
   excludeGlobs?: string[];
-  limits?: CaptureLimits;
-}
-
-export interface CapturedManagedWorkBundle {
-  manifest: ManagedWorkBundleManifest;
-  manifestReference: string;
 }
 
 export interface PreparedManagedWorkRestoreReceipt {
@@ -329,69 +317,30 @@ async function validateBundleRuntime(
   return validated;
 }
 
-/** Compose the public Pi logical profile and existing workspace packer into one bundle. */
+/** Capture workspace state locally, then delegate v1 bundle composition. */
 export async function captureManagedWorkBundle(
   options: ManagedWorkBundleCaptureOptions,
 ): Promise<CapturedManagedWorkBundle> {
-  const managedWork = await validateManagedWorkCheckpoint(options.managedWork);
-  if (managedWork.rootConversationId !== ROOT_CONVERSATION_ID) {
-    throw new Error("Managed-work checkpoint must use the reserved root");
-  }
-  const runtimeBytes = Buffer.from(canonicalJson(managedWork), "utf8");
-  const requirements = [
-    ...new Set([
-      ...RUNTIME_REQUIREMENTS,
-      ...(options.compatibilityRequirements ?? []),
-    ]),
-  ];
-  if (
-    requirements.some(
-      (requirement) =>
-        !requirement.trim() ||
-        requirement.length > 256 ||
-        /[\r\n]/.test(requirement),
-    )
-  ) {
-    throw new Error("Managed-work compatibility requirements are invalid");
-  }
+  const prepared = await prepareManagedWorkBundleComposition({
+    managedWork: options.managedWork,
+    compatibilityRequirements: options.compatibilityRequirements,
+    attachments: options.attachments,
+    limits: options.limits,
+  });
   const capturedWorkspace = await captureWorkspaceCheckpoint({
     workspacePath: options.workspacePath,
     transport: options.transport,
     includeGlobs: options.includeGlobs,
     excludeGlobs: options.excludeGlobs,
     limits: options.limits,
-    runtimeArtifact: {
-      formatVersion: 1,
-      mediaType: MANAGED_WORK_ARTIFACT_MEDIA_TYPE,
-      bytes: runtimeBytes,
-      compatibilityRequirements: requirements,
-    },
-    attachments: options.attachments,
   });
-  const body: ManagedWorkBundleBody = {
-    format: MANAGED_WORK_BUNDLE_FORMAT,
-    version: MANAGED_WORK_BUNDLE_VERSION,
-    profile: MANAGED_WORK_PROFILE,
-    runtime: {
-      formatVersion: 1,
-      mediaType: MANAGED_WORK_ARTIFACT_MEDIA_TYPE,
-      requirements,
-    },
+  return composeManagedWorkBundleFromWorkspace({
+    prepared,
+    workspaceManifest: capturedWorkspace.manifest,
     workspaceManifestReference: capturedWorkspace.manifestReference,
-    workspace: capturedWorkspace.manifest,
-  };
-  const manifest = { ...body, sha256: bundleChecksum(body) };
-  const bytes = Buffer.from(canonicalJson(manifest), "utf8");
-  if (bytes.byteLength > WORKSPACE_CHECKPOINT_MANIFEST_MAX_BYTES) {
-    throw new Error("Managed-work bundle manifest exceeds its size limit");
-  }
-  const reference = await options.transport.putBlob(bytes);
-  if (reference !== sha256(bytes)) {
-    throw new Error(
-      "Blob transport returned an invalid bundle manifest reference",
-    );
-  }
-  return { manifest, manifestReference: reference };
+    workspaceManifestBytes: capturedWorkspace.manifestBytes,
+    transport: options.transport,
+  });
 }
 
 /** Validate all manifest, compatibility, workspace and managed-runtime resources. */

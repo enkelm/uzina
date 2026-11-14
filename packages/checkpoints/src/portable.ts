@@ -3,6 +3,8 @@ export const PORTABLE_WORKSPACE_CHECKPOINT_FORMAT =
 export const PORTABLE_WORKSPACE_CHECKPOINT_VERSION = 1 as const;
 export const PORTABLE_WORKSPACE_MANIFEST_MAX_BYTES = 16 * 1024 * 1024;
 export const PORTABLE_WORKSPACE_FILE_MAX_BYTES = 64 * 1024 * 1024;
+export const PORTABLE_WORKSPACE_RUNTIME_MAX_BYTES = 32 * 1024 * 1024;
+export const PORTABLE_WORKSPACE_ATTACHMENT_MAX_BYTES = 32 * 1024 * 1024;
 export const PORTABLE_WORKSPACE_TOTAL_MAX_BYTES = 512 * 1024 * 1024;
 export const PORTABLE_WORKSPACE_MAX_FILES = 100_000;
 export const PORTABLE_WORKSPACE_MAX_OMISSIONS = 10_000;
@@ -50,6 +52,31 @@ let globGeneration = 0;
 
 interface WorkspaceGlobWorkBudget {
   remaining: number;
+}
+
+export function validatePortableAttachmentName(name: string): void {
+  if (
+    typeof name !== "string" ||
+    !name ||
+    name.length > 256 ||
+    name.includes("/") ||
+    name.includes("\\") ||
+    name === "." ||
+    name === ".."
+  ) {
+    throw new Error(`invalid checkpoint attachment name: ${String(name)}`);
+  }
+}
+
+export function validatePortableMediaType(mediaType: string): string {
+  if (
+    typeof mediaType !== "string" ||
+    mediaType.length > 128 ||
+    !/^[A-Za-z0-9][A-Za-z0-9.+-]*\/[A-Za-z0-9][A-Za-z0-9.+-]*$/.test(mediaType)
+  ) {
+    throw new Error(`invalid media type: ${String(mediaType)}`);
+  }
+  return mediaType;
 }
 
 export function normalizeWorkspaceGlobs(globs: string[]): string[] {

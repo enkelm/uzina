@@ -25,6 +25,7 @@ import {
   validateManagedWorkBundle,
   WORKSPACE_CHECKPOINT_MANIFEST_MAX_BYTES,
   type BlobTransport,
+  type WorkspaceCheckpointManifest,
 } from "@uzina/checkpoints";
 import {
   ExecutionDaemon,
@@ -534,6 +535,10 @@ describe("standalone local Factory managed Pi composition", () => {
       releasePut = resolve;
     });
     let firstWrite = true;
+    let sourceWorkspaceManifest: WorkspaceCheckpointManifest | undefined;
+    let sourceManifestPutIndex = -1;
+    const sourceManifestReferences: string[] = [];
+    const putReferences: string[] = [];
     const blockingTransport: BlobTransport = {
       async putBlob(bytes) {
         if (firstWrite) {
@@ -541,10 +546,31 @@ describe("standalone local Factory managed Pi composition", () => {
           signalFirstPut();
           await putBlocked;
         }
-        return blobs.putBlob(bytes);
+        const reference = await blobs.putBlob(bytes);
+        putReferences.push(reference);
+        try {
+          const value = JSON.parse(new TextDecoder().decode(bytes)) as {
+            format?: unknown;
+            runtimeArtifact?: unknown;
+            attachments?: unknown;
+          };
+          if (
+            value.format === "uzina-workspace-checkpoint" &&
+            value.runtimeArtifact === null &&
+            Array.isArray(value.attachments) &&
+            value.attachments.length === 0
+          ) {
+            sourceWorkspaceManifest = value as WorkspaceCheckpointManifest;
+            sourceManifestReferences.push(reference);
+            sourceManifestPutIndex = putReferences.length - 1;
+          }
+        } catch {
+          // Workspace objects are binary or non-manifest payloads.
+        }
+        return reference;
       },
-      getBlob(reference) {
-        return blobs.getBlob(reference);
+      async getBlob() {
+        throw new Error("managed-work composition must not read source blobs");
       },
     };
     const pendingCapture = local.host.captureManagedWorkCheckpoint({
@@ -613,6 +639,39 @@ describe("standalone local Factory managed Pi composition", () => {
     expect(captured.manifest.profile).toBe(
       "quiescent-current-documents-no-forks-v1",
     );
+    expect(sourceWorkspaceManifest).toBeDefined();
+    expect(sourceManifestReferences).toHaveLength(1);
+    expect(sourceManifestPutIndex).toBeGreaterThanOrEqual(0);
+    const capturedSource = sourceWorkspaceManifest!;
+    const {
+      runtimeArtifact: _sourceRuntime,
+      attachments: _sourceAttachments,
+      ...capturedWorkspaceCore
+    } = captured.manifest.workspace;
+    const {
+      runtimeArtifact: _sourceRuntimeOriginal,
+      attachments: _sourceAttachmentsOriginal,
+      ...sourceWorkspaceCore
+    } = capturedSource;
+    expect(capturedWorkspaceCore).toEqual(sourceWorkspaceCore);
+    expect(capturedSource.runtimeArtifact).toBeNull();
+    expect(capturedSource.attachments).toEqual([]);
+    const sourceObjectReferences = new Set([
+      capturedSource.git.bundle.reference,
+      capturedSource.git.stagedPatch.reference,
+      ...capturedSource.workspace.entries.map((entry) => entry.sha256),
+    ]);
+    expect(
+      [...sourceObjectReferences].every((reference) =>
+        putReferences.slice(0, sourceManifestPutIndex).includes(reference),
+      ),
+    ).toBe(true);
+    expect(
+      putReferences
+        .slice(sourceManifestPutIndex + 1)
+        .some((reference) => sourceObjectReferences.has(reference)),
+    ).toBe(false);
+    expect(putReferences.slice(sourceManifestPutIndex + 1)).toHaveLength(4);
     expect(local.host.factory.listManagedWorkCaptures(session)).toHaveLength(0);
 
     const capturedRecord = captured.manifest as unknown as Record<
