@@ -23,12 +23,16 @@ import {
   createManagedRemoteToolExecutor,
   type ManagedPiWorkOptions,
 } from "@uzina/pi-runtime/work";
+import { MANAGED_REMOTE_TOOL_REQUIREMENTS } from "@uzina/pi-runtime/tools";
 
 type DurableObjectSqliteStorage = Parameters<
   typeof openDurableObjectSqliteStorage
 >[0];
 
 type AlarmStorage = DurableObjectSqliteStorage & {
+  get<T = unknown>(key: string): Promise<T | undefined>;
+  put<T>(key: string, value: T): Promise<void>;
+  delete(key: string): Promise<boolean>;
   getAlarm(): Promise<number | null>;
   setAlarm(scheduledTime: number): Promise<void>;
   deleteAlarm(): Promise<void>;
@@ -40,6 +44,27 @@ export interface ManagedWorkState {
   blockConcurrencyWhile<T>(callback: () => Promise<T>): Promise<T>;
   abort(reason?: string): void;
 }
+
+/** Separate Durable Object metadata; never part of Pi logical storage or its export. */
+export const MANAGED_WORK_SOURCE_RUNTIME_PROFILE_STORAGE_KEY =
+  "uzina:managed-work-source-runtime-profile:v1";
+
+export type ManagedWorkSourceRuntimeProfile = Readonly<{
+  version: 1;
+  threadId: string;
+  model: Readonly<{ provider: string; modelId: string }>;
+  requirements: readonly string[];
+}>;
+
+export type BoundManagedWorkSourceRuntimeProfile =
+  ManagedWorkSourceRuntimeProfile &
+    Readonly<{
+      captureId: string;
+      captureRequestId: string;
+      target: Readonly<{ nodeId: string; workspaceId: string }>;
+      ownershipGeneration: number;
+      checkpointSha256: string;
+    }>;
 
 /** Supplied by the later Worker composition; no model or tool credential is embedded here. */
 export type ManagedWorkRuntimeOptions = Omit<
@@ -60,6 +85,8 @@ export type ManagedWorkCheckpointExport = {
   ownershipGeneration: number;
   rootConversationId: number;
   profile: ManagedWorkCheckpoint["profile"];
+  /** Null for legacy or unsupported source profiles; raw export remains available. */
+  sourceRuntimeProfile: BoundManagedWorkSourceRuntimeProfile | null;
   /** Logical v1 body checksum; it is not a digest of the returned `bytes`. */
   checkpointSha256: string;
   sizeBytes: number;
@@ -122,6 +149,161 @@ function validateCaptureExportRequest(
     captureId: request.captureId,
     captureRequestId: request.captureRequestId,
   };
+}
+
+function isProfileRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isSafeModelIdentifier(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(value)
+  );
+}
+
+function freezeSourceRuntimeProfile(
+  value: ManagedWorkSourceRuntimeProfile,
+): ManagedWorkSourceRuntimeProfile {
+  return Object.freeze({
+    version: 1,
+    threadId: value.threadId,
+    model: Object.freeze({ ...value.model }),
+    requirements: Object.freeze([...value.requirements]),
+  });
+}
+
+function sourceRuntimeProfileFromOptions(
+  options: ManagedWorkRuntimeOptions,
+  threadId: string,
+  modelSelection: unknown,
+): ManagedWorkSourceRuntimeProfile | null {
+  // A caller-supplied registry can add unknown tools, so do not claim the
+  // managed remote-tool catalog is the complete destination requirement set.
+  if (options.registry !== undefined) return null;
+  const selectedModel = isProfileRecord(modelSelection)
+    ? modelSelection
+    : undefined;
+  const provider = selectedModel?.provider;
+  const modelId = selectedModel?.modelId;
+  if (
+    !isSafeModelIdentifier(provider) ||
+    !isSafeModelIdentifier(modelId) ||
+    typeof options.models === "function"
+  ) {
+    return null;
+  }
+  try {
+    if (!options.models.getModel(provider, modelId)) return null;
+  } catch {
+    return null;
+  }
+  const requirements = [
+    `model:${provider}/${modelId}`,
+    ...MANAGED_REMOTE_TOOL_REQUIREMENTS,
+  ];
+  if (
+    requirements.length > 16 ||
+    requirements.some(
+      (requirement) => requirement.length > 256 || /[\r\n]/.test(requirement),
+    )
+  ) {
+    return null;
+  }
+  return freezeSourceRuntimeProfile({
+    version: 1,
+    threadId,
+    model: { provider, modelId },
+    requirements,
+  });
+}
+
+function parseStoredSourceRuntimeProfile(
+  value: unknown,
+  threadId: string,
+): ManagedWorkSourceRuntimeProfile | null {
+  if (
+    !isProfileRecord(value) ||
+    Object.keys(value).length !== 4 ||
+    value.version !== 1 ||
+    value.threadId !== threadId ||
+    !isProfileRecord(value.model) ||
+    Object.keys(value.model).length !== 2 ||
+    !Array.isArray(value.requirements)
+  ) {
+    return null;
+  }
+  const provider = value.model.provider;
+  const modelId = value.model.modelId;
+  if (!isSafeModelIdentifier(provider) || !isSafeModelIdentifier(modelId)) {
+    return null;
+  }
+  const expectedRequirements = [
+    `model:${provider}/${modelId}`,
+    ...MANAGED_REMOTE_TOOL_REQUIREMENTS,
+  ];
+  if (
+    value.requirements.length !== expectedRequirements.length ||
+    value.requirements.some(
+      (requirement, index) => requirement !== expectedRequirements[index],
+    )
+  ) {
+    return null;
+  }
+  return freezeSourceRuntimeProfile({
+    version: 1,
+    threadId,
+    model: { provider, modelId },
+    requirements: expectedRequirements,
+  });
+}
+
+function sameSourceRuntimeProfile(
+  left: ManagedWorkSourceRuntimeProfile | null,
+  right: ManagedWorkSourceRuntimeProfile | null,
+): boolean {
+  if (left === null || right === null) return left === right;
+  return (
+    left.version === right.version &&
+    left.threadId === right.threadId &&
+    left.model.provider === right.model.provider &&
+    left.model.modelId === right.model.modelId &&
+    JSON.stringify(left.requirements) === JSON.stringify(right.requirements)
+  );
+}
+
+function bindSourceRuntimeProfile(
+  profile: ManagedWorkSourceRuntimeProfile | null,
+  binding: ManagedWorkCaptureBinding,
+  checkpoint: ManagedWorkCheckpoint,
+): BoundManagedWorkSourceRuntimeProfile | null {
+  if (!profile) return null;
+  const rootAgent = checkpoint.documents.find(
+    ({ record }) =>
+      record.kind === "pi.agent" &&
+      record.key === undefined &&
+      record.scope.kind === "conversation" &&
+      record.scope.conversationId === checkpoint.rootConversationId,
+  );
+  const selectedModel = rootAgent?.value.model;
+  if (
+    rootAgent?.version !== 1 ||
+    !isProfileRecord(selectedModel) ||
+    selectedModel.provider !== profile.model.provider ||
+    selectedModel.modelId !== profile.model.modelId
+  ) {
+    // Raw logical export remains available, but stale or unknown metadata must
+    // never advertise compatibility with a model the captured root did not select.
+    return null;
+  }
+  return Object.freeze({
+    ...profile,
+    target: Object.freeze({ ...binding.target }),
+    captureId: binding.captureId,
+    captureRequestId: binding.captureRequestId,
+    ownershipGeneration: binding.ownershipGeneration,
+    checkpointSha256: checkpoint.sha256,
+  });
 }
 
 function assertSameCaptureBinding(
@@ -265,11 +447,16 @@ export class ManagedWork {
   ): Promise<ManagedWorkCheckpointExport> {
     return this.enqueue(async () => {
       await this.ready;
-      if (this.closed)
-        throw new Error("Managed Pi work Durable Object is closed");
+      // A quiescent closed runtime still permits this read-only durable export.
       const captureRequest = validateCaptureExportRequest(request);
       const threadId = this.threadId;
       const initial = await this.requireExportBinding(threadId, captureRequest);
+      const sourceProfileBefore = parseStoredSourceRuntimeProfile(
+        await this.state.storage.get<unknown>(
+          MANAGED_WORK_SOURCE_RUNTIME_PROFILE_STORAGE_KEY,
+        ),
+        threadId,
+      );
       let storage = this.runtimeStorage;
       const ownsStorage = storage === undefined;
       if (!storage) {
@@ -289,11 +476,24 @@ export class ManagedWork {
           checkpoint,
           MANAGED_WORK_CHECKPOINT_MAX_BYTES,
         );
+        const sourceProfileAfter = parseStoredSourceRuntimeProfile(
+          await this.state.storage.get<unknown>(
+            MANAGED_WORK_SOURCE_RUNTIME_PROFILE_STORAGE_KEY,
+          ),
+          threadId,
+        );
         const afterRead = await this.requireExportBinding(
           threadId,
           captureRequest,
         );
         assertSameCaptureBinding(initial, afterRead);
+        if (
+          !sameSourceRuntimeProfile(sourceProfileBefore, sourceProfileAfter)
+        ) {
+          throw new Error(
+            "Managed-work source runtime profile changed during export",
+          );
+        }
         return {
           captureId: initial.captureId,
           captureRequestId: initial.captureRequestId,
@@ -302,6 +502,11 @@ export class ManagedWork {
           ownershipGeneration: initial.ownershipGeneration,
           rootConversationId: artifact.checkpoint.rootConversationId,
           profile: artifact.checkpoint.profile,
+          sourceRuntimeProfile: bindSourceRuntimeProfile(
+            sourceProfileBefore,
+            initial,
+            artifact.checkpoint,
+          ),
           checkpointSha256: artifact.checkpoint.sha256,
           sizeBytes: artifact.bytes.byteLength,
           bytes: artifact.bytes,
@@ -503,8 +708,41 @@ export class ManagedWork {
     const bridge = this.env.factory();
     const opening = Promise.resolve()
       .then(() => this.env.runtimeOptions())
-      .then((options) =>
-        ManagedPiWork.open(
+      .then(async (options) => {
+        // agent is a creation default, not a reconfiguration of an existing
+        // root. Read the committed singleton before opening/resuming its Harness.
+        const root = await storage.conversation(
+          ROOT_CONVERSATION_ID,
+          BACKGROUND_CONTEXT,
+        );
+        let modelSelection: unknown = options.agent?.model;
+        if (root) {
+          const agentRecord = await storage.findDocument(
+            {
+              kind: "pi.agent",
+              scope: {
+                kind: "conversation",
+                conversationId: ROOT_CONVERSATION_ID,
+              },
+            },
+            "current",
+            BACKGROUND_CONTEXT,
+          );
+          const agent = agentRecord
+            ? await storage.document(
+                agentRecord.id,
+                "current",
+                BACKGROUND_CONTEXT,
+              )
+            : undefined;
+          modelSelection = agent?.version === 1 ? agent.value.model : undefined;
+        }
+        const sourceProfile = sourceRuntimeProfileFromOptions(
+          options,
+          this.threadId,
+          modelSelection,
+        );
+        const work = await ManagedPiWork.open(
           {
             ...options,
             storage,
@@ -532,8 +770,18 @@ export class ManagedWork {
             beforeWork: (wake) => this.arm(wake),
           },
           BACKGROUND_CONTEXT,
-        ),
-      );
+        );
+        try {
+          await this.state.storage.put(
+            MANAGED_WORK_SOURCE_RUNTIME_PROFILE_STORAGE_KEY,
+            sourceProfile,
+          );
+        } catch (error) {
+          await work.close(BACKGROUND_CONTEXT);
+          throw error;
+        }
+        return work;
+      });
     this.opening = opening;
     try {
       this.work = await opening;

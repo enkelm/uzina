@@ -27,7 +27,16 @@ export class FactoryObject
     environment: FactoryDurableObjectEnvironment,
   ) {
     super(state as unknown as DurableObjectState, environment);
-    this.#controller = new FactoryController(state, environment);
+    this.#controller = new FactoryController(
+      state,
+      environment,
+      (requestId, manifestReference, verification) =>
+        this.publishManagedWorkCheckpoint(
+          requestId,
+          manifestReference,
+          verification,
+        ),
+    );
   }
 
   fetch(request: Request): Promise<Response> {
@@ -89,6 +98,20 @@ export class FactoryObject
 
   markManagedEffectUncertain(jobId: string, detail: string): void {
     this.#controller.markManagedEffectUncertain(jobId, detail);
+  }
+
+  publishManagedWorkCheckpoint(
+    requestId: string,
+    manifestReference: string,
+    verification: Parameters<
+      FactoryController["publishManagedWorkCheckpoint"]
+    >[2],
+  ) {
+    return this.#controller.publishManagedWorkCheckpoint(
+      requestId,
+      manifestReference,
+      verification,
+    );
   }
 }
 

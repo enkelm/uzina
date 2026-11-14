@@ -15,6 +15,7 @@ import {
   privateAssistantInputRequestSchema,
   submitInputRequestSchema,
   workspaceSnapshotRequestSchema,
+  managedWorkCheckpointRequestSchema,
   workspaceSnapshotClaimRequestSchema,
   workspaceSnapshotClaimResponseSchema,
   workspaceSnapshotReportSchema,
@@ -35,6 +36,7 @@ import {
   verifyPublishedWorkspaceManifest,
   type WorkspaceSnapshotStorage,
 } from "./snapshot-storage";
+import type { ManagedWorkCheckpointPrivateStorage } from "./managed-work-checkpoint-verification";
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -89,6 +91,11 @@ function numberParameter(value: string | null, fallback: number): number {
 export interface ManagedWorkQueries {
   context(threadId: string): Promise<unknown>;
   status(threadId: string): Promise<unknown>;
+  exportCheckpoint?(request: {
+    captureId: string;
+    captureRequestId: string;
+    threadId: string;
+  }): Promise<unknown>;
 }
 
 export interface PrivateAssistantQueries {
@@ -103,6 +110,9 @@ export function createFactoryHttpHandler(
   managedWork?: ManagedWorkQueries,
   privateAssistant?: PrivateAssistantQueries,
   snapshotStorage?: WorkspaceSnapshotStorage,
+  checkpointPrivateStorage?: (
+    requestId: string,
+  ) => Pick<ManagedWorkCheckpointPrivateStorage, "getBlobStream">,
 ): (request: Request) => Promise<Response> {
   const mcp = createFactoryMcpHandler(factory, managedWork);
   return async (request) => {
@@ -284,6 +294,82 @@ export function createFactoryHttpHandler(
           contractVersion: CONTRACT_VERSION,
           thread: currentThread,
           runtime,
+        });
+      }
+      const managedWorkCheckpointAdmissionMatch = path.match(
+        /^\/v1\/threads\/([^/]+)\/managed-work-checkpoints$/,
+      );
+      if (request.method === "POST" && managedWorkCheckpointAdmissionMatch) {
+        if (!managedWork?.exportCheckpoint || !checkpointPrivateStorage) {
+          throw new FactoryError(
+            503,
+            "managed_work_checkpoint_assembly_unavailable",
+          );
+        }
+        const input = await body(request, managedWorkCheckpointRequestSchema);
+        return json(
+          await factory.requestManagedWorkCheckpoint(
+            session,
+            decodeURIComponent(managedWorkCheckpointAdmissionMatch[1]!),
+            input,
+          ),
+          202,
+        );
+      }
+      const managedWorkCheckpointStatusMatch = path.match(
+        /^\/v1\/managed-work-checkpoints\/([^/]+)$/,
+      );
+      if (request.method === "GET" && managedWorkCheckpointStatusMatch) {
+        return json(
+          await factory.getManagedWorkCheckpointStatus(
+            session,
+            decodeURIComponent(managedWorkCheckpointStatusMatch[1]!),
+          ),
+        );
+      }
+      const managedWorkCheckpointBlobMatch = path.match(
+        /^\/v1\/managed-work-checkpoints\/([^/]+)\/blobs\/([a-f0-9]{64})$/,
+      );
+      if (request.method === "GET" && managedWorkCheckpointBlobMatch) {
+        const requestId = decodeURIComponent(
+          managedWorkCheckpointBlobMatch[1]!,
+        );
+        const reference = managedWorkCheckpointBlobMatch[2]!;
+        const authorized = await factory.getAuthorizedManagedWorkCheckpointBlob(
+          session,
+          requestId,
+          reference,
+        );
+        let blob: { size: number; body: ReadableStream<Uint8Array> } | null;
+        if (authorized.scope === "private") {
+          if (!checkpointPrivateStorage) {
+            throw new FactoryError(
+              503,
+              "managed_work_checkpoint_storage_unavailable",
+            );
+          }
+          blob =
+            await checkpointPrivateStorage(requestId).getBlobStream(reference);
+        } else {
+          if (!snapshotStorage) {
+            throw new FactoryError(
+              503,
+              "workspace_snapshot_storage_unavailable",
+            );
+          }
+          blob = await snapshotStorage.getBlob(authorized.captureId, reference);
+        }
+        if (!blob || blob.size !== authorized.size) {
+          await blob?.body.cancel().catch(() => {});
+          throw new FactoryError(404, "managed_work_checkpoint_blob_not_found");
+        }
+        return new Response(blob.body, {
+          headers: {
+            "content-type": "application/octet-stream",
+            "content-length": String(blob.size),
+            "cache-control": "private, no-store",
+            "x-content-sha256": reference,
+          },
         });
       }
       const captureAdmissionMatch = path.match(

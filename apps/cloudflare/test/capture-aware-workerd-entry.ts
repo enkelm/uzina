@@ -7,11 +7,25 @@ import {
   type Page,
 } from "@earendil-works/pi-durable";
 import type { ManagedWorkCheckpoint } from "@uzina/pi-runtime/checkpoint";
+import type { FactoryProvenanceEvidence } from "@uzina/contracts/factory";
+import type { ExecutionOperation } from "@uzina/contracts/execution";
+import {
+  verifyManagedWorkCheckpointClosure,
+  type ManagedWorkCheckpointClosureVerification,
+} from "@uzina/core/managed-work-checkpoint-verification";
+import { R2ManagedWorkCheckpointStorage } from "../src/managed-work-checkpoint-storage";
+import {
+  MANAGED_WORK_RUNTIME_REQUIREMENTS,
+  type ManagedWorkCheckpointArtifactReference,
+} from "@uzina/checkpoints/managed-work-composition";
+import { MANAGED_REMOTE_TOOL_REQUIREMENTS } from "@uzina/pi-runtime/tools";
+import { R2WorkspaceSnapshotStorage } from "../src/snapshot-storage";
 import { openDurableObjectSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/cloudflare";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
 import { createWorkerManagedRuntimeOptions } from "../../../packages/pi-runtime/src/worker-provider";
 import { FactoryObject, ManagedWorkRpcObject } from "../src/durable-objects";
 import type { FactoryRpc } from "../src/factory-object";
+import { MANAGED_WORK_SOURCE_RUNTIME_PROFILE_STORAGE_KEY } from "../src/work-object";
 import type {
   ManagedWorkFactoryBridge,
   ManagedWorkState,
@@ -23,8 +37,27 @@ let alarmCalls = 0;
 let runtimeOptionsHeld = false;
 let runtimeOptionsEntered = false;
 let unusableProviderConfiguration = false;
+let configuredModelId = "capture-test-model";
 let modelResponseHeld = false;
+let failNextManagedReadToolCall = false;
 let completeHeldModelResponse: (() => void) | undefined;
+let loseNextCheckpointExportResponse = false;
+let checkpointExportAttempts = 0;
+let lostCheckpointExportResponses = 0;
+let checkpointPublicationHoldRequested = false;
+let checkpointPublicationEntered = false;
+let releaseCheckpointPublication: (() => void) | undefined;
+let checkpointPublicationSummary:
+  ManagedWorkCheckpointClosureVerification | undefined;
+let checkpointPublicationSummaryFrozen = false;
+let privateArtifactReadHoldRequestId: string | undefined;
+let privateArtifactReadHoldMode: "first-read" | "second-read" | undefined;
+let privateArtifactReadEntered = false;
+let releasePrivateArtifactRead: (() => void) | undefined;
+let checkpointExportForbiddenThreadId: string | undefined;
+let publicationBindingApplied = false;
+let privateReadBindingApplied = false;
+let exportGuardBindingApplied = false;
 
 const model = {
   id: "capture-test-model",
@@ -39,9 +72,16 @@ const model = {
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 };
 
+const reconfiguredModel = { ...model, id: "capture-test-model-reconfigured" };
+
 const models = {
   getModel(provider: string, id: string) {
-    return provider === model.provider && id === model.id ? model : undefined;
+    if (provider !== model.provider) return undefined;
+    return id === model.id
+      ? model
+      : id === reconfiguredModel.id
+        ? reconfiguredModel
+        : undefined;
   },
   async getAuth() {
     return undefined;
@@ -65,6 +105,8 @@ const models = {
 function response(signal?: AbortSignal) {
   modelCalls += 1;
   const stream = createAssistantMessageEventStream();
+  const emitManagedReadFailure = failNextManagedReadToolCall;
+  if (emitManagedReadFailure) failNextManagedReadToolCall = false;
   let completed = false;
   const complete = () => {
     if (completed) return;
@@ -74,7 +116,19 @@ function response(signal?: AbortSignal) {
       completeHeldModelResponse = undefined;
     stream.end({
       role: "assistant",
-      content: [{ type: "text", text: "The captured Pi root is settled." }],
+      content: emitManagedReadFailure
+        ? [
+            {
+              type: "toolCall",
+              id: "call:checkpoint-provenance-failure",
+              name: "remote_read_file",
+              arguments: {
+                path: "missing-provenance-input.txt",
+                maxBytes: 1024,
+              },
+            },
+          ]
+        : [{ type: "text", text: "The captured Pi root is settled." }],
       api: "uzina-capture-test-api",
       provider: "uzina-capture-test",
       model: "capture-test-model",
@@ -86,7 +140,11 @@ function response(signal?: AbortSignal) {
         totalTokens: 2,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
       },
-      stopReason: signal?.aborted ? "aborted" : "stop",
+      stopReason: signal?.aborted
+        ? "aborted"
+        : emitManagedReadFailure
+          ? "toolUse"
+          : "stop",
       timestamp: Date.now(),
     });
   };
@@ -98,13 +156,62 @@ function response(signal?: AbortSignal) {
 }
 
 type TestFactoryState = ConstructorParameters<typeof FactoryObject>[0];
-type TestFactoryEnvironment = ConstructorParameters<typeof FactoryObject>[1];
+type TestFactoryEnvironment = ConstructorParameters<typeof FactoryObject>[1] & {
+  UZINA_TEST_HOLD_CHECKPOINT_PUBLICATION?: string;
+  UZINA_TEST_HOLD_PRIVATE_READ_REQUEST_ID?: string;
+  UZINA_TEST_HOLD_PRIVATE_READ_MODE?: "first-read" | "second-read";
+  UZINA_TEST_FORBID_CHECKPOINT_EXPORT_THREAD_ID?: string;
+};
+
+function checkpointBucketWithPrivateReadGate(
+  bucket: NonNullable<TestFactoryEnvironment["CHECKPOINTS"]>,
+): NonNullable<TestFactoryEnvironment["CHECKPOINTS"]> {
+  const reads = new Map<string, number>();
+  return {
+    put: (key, value, options) => bucket.put(key, value, options),
+    async get(key) {
+      const requestId = privateArtifactReadHoldRequestId;
+      const mode = privateArtifactReadHoldMode;
+      if (requestId && mode) {
+        const prefix = await namespacedPrefix(
+          "managed-work-checkpoints",
+          requestId,
+        );
+        if (
+          privateArtifactReadHoldRequestId === requestId &&
+          key.startsWith(prefix)
+        ) {
+          const count = (reads.get(key) ?? 0) + 1;
+          reads.set(key, count);
+          const shouldHold = mode === "first-read" ? count === 1 : count === 2;
+          if (shouldHold) {
+            privateArtifactReadHoldRequestId = undefined;
+            privateArtifactReadHoldMode = undefined;
+            privateArtifactReadEntered = true;
+            try {
+              await new Promise<void>((resolve) => {
+                releasePrivateArtifactRead = resolve;
+              });
+            } finally {
+              privateArtifactReadEntered = false;
+              releasePrivateArtifactRead = undefined;
+            }
+          }
+        }
+      }
+      return bucket.get(key);
+    },
+    delete: (key) => bucket.delete(key),
+    list: (options) => bucket.list(options),
+  };
+}
 
 type TestManagedWorkEnvironment = {
   FACTORY: {
     idFromName(name: string): unknown;
     get(id: unknown): FactoryRpc & ManagedWorkFactoryBridge;
   };
+  UZINA_TEST_FORBID_CHECKPOINT_EXPORT_THREAD_ID?: string;
 };
 
 type PublicStorageObservation = Pick<
@@ -127,6 +234,7 @@ type TestManagedWorkRpc = {
   }): Promise<string>;
   scheduleAlarmForTest(at: number): Promise<void>;
   pendingAlarmForTest(): Promise<number | null>;
+  clearSourceRuntimeProfileForTest(): Promise<boolean>;
   exportManagedWorkCheckpoint(request: {
     captureId: string;
     captureRequestId: string;
@@ -154,8 +262,97 @@ export class CaptureTestFactory extends FactoryObject {
     state: TestFactoryState,
     private readonly environment: TestFactoryEnvironment,
   ) {
-    super(state, environment);
+    super(state, {
+      ...environment,
+      CHECKPOINTS: environment.CHECKPOINTS
+        ? checkpointBucketWithPrivateReadGate(environment.CHECKPOINTS)
+        : undefined,
+    });
+    if (!publicationBindingApplied) {
+      if (environment.UZINA_TEST_HOLD_CHECKPOINT_PUBLICATION === "true") {
+        checkpointPublicationHoldRequested = true;
+      }
+      publicationBindingApplied = true;
+    }
+    if (!privateReadBindingApplied) {
+      if (environment.UZINA_TEST_HOLD_PRIVATE_READ_REQUEST_ID) {
+        privateArtifactReadHoldRequestId =
+          environment.UZINA_TEST_HOLD_PRIVATE_READ_REQUEST_ID;
+        privateArtifactReadHoldMode =
+          environment.UZINA_TEST_HOLD_PRIVATE_READ_MODE;
+      }
+      privateReadBindingApplied = true;
+    }
+    if (!exportGuardBindingApplied) {
+      checkpointExportForbiddenThreadId =
+        environment.UZINA_TEST_FORBID_CHECKPOINT_EXPORT_THREAD_ID || undefined;
+      exportGuardBindingApplied = true;
+    }
     this.#storage = state.storage;
+  }
+
+  checkpointAssemblyJournalForTest(requestId: string) {
+    const request = this.#storage.sql
+      .exec<{
+        status: string;
+        stage: string;
+        runtime_requirements_json: string | null;
+      }>(
+        "SELECT status, stage, runtime_requirements_json FROM managed_work_checkpoint_requests WHERE request_id = ?",
+        requestId,
+      )
+      .toArray()[0];
+    if (!request) return null;
+    const artifacts = this.#storage.sql
+      .exec<{
+        role: string;
+        reference: string;
+        size_bytes: number;
+      }>(
+        "SELECT role, reference, size_bytes FROM managed_work_checkpoint_artifacts WHERE request_id = ? ORDER BY role, reference",
+        requestId,
+      )
+      .toArray();
+    return {
+      status: request.status,
+      stage: request.stage,
+      runtimeRequirements: request.runtime_requirements_json
+        ? (JSON.parse(request.runtime_requirements_json) as string[])
+        : null,
+      artifacts: artifacts.map((artifact) => ({
+        role: artifact.role,
+        reference: artifact.reference,
+        size: artifact.size_bytes,
+      })),
+    };
+  }
+
+  override async publishManagedWorkCheckpoint(
+    requestId: string,
+    manifestReference: string,
+    verification: Parameters<FactoryObject["publishManagedWorkCheckpoint"]>[2],
+  ) {
+    if (checkpointPublicationHoldRequested) {
+      checkpointPublicationHoldRequested = false;
+      checkpointPublicationSummaryFrozen = Object.isFrozen(verification);
+      checkpointPublicationSummary = JSON.parse(
+        JSON.stringify(verification),
+      ) as ManagedWorkCheckpointClosureVerification;
+      checkpointPublicationEntered = true;
+      try {
+        await new Promise<void>((resolve) => {
+          releaseCheckpointPublication = resolve;
+        });
+      } finally {
+        checkpointPublicationEntered = false;
+        releaseCheckpointPublication = undefined;
+      }
+    }
+    return super.publishManagedWorkCheckpoint(
+      requestId,
+      manifestReference,
+      verification,
+    );
   }
 
   async exportManagedWorkCheckpointForTest(
@@ -185,6 +382,14 @@ export class CaptureTestManagedWork extends ManagedWorkRpcObject {
     state: ManagedWorkState,
     environment: TestManagedWorkEnvironment,
   ) {
+    if (
+      !exportGuardBindingApplied &&
+      environment.UZINA_TEST_FORBID_CHECKPOINT_EXPORT_THREAD_ID
+    ) {
+      checkpointExportForbiddenThreadId =
+        environment.UZINA_TEST_FORBID_CHECKPOINT_EXPORT_THREAD_ID;
+      exportGuardBindingApplied = true;
+    }
     super(state, environment, {
       runtimeOptions: async () => {
         if (runtimeOptionsHeld) {
@@ -209,7 +414,7 @@ export class CaptureTestManagedWork extends ManagedWorkRpcObject {
           agent: {
             model: {
               provider: "uzina-capture-test",
-              modelId: "capture-test-model",
+              modelId: configuredModelId,
             },
           },
         };
@@ -228,8 +433,33 @@ export class CaptureTestManagedWork extends ManagedWorkRpcObject {
     alarmCalls += 1;
   }
 
+  override async exportManagedWorkCheckpoint(request: {
+    captureId: string;
+    captureRequestId: string;
+  }) {
+    checkpointExportAttempts += 1;
+    if (checkpointExportForbiddenThreadId === this.#threadId) {
+      throw new Error(
+        "Managed-work export unexpectedly repeated after its runtime artifact was recorded",
+      );
+    }
+    const result = await super.exportManagedWorkCheckpoint(request);
+    if (loseNextCheckpointExportResponse) {
+      loseNextCheckpointExportResponse = false;
+      lostCheckpointExportResponses += 1;
+      throw new Error("Test lost the completed checkpoint export response");
+    }
+    return result;
+  }
+
   scheduleAlarmForTest(at: number): Promise<void> {
     return this.#storage.setAlarm(at);
+  }
+
+  clearSourceRuntimeProfileForTest(): Promise<boolean> {
+    return this.#storage.delete(
+      MANAGED_WORK_SOURCE_RUNTIME_PROFILE_STORAGE_KEY,
+    );
   }
 
   pendingAlarmForTest(): Promise<number | null> {
@@ -395,9 +625,224 @@ async function errorMessage(operation: () => unknown | Promise<unknown>) {
 }
 
 // Keep test-only DO RPC calls inside workerd; Miniflare's Node proxy leaks a stub warning.
+async function namespacedPrefix(
+  namespace: "workspace-snapshots" | "managed-work-checkpoints",
+  identifier: string,
+): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(identifier),
+  );
+  const reference = [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+  return `${namespace}/${reference}/`;
+}
+
 export default {
   async fetch(request: Request, environment: TestFactoryEnvironment) {
     const url = new URL(request.url);
+    const checkpointBucket = environment.CHECKPOINTS;
+    if (!checkpointBucket) {
+      return new Response("Checkpoint test bucket is unavailable", {
+        status: 503,
+      });
+    }
+    if (
+      request.method === "POST" &&
+      url.pathname === "/__test/private-checkpoint-read"
+    ) {
+      const input = (await request.json()) as {
+        action: "hold" | "state" | "release";
+        requestId?: string;
+        mode?: "first-read" | "second-read";
+      };
+      if (input.action === "hold") {
+        if (!input.requestId || !input.mode) {
+          return Response.json(
+            { error: "invalid_test_input" },
+            { status: 400 },
+          );
+        }
+        privateArtifactReadHoldRequestId = input.requestId;
+        privateArtifactReadHoldMode = input.mode;
+        privateArtifactReadEntered = false;
+      } else if (input.action === "release") {
+        releasePrivateArtifactRead?.();
+      }
+      return Response.json({ entered: privateArtifactReadEntered });
+    }
+    if (
+      request.method === "POST" &&
+      url.pathname === "/__test/managed-checkpoint-journal"
+    ) {
+      const input = (await request.json()) as { requestId: string };
+      const factory = environment.FACTORY.get(
+        environment.FACTORY.idFromName("uzina-single-factory"),
+      ) as FactoryRpc & {
+        checkpointAssemblyJournalForTest(requestId: string): unknown;
+      };
+      return Response.json(
+        await factory.checkpointAssemblyJournalForTest(input.requestId),
+      );
+    }
+    if (
+      request.method === "POST" &&
+      url.pathname === "/__test/managed-checkpoint-publication"
+    ) {
+      const input = (await request.json()) as {
+        action: "hold" | "state" | "release" | "attempt";
+        requestId?: string;
+        manifestReference?: string;
+        verification?: ManagedWorkCheckpointClosureVerification;
+      };
+      if (input.action === "hold") {
+        checkpointPublicationHoldRequested = true;
+        checkpointPublicationSummary = undefined;
+        checkpointPublicationSummaryFrozen = false;
+        return Response.json({ held: true });
+      }
+      if (input.action === "state") {
+        return Response.json({
+          entered: checkpointPublicationEntered,
+          verificationFrozen: checkpointPublicationSummaryFrozen,
+          verification: checkpointPublicationSummary,
+        });
+      }
+      if (input.action === "release") {
+        releaseCheckpointPublication?.();
+        return Response.json({ released: true });
+      }
+      if (!input.requestId || !input.manifestReference || !input.verification) {
+        return Response.json({ error: "invalid_test_input" }, { status: 400 });
+      }
+      const factory = environment.FACTORY.get(
+        environment.FACTORY.idFromName("uzina-single-factory"),
+      );
+      try {
+        return Response.json(
+          await factory.publishManagedWorkCheckpoint(
+            input.requestId,
+            input.manifestReference,
+            input.verification,
+          ),
+        );
+      } catch (error) {
+        return Response.json(
+          {
+            error:
+              error instanceof Error ? error.message : "publication_refused",
+          },
+          { status: 409 },
+        );
+      }
+    }
+    if (
+      request.method === "POST" &&
+      url.pathname === "/__test/checkpoint-export-response"
+    ) {
+      const input = (await request.json()) as {
+        action: "lose-next" | "stats" | "allow";
+      };
+      if (input.action === "lose-next") loseNextCheckpointExportResponse = true;
+      if (input.action === "allow")
+        checkpointExportForbiddenThreadId = undefined;
+      return Response.json({
+        attempts: checkpointExportAttempts,
+        lostResponses: lostCheckpointExportResponses,
+      });
+    }
+    if (
+      request.method === "POST" &&
+      url.pathname === "/__test/verify-checkpoint"
+    ) {
+      const input = (await request.json()) as {
+        requestId: string;
+        captureId: string;
+        sourceWorkspaceManifestReference: string;
+        authoritativeWorkspaceReferences: Array<{
+          reference: string;
+          size: number;
+        }>;
+        manifestReference: string;
+        expectedEvidence: FactoryProvenanceEvidence;
+        privateArtifacts: ManagedWorkCheckpointArtifactReference[];
+      };
+      try {
+        const result = await verifyManagedWorkCheckpointClosure({
+          checkpointRequestId: input.requestId,
+          captureId: input.captureId,
+          sourceWorkspaceManifestReference:
+            input.sourceWorkspaceManifestReference,
+          authoritativeWorkspaceReferences:
+            input.authoritativeWorkspaceReferences,
+          manifestReference: input.manifestReference,
+          expectedRuntimeRequirements: [
+            ...MANAGED_WORK_RUNTIME_REQUIREMENTS,
+            "model:uzina-capture-test/capture-test-model",
+            ...MANAGED_REMOTE_TOOL_REQUIREMENTS,
+          ],
+          expectedEvidence: input.expectedEvidence,
+          privateArtifacts: input.privateArtifacts,
+          workspaceStorage: new R2WorkspaceSnapshotStorage(checkpointBucket),
+          privateStorage: new R2ManagedWorkCheckpointStorage(
+            checkpointBucket,
+            input.requestId,
+          ),
+        });
+        return Response.json(result);
+      } catch (error) {
+        return Response.json(
+          { error: error instanceof Error ? error.message : "closure invalid" },
+          { status: 422 },
+        );
+      }
+    }
+    const privateOrphan = url.pathname.match(
+      /^\/__test\/checkpoint-storage\/([^/]+)\/orphan$/,
+    );
+    if (request.method === "POST" && privateOrphan) {
+      const input = (await request.json()) as { bytes: number[] };
+      const storage = new R2ManagedWorkCheckpointStorage(
+        checkpointBucket,
+        decodeURIComponent(privateOrphan[1]!),
+      );
+      return Response.json({
+        reference: await storage.putBlob(new Uint8Array(input.bytes)),
+      });
+    }
+    const privateMutation = url.pathname.match(
+      /^\/__test\/checkpoint-storage\/([^/]+)\/([a-f0-9]{64})\/(delete|replace)$/,
+    );
+    if (request.method === "POST" && privateMutation) {
+      const prefix = await namespacedPrefix(
+        "managed-work-checkpoints",
+        decodeURIComponent(privateMutation[1]!),
+      );
+      const key = `${prefix}${privateMutation[2]}`;
+      if (privateMutation[3] === "delete") {
+        await checkpointBucket.delete(key);
+      } else if (request.body) {
+        await checkpointBucket.put(key, request.body);
+      }
+      return new Response(null, { status: 204 });
+    }
+    const workspaceMutation = url.pathname.match(
+      /^\/__test\/workspace-storage\/([^/]+)\/([a-f0-9]{64})\/(delete|replace)$/,
+    );
+    if (request.method === "POST" && workspaceMutation) {
+      const prefix = await namespacedPrefix(
+        "workspace-snapshots",
+        decodeURIComponent(workspaceMutation[1]!),
+      );
+      const key = `${prefix}${workspaceMutation[2]}`;
+      if (workspaceMutation[3] === "delete") {
+        await checkpointBucket.delete(key);
+      } else if (request.body) {
+        await checkpointBucket.put(key, request.body);
+      }
+      return new Response(null, { status: 204 });
+    }
     if (
       request.method === "POST" &&
       url.pathname === "/__test/managed-work-export"
@@ -429,12 +874,37 @@ export default {
     }
     if (
       request.method === "POST" &&
+      url.pathname === "/__test/managed-effect"
+    ) {
+      const input = (await request.json()) as {
+        threadId: string;
+        taskId: string;
+        callId: string;
+        operation: ExecutionOperation;
+      };
+      const factory = environment.FACTORY.get(
+        environment.FACTORY.idFromName("uzina-single-factory"),
+      );
+      const receipt = await factory.enqueueManagedRemoteExecution(
+        input.threadId,
+        input.taskId,
+        input.callId,
+        input.operation,
+      );
+      return Response.json({ jobId: receipt.jobId, status: receipt.status });
+    }
+    if (
+      request.method === "POST" &&
       url.pathname === "/__test/model-response"
     ) {
       const input = (await request.json()) as {
-        action: "hold" | "release";
+        action: "hold" | "release" | "arm-read-failure";
         threadId: string;
       };
+      if (input.action === "arm-read-failure") {
+        failNextManagedReadToolCall = true;
+        return Response.json({ armed: true });
+      }
       if (input.action === "hold") modelResponseHeld = true;
       else {
         const work = environment.MANAGED_WORK.get(
@@ -449,9 +919,11 @@ export default {
       url.pathname === "/__test/provider-configuration"
     ) {
       const input = (await request.json()) as {
-        mode: "deterministic" | "unusable";
+        mode: "deterministic" | "reconfigured" | "unusable";
       };
       unusableProviderConfiguration = input.mode === "unusable";
+      configuredModelId =
+        input.mode === "reconfigured" ? reconfiguredModel.id : model.id;
       return Response.json({ mode: input.mode });
     }
     if (
@@ -478,6 +950,7 @@ export default {
           | { kind: "close" }
           | { kind: "public-storage-observation" }
           | { kind: "pending-alarm" }
+          | { kind: "clear-source-runtime-profile" }
           | {
               kind: "export" | "export-refusal";
               request: { captureId: string; captureRequestId: string };
@@ -504,6 +977,8 @@ export default {
           return Response.json(await work.publicStorageObservation());
         case "pending-alarm":
           return Response.json(await work.pendingAlarmForTest());
+        case "clear-source-runtime-profile":
+          return Response.json(await work.clearSourceRuntimeProfileForTest());
         case "export": {
           const checkpoint = await work.exportManagedWorkCheckpoint(
             input.operation.request,

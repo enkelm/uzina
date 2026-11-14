@@ -30,12 +30,11 @@ import {
   type CheckpointAttachment,
 } from "./index";
 import {
+  canonicalManagedWorkJson,
   composeManagedWorkBundleFromWorkspace,
+  managedWorkBundleChecksum,
+  parseManagedWorkBundleManifestBytes,
   prepareManagedWorkBundleComposition,
-  MANAGED_WORK_ARTIFACT_MEDIA_TYPE,
-  MANAGED_WORK_BUNDLE_FORMAT,
-  MANAGED_WORK_BUNDLE_VERSION,
-  MANAGED_WORK_PROFILE,
   type CapturedManagedWorkBundle,
   type ManagedWorkBundleCompositionOptions,
   type ManagedWorkBundleManifest,
@@ -102,67 +101,12 @@ export interface RestoredManagedWorkBundle {
   }>;
 }
 
-function canonicalJson(value: unknown): string {
-  if (value === null || typeof value !== "object") {
-    const encoded = JSON.stringify(value);
-    if (encoded === undefined) throw new Error("Bundle contains non-JSON data");
-    return encoded;
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map((entry) => canonicalJson(entry)).join(",")}]`;
-  }
-  const record = value as Record<string, unknown>;
-  return `{${Object.keys(record)
-    .sort()
-    .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
-    .join(",")}}`;
-}
-
 function sha256(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-function bundleChecksum(value: unknown): string {
-  return sha256(Buffer.from(canonicalJson(value), "utf8"));
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function assertBundle(
-  value: unknown,
-): asserts value is ManagedWorkBundleManifest {
-  if (
-    !isRecord(value) ||
-    value.format !== MANAGED_WORK_BUNDLE_FORMAT ||
-    value.version !== MANAGED_WORK_BUNDLE_VERSION ||
-    value.profile !== MANAGED_WORK_PROFILE ||
-    typeof value.sha256 !== "string" ||
-    !isRecord(value.runtime) ||
-    Object.keys(value).some(
-      (key) =>
-        ![
-          "format",
-          "version",
-          "profile",
-          "runtime",
-          "workspaceManifestReference",
-          "workspace",
-          "sha256",
-        ].includes(key),
-    ) ||
-    Object.keys(value.runtime).some(
-      (key) => !["formatVersion", "mediaType", "requirements"].includes(key),
-    ) ||
-    value.runtime.formatVersion !== 1 ||
-    value.runtime.mediaType !== MANAGED_WORK_ARTIFACT_MEDIA_TYPE ||
-    !Array.isArray(value.runtime.requirements) ||
-    typeof value.workspaceManifestReference !== "string" ||
-    !isRecord(value.workspace)
-  ) {
-    throw new Error("Unsupported or malformed coherent managed-work bundle");
-  }
 }
 
 async function readBundle(
@@ -176,33 +120,7 @@ async function readBundle(
   if (bytes.byteLength > WORKSPACE_CHECKPOINT_MANIFEST_MAX_BYTES) {
     throw new Error("Managed-work bundle manifest exceeds its size limit");
   }
-  if (sha256(bytes) !== manifestReference) {
-    throw new Error("Managed-work bundle manifest content hash mismatch");
-  }
-  let value: unknown;
-  try {
-    value = JSON.parse(Buffer.from(bytes).toString("utf8"));
-  } catch {
-    throw new Error("Managed-work bundle manifest is not valid JSON");
-  }
-  assertBundle(value);
-  const { sha256: digest, ...body } = value;
-  if (bundleChecksum(body) !== digest) {
-    throw new Error("Managed-work bundle manifest checksum mismatch");
-  }
-  if (
-    !/^[a-f0-9]{64}$/.test(value.workspaceManifestReference) ||
-    value.runtime.requirements.some(
-      (requirement) => typeof requirement !== "string",
-    ) ||
-    new Set(value.runtime.requirements).size !==
-      value.runtime.requirements.length ||
-    RUNTIME_REQUIREMENTS.some(
-      (requirement) => !value.runtime.requirements.includes(requirement),
-    )
-  ) {
-    throw new Error("Managed-work bundle runtime requirements are unsupported");
-  }
+  const value = parseManagedWorkBundleManifestBytes(bytes, manifestReference);
   const workspaceBytes = await transport.getBlob(
     value.workspaceManifestReference,
   );
@@ -220,7 +138,10 @@ async function readBundle(
   } catch {
     throw new Error("Workspace manifest is not valid JSON");
   }
-  if (canonicalJson(workspaceManifest) !== canonicalJson(value.workspace)) {
+  if (
+    canonicalManagedWorkJson(workspaceManifest) !==
+    canonicalManagedWorkJson(value.workspace)
+  ) {
     throw new Error(
       "Managed-work bundle workspace manifest/reference mismatch",
     );
@@ -393,7 +314,7 @@ async function preparedReceipt(
       value.status !== "prepared-inactive" ||
       value.manifestReference !== manifestReference ||
       value.receiptId !==
-        bundleChecksum({ manifestReference, destinationPath }) ||
+        managedWorkBundleChecksum({ manifestReference, destinationPath }) ||
       typeof value.preparedAt !== "string" ||
       !Number.isFinite(Date.parse(value.preparedAt)) ||
       value.workspacePath !== "workspace" ||
@@ -708,7 +629,7 @@ export async function restoreManagedWorkBundle(
       format: PREPARED_RECEIPT_FORMAT,
       version: 1,
       status: "prepared-inactive",
-      receiptId: bundleChecksum({
+      receiptId: managedWorkBundleChecksum({
         manifestReference: options.manifestReference,
         destinationPath,
       }),

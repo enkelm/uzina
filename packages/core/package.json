@@ -8,6 +8,7 @@
     "./http": "./src/http.ts",
     "./database": "./src/database.ts",
     "./snapshot-storage": "./src/snapshot-storage.ts",
+    "./managed-work-checkpoint-verification": "./src/managed-work-checkpoint-verification.ts",
     "./access": "./src/access.ts",
     "./mcp": "./src/mcp.ts"
   },

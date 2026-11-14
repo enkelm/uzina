@@ -17,6 +17,7 @@ import {
   type ManagedModels,
   type ManagedPiWork,
 } from "@uzina/pi-runtime";
+import { MANAGED_REMOTE_TOOL_REQUIREMENTS } from "@uzina/pi-runtime/tools";
 import { FactoryClient, type FactoryFetch } from "@uzina/client";
 import {
   createRegistry,
@@ -517,9 +518,7 @@ export async function createStandaloneFactoryServer(
             managedWork: await managed.exportCheckpoint(),
             compatibilityRequirements: [
               `model:${options.modelProvider}/${options.modelId}`,
-              "tool:remote_read_file:v1",
-              "tool:remote_write_file:v1",
-              "tool:remote_run_command:v1",
+              ...MANAGED_REMOTE_TOOL_REQUIREMENTS,
             ],
             workspacePath,
             transport,

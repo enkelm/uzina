@@ -5,6 +5,9 @@ import {
 } from "@uzina/contracts";
 import {
   factoryCommandReceiptSchema,
+  factoryProvenanceCommandSchema,
+  factoryProvenanceExecutionEffectSchema,
+  FACTORY_PROVENANCE_EXECUTION_ERROR_CODES,
   accessGrantSchema,
   createThreadRequestSchema,
   discussionEntrySchema,
@@ -19,6 +22,14 @@ import {
   captureControlStatusSchema,
   workspaceSnapshotRequestSchema,
   workspaceSnapshotStatusSchema,
+  managedWorkCheckpointRequestSchema,
+  managedWorkCheckpointStatusSchema,
+  factoryProvenanceEvidenceSchema,
+  type FactoryCommandReceipt,
+  type FactoryProvenanceCommand,
+  type FactoryProvenanceEvidence,
+  type FactoryProvenanceExecutionEffect,
+  type ManagedWorkCheckpointStage,
   workspaceSnapshotClaimRequestSchema,
   workspaceSnapshotClaimSchema,
   workspaceSnapshotReportSchema,
@@ -38,7 +49,6 @@ import {
   type FactoryInvitation,
   type FactoryParticipant,
   type ParticipantRole,
-  type FactoryCommandReceipt,
   type FactoryQueueJob,
   type ManagedRuntimeDispatch,
 } from "@uzina/contracts/factory";
@@ -66,9 +76,11 @@ import {
   type ExecutionRegisterRequest,
   type ExecutionWorkspaceReport,
 } from "@uzina/contracts/execution";
+import { MANAGED_WORK_RUNTIME_REQUIREMENTS } from "@uzina/checkpoints/managed-work-composition";
 import type { FactoryDatabase } from "./database";
 import { initializeFactoryDatabase } from "./database";
 import { FactoryAccessPolicy, type StoredAccessPrincipal } from "./access";
+import { isVerifiedManagedWorkCheckpointClosure } from "./managed-work-checkpoint-verification";
 
 export class FactoryError extends Error {
   constructor(
@@ -185,6 +197,51 @@ type ExecutionWorkspaceRow = {
   ownership_generation: number;
   state: "active" | "fenced";
 };
+export type ManagedWorkCheckpointArtifactRole =
+  "runtime" | "evidence" | "attachment" | "inner-manifest" | "outer-manifest";
+export type ManagedWorkCheckpointArtifactReference = {
+  role: ManagedWorkCheckpointArtifactRole;
+  reference: string;
+  size: number;
+};
+type ManagedWorkCheckpointArtifactRow = {
+  request_id: string;
+  role: ManagedWorkCheckpointArtifactRole;
+  reference: string;
+  size_bytes: number;
+  verified_at: string;
+};
+type ManagedWorkCheckpointRow = {
+  request_id: string;
+  capture_request_id: string;
+  workspace_snapshot_request_id: string;
+  capture_id: string;
+  actor_json: string;
+  project_id: string;
+  thread_id: string;
+  node_id: string;
+  workspace_id: string;
+  ownership_generation: number;
+  status: "assembling" | "available" | "blocked" | "uncertain";
+  stage: ManagedWorkCheckpointStage;
+  accepted_at: string;
+  updated_at: string;
+  manifest_reference: string | null;
+  runtime_requirements_json: string | null;
+};
+type ManagedWorkCheckpointBindingRow = Pick<
+  ManagedWorkCheckpointRow,
+  | "request_id"
+  | "capture_request_id"
+  | "workspace_snapshot_request_id"
+  | "capture_id"
+  | "actor_json"
+  | "project_id"
+  | "thread_id"
+  | "node_id"
+  | "workspace_id"
+  | "ownership_generation"
+>;
 type WorkspaceSnapshotRow = {
   request_id: string;
   capture_request_id: string;
@@ -308,6 +365,100 @@ export type ManagedWorkRuntimeAdmission =
   | Readonly<{ state: "held"; captureId?: string }>;
 
 const NODE_HEARTBEAT_TTL_MS = 90_000;
+const CHECKPOINT_SHA256 = /^[a-f0-9]{64}$/;
+const CHECKPOINT_MANIFEST_MAX_BYTES = 16 * 1024 * 1024;
+const CHECKPOINT_ARTIFACT_MAX_BYTES = 32 * 1024 * 1024;
+const CHECKPOINT_RUNTIME_REQUIREMENTS_MAX = 16;
+
+function normalizeManagedWorkRuntimeRequirements(
+  value: unknown,
+): string[] | undefined {
+  if (
+    !Array.isArray(value) ||
+    value.length <= MANAGED_WORK_RUNTIME_REQUIREMENTS.length ||
+    value.length > CHECKPOINT_RUNTIME_REQUIREMENTS_MAX ||
+    value.some(
+      (requirement) =>
+        typeof requirement !== "string" ||
+        !requirement.trim() ||
+        requirement.length > 256 ||
+        /[\r\n]/.test(requirement),
+    ) ||
+    new Set(value).size !== value.length ||
+    MANAGED_WORK_RUNTIME_REQUIREMENTS.some(
+      (requirement, index) => value[index] !== requirement,
+    )
+  ) {
+    return undefined;
+  }
+  return [...value];
+}
+
+function parsePersistedManagedWorkRuntimeRequirements(
+  value: string | null,
+): string[] | undefined {
+  if (value === null) return undefined;
+  try {
+    return normalizeManagedWorkRuntimeRequirements(JSON.parse(value));
+  } catch {
+    return undefined;
+  }
+}
+
+function validManagedWorkCheckpointTransition(
+  from: ManagedWorkCheckpointStage,
+  to: ManagedWorkCheckpointStage,
+): boolean {
+  return (
+    (from === "admitted" && to === "runtime-export-started") ||
+    (from === "runtime-export-recorded" && to === "evidence-write-started") ||
+    (from === "evidence-recorded" && to === "bundle-compose-started") ||
+    (from === "bundle-composed" && to === "closure-verification-started")
+  );
+}
+
+function validManagedWorkCheckpointArtifactTransition(
+  from: ManagedWorkCheckpointStage,
+  to: ManagedWorkCheckpointStage,
+  artifacts: readonly ManagedWorkCheckpointArtifactReference[],
+  runtimeRequirements?: readonly string[],
+): boolean {
+  if (from === "runtime-export-started" && to === "runtime-export-recorded") {
+    return (
+      artifacts.length === 1 &&
+      artifacts[0]?.role === "runtime" &&
+      normalizeManagedWorkRuntimeRequirements(runtimeRequirements) !== undefined
+    );
+  }
+  if (runtimeRequirements !== undefined) return false;
+  if (from === "evidence-write-started" && to === "evidence-recorded") {
+    return artifacts.length === 1 && artifacts[0]?.role === "evidence";
+  }
+  return (
+    from === "bundle-compose-started" &&
+    to === "bundle-composed" &&
+    artifacts.length === 2 &&
+    artifacts.some((artifact) => artifact.role === "inner-manifest") &&
+    artifacts.some((artifact) => artifact.role === "outer-manifest")
+  );
+}
+
+function validateCheckpointArtifact(
+  artifact: ManagedWorkCheckpointArtifactReference,
+): void {
+  const manifest =
+    artifact.role === "inner-manifest" || artifact.role === "outer-manifest";
+  if (
+    !CHECKPOINT_SHA256.test(artifact.reference) ||
+    !Number.isSafeInteger(artifact.size) ||
+    artifact.size < 0 ||
+    artifact.size >
+      (manifest ? CHECKPOINT_MANIFEST_MAX_BYTES : CHECKPOINT_ARTIFACT_MAX_BYTES)
+  ) {
+    throw new FactoryError(400, "invalid_checkpoint_artifact_reference");
+  }
+}
+
 // Participant cursors occupy a generation-specific range independent of hidden global events.
 const EVENT_CURSOR_RADIX = 1_000_000_000;
 const now = () => new Date().toISOString();
@@ -356,8 +507,12 @@ function notFound(resource: string): FactoryError {
   return new FactoryError(404, "not_found", `${resource} was not found`);
 }
 
-function conflict(code: string, message: string): FactoryError {
+function conflict(code: string, message = code): FactoryError {
   return new FactoryError(409, code, message);
+}
+
+function checkpointConflict(code: string): FactoryError {
+  return new FactoryError(409, code);
 }
 
 function encode<T>(value: T): string {
@@ -1727,6 +1882,646 @@ export class FactoryService {
     if (!row) throw notFound("Workspace snapshot request");
     if (row.actor_json !== encode(session.actor)) throw forbidden();
     return this.#workspaceSnapshotStatus(row);
+  }
+
+  /**
+   * Admit one coherent-checkpoint assembly against an existing held capture and
+   * verified workspace snapshot. Admission records intent only; it starts no export.
+   */
+  async requestManagedWorkCheckpoint(
+    session: FactorySession,
+    threadId: string,
+    request: unknown,
+  ) {
+    this.#requireOwner(session);
+    const input = managedWorkCheckpointRequestSchema.parse(request);
+    const state = await this.getManagedWorkCaptureState(threadId);
+    const result = this.database.transaction(() => {
+      this.#requireOwner(session);
+      const existing = this.#managedWorkCheckpointByRequest(input.requestId);
+      if (existing) {
+        if (
+          existing.actor_json !== encode(session.actor) ||
+          existing.thread_id !== threadId ||
+          existing.capture_request_id !== input.captureRequestId ||
+          existing.workspace_snapshot_request_id !==
+            input.workspaceSnapshotRequestId
+        ) {
+          throw conflict(
+            "managed_work_checkpoint_request_conflict",
+            "The stable checkpoint request ID is already bound to another actor, thread, capture, or snapshot",
+          );
+        }
+        this.#assertManagedWorkCheckpointAuthority(session, existing, state);
+        return existing;
+      }
+
+      const capture = this.#captureControlByRequest(input.captureRequestId);
+      if (!capture || capture.actor_json !== encode(session.actor)) {
+        throw notFound("Owner-held source capture and workspace snapshot");
+      }
+      const captureBinding: ManagedWorkCheckpointBindingRow = {
+        request_id: input.requestId,
+        capture_request_id: input.captureRequestId,
+        workspace_snapshot_request_id: input.workspaceSnapshotRequestId,
+        capture_id: capture.capture_id,
+        actor_json: encode(session.actor),
+        project_id: capture.project_id,
+        thread_id: threadId,
+        node_id: capture.node_id,
+        workspace_id: capture.workspace_id,
+        ownership_generation: capture.ownership_generation,
+      };
+      if (capture.thread_id !== threadId) {
+        throw conflict(
+          "managed_work_checkpoint_binding_mismatch",
+          "The requested capture is not bound to this thread",
+        );
+      }
+      this.#assertManagedWorkCheckpointCaptureState(state, captureBinding);
+      const snapshot = this.#workspaceSnapshotByRequest(
+        input.workspaceSnapshotRequestId,
+      );
+      if (!snapshot || snapshot.actor_json !== encode(session.actor)) {
+        throw conflict(
+          "managed_work_checkpoint_prerequisite_unavailable",
+          "The bound workspace snapshot is not available to this owner",
+        );
+      }
+      if (
+        snapshot.thread_id !== threadId ||
+        snapshot.capture_request_id !== input.captureRequestId ||
+        snapshot.capture_id !== capture.capture_id
+      ) {
+        throw conflict(
+          "managed_work_checkpoint_binding_mismatch",
+          "The requested capture and workspace snapshot are not bound to this thread",
+        );
+      }
+      const alreadyBound = this.database.all<{ request_id: string }>(
+        "SELECT request_id FROM managed_work_checkpoint_requests WHERE capture_id = ? OR capture_request_id = ? OR workspace_snapshot_request_id = ?",
+        [
+          capture.capture_id,
+          input.captureRequestId,
+          input.workspaceSnapshotRequestId,
+        ],
+      )[0];
+      if (alreadyBound) {
+        throw conflict(
+          "managed_work_checkpoint_capture_already_bound",
+          "A source capture may be bound to only one coherent-checkpoint request",
+        );
+      }
+      const binding = {
+        request_id: input.requestId,
+        capture_request_id: input.captureRequestId,
+        workspace_snapshot_request_id: input.workspaceSnapshotRequestId,
+        capture_id: capture.capture_id,
+        actor_json: encode(session.actor),
+        project_id: capture.project_id,
+        thread_id: threadId,
+        node_id: capture.node_id,
+        workspace_id: capture.workspace_id,
+        ownership_generation: capture.ownership_generation,
+      };
+      this.#assertManagedWorkCheckpointPrerequisites(
+        session,
+        binding,
+        capture,
+        snapshot,
+      );
+      this.#assertManagedWorkCheckpointCaptureState(state, binding);
+      const acceptedAt = now();
+      this.database.exec(
+        `INSERT INTO managed_work_checkpoint_requests(
+          request_id, capture_request_id, workspace_snapshot_request_id,
+          capture_id, actor_json, project_id, thread_id, node_id, workspace_id,
+          ownership_generation, status, stage, accepted_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'assembling', 'admitted', ?, ?)`,
+        [
+          input.requestId,
+          input.captureRequestId,
+          input.workspaceSnapshotRequestId,
+          capture.capture_id,
+          encode(session.actor),
+          capture.project_id,
+          threadId,
+          capture.node_id,
+          capture.workspace_id,
+          capture.ownership_generation,
+          acceptedAt,
+          acceptedAt,
+        ],
+      );
+      return this.#managedWorkCheckpointByRequest(input.requestId)!;
+    });
+    return this.#managedWorkCheckpointStatus(result);
+  }
+
+  /** Owner-only read revalidates the original held source authority on every query. */
+  async getManagedWorkCheckpointStatus(
+    session: FactorySession,
+    requestId: string,
+  ) {
+    this.#requireOwner(session);
+    const row = this.#managedWorkCheckpointByRequest(requestId);
+    if (!row) throw notFound("Managed-work checkpoint request");
+    if (row.actor_json !== encode(session.actor)) throw forbidden();
+    const state = await this.getManagedWorkCaptureState(row.thread_id);
+    const current = this.database.transaction(() => {
+      this.#requireOwner(session);
+      const persisted = this.#managedWorkCheckpointByRequest(requestId);
+      if (!persisted) throw notFound("Managed-work checkpoint request");
+      if (persisted.actor_json !== encode(session.actor)) throw forbidden();
+      this.#assertManagedWorkCheckpointAuthority(session, persisted, state);
+      return persisted;
+    });
+    return this.#managedWorkCheckpointStatus(current);
+  }
+
+  /** Trusted FactoryController read; authority is checked before and after bounded projections. */
+  async getManagedWorkCheckpointAssembly(requestId: string) {
+    const initial = this.#managedWorkCheckpointByRequest(requestId);
+    if (!initial) throw notFound("Managed-work checkpoint request");
+    const session = this.#managedWorkCheckpointOwnerSession(initial);
+    const state = await this.getManagedWorkCaptureState(initial.thread_id);
+    const source = this.database.transaction(() => {
+      const row = this.#managedWorkCheckpointByRequest(requestId);
+      if (!row) throw notFound("Managed-work checkpoint request");
+      if (row.actor_json !== encode(session.actor)) throw forbidden();
+      this.#assertManagedWorkCheckpointAuthority(session, row, state);
+      const capture = this.#captureControlByRequest(row.capture_request_id);
+      const snapshot = this.#workspaceSnapshotByRequest(
+        row.workspace_snapshot_request_id,
+      );
+      if (
+        !capture?.report_json ||
+        !capture.report_sha256 ||
+        !snapshot?.report_json ||
+        !snapshot.manifest_reference ||
+        !snapshot.report_sha256
+      ) {
+        throw checkpointConflict(
+          "managed_work_checkpoint_prerequisite_unavailable",
+        );
+      }
+      return { row, capture, snapshot };
+    });
+    const { row, capture, snapshot } = source;
+    const runtimeRequirements = parsePersistedManagedWorkRuntimeRequirements(
+      row.runtime_requirements_json,
+    );
+    if (
+      row.stage !== "admitted" &&
+      row.stage !== "runtime-export-started" &&
+      !runtimeRequirements
+    ) {
+      throw checkpointConflict(
+        "managed_work_checkpoint_prerequisite_unavailable",
+      );
+    }
+    const captureReport = executionCaptureControlReportSchema.parse(
+      JSON.parse(capture.report_json!),
+    );
+    const snapshotReport = workspaceSnapshotReportSchema.parse(
+      JSON.parse(snapshot.report_json!),
+    );
+    if (
+      captureReport.status !== "source-capture-fenced" ||
+      captureReport.requestId !== row.capture_request_id ||
+      captureReport.captureId !== row.capture_id ||
+      captureReport.nodeId !== row.node_id ||
+      captureReport.target.workspaceId !== row.workspace_id ||
+      captureReport.ownershipGeneration !== row.ownership_generation ||
+      !captureReport.sourceFence ||
+      snapshotReport.status !== "workspace-checkpoint-available" ||
+      snapshotReport.requestId !== row.workspace_snapshot_request_id ||
+      snapshotReport.captureRequestId !== row.capture_request_id ||
+      snapshotReport.captureId !== row.capture_id ||
+      snapshotReport.nodeId !== row.node_id ||
+      snapshotReport.target.workspaceId !== row.workspace_id ||
+      snapshotReport.ownershipGeneration !== row.ownership_generation ||
+      snapshotReport.manifestReference !== snapshot.manifest_reference
+    ) {
+      throw checkpointConflict(
+        "managed_work_checkpoint_prerequisite_unavailable",
+      );
+    }
+    const projected = this.#boundedManagedWorkCheckpointCommands(
+      row.thread_id,
+      row,
+    );
+    const evidenceHeader = {
+      contractVersion: CONTRACT_VERSION,
+      format: "uzina-factory-managed-work-provenance" as const,
+      version: 1 as const,
+      checkpointRequestId: row.request_id,
+      threadId: row.thread_id,
+      projectId: row.project_id,
+      capture: {
+        requestId: row.capture_request_id,
+        captureId: row.capture_id,
+        controlId: captureReport.controlId,
+        target: { nodeId: row.node_id, workspaceId: row.workspace_id },
+        ownershipGeneration: row.ownership_generation,
+        reportSha256: capture.report_sha256!,
+        sourceFence: captureReport.sourceFence,
+      },
+      workspaceSnapshot: {
+        requestId: row.workspace_snapshot_request_id,
+        snapshotId: snapshot.snapshot_id,
+        captureId: row.capture_id,
+        status: snapshot.status,
+        manifestReference: snapshot.manifest_reference!,
+        reportSha256: snapshot.report_sha256!,
+      },
+    };
+    const evidenceShell = {
+      ...evidenceHeader,
+      commands: [] as FactoryProvenanceCommand[],
+    };
+    const encoder = new TextEncoder();
+    const shellBytes = encoder.encode(JSON.stringify(evidenceShell)).byteLength;
+    const projectedEvidenceBytes = shellBytes - 2 + projected.serializedBytes;
+    if (projectedEvidenceBytes > 32 * 1024 * 1024) {
+      throw checkpointConflict("managed_work_checkpoint_evidence_limit");
+    }
+    const evidence: FactoryProvenanceEvidence =
+      factoryProvenanceEvidenceSchema.parse({
+        ...evidenceHeader,
+        commands: projected.commands,
+      });
+    const evidenceBytes = encoder.encode(JSON.stringify(evidence));
+    if (
+      evidenceBytes.byteLength > 32 * 1024 * 1024 ||
+      evidenceBytes.byteLength !== projectedEvidenceBytes
+    ) {
+      throw checkpointConflict("managed_work_checkpoint_evidence_limit");
+    }
+    return this.database.transaction(() => {
+      const current = this.#managedWorkCheckpointByRequest(requestId);
+      if (!current) throw notFound("Managed-work checkpoint request");
+      if (current.actor_json !== encode(session.actor)) throw forbidden();
+      this.#assertManagedWorkCheckpointAuthority(session, current, state);
+      const currentCapture = this.#captureControlByRequest(
+        current.capture_request_id,
+      );
+      const currentSnapshot = this.#workspaceSnapshotByRequest(
+        current.workspace_snapshot_request_id,
+      );
+      if (
+        current.capture_id !== row.capture_id ||
+        currentCapture?.report_sha256 !== capture.report_sha256 ||
+        currentSnapshot?.manifest_reference !== snapshot.manifest_reference ||
+        currentSnapshot?.report_sha256 !== snapshot.report_sha256
+      ) {
+        throw checkpointConflict(
+          "managed_work_checkpoint_prerequisite_unavailable",
+        );
+      }
+      const workspaceReferences = this.database.all<{
+        reference: string;
+        size_bytes: number;
+      }>(
+        "SELECT reference, size_bytes FROM workspace_snapshot_blobs WHERE capture_id = ? ORDER BY reference",
+        [current.capture_id],
+      );
+      const artifacts = this.database.all<ManagedWorkCheckpointArtifactRow>(
+        "SELECT * FROM managed_work_checkpoint_artifacts WHERE request_id = ? ORDER BY role, reference",
+        [requestId],
+      );
+      return {
+        request: this.#managedWorkCheckpointStatus(current),
+        ...(runtimeRequirements ? { runtimeRequirements } : {}),
+        sourceWorkspaceManifestReference: currentSnapshot!.manifest_reference!,
+        authoritativeWorkspaceReferences: workspaceReferences.map((blob) => ({
+          reference: blob.reference,
+          size: blob.size_bytes,
+        })),
+        evidence,
+        evidenceBytes,
+        privateArtifacts: artifacts.map((artifact) => ({
+          role: artifact.role,
+          reference: artifact.reference,
+          size: artifact.size_bytes,
+        })),
+      };
+    });
+  }
+
+  /** Internal assembly recovery scans only a bounded batch of persisted receipts. */
+  listManagedWorkCheckpointAssemblies(limit = 32): string[] {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 32) {
+      throw new FactoryError(400, "invalid_checkpoint_batch_limit");
+    }
+    return this.database
+      .all<{ request_id: string }>(
+        "SELECT request_id FROM managed_work_checkpoint_requests WHERE status = 'assembling' ORDER BY accepted_at, request_id LIMIT ?",
+        [limit],
+      )
+      .map((row) => row.request_id);
+  }
+
+  /** Starts one persisted effect phase after rechecking the live source authority. */
+  async beginManagedWorkCheckpointStage(
+    requestId: string,
+    expectedStage: ManagedWorkCheckpointStage,
+    nextStage: ManagedWorkCheckpointStage,
+  ): Promise<void> {
+    if (!validManagedWorkCheckpointTransition(expectedStage, nextStage)) {
+      throw new FactoryError(400, "invalid_checkpoint_stage_transition");
+    }
+    const row = this.#managedWorkCheckpointByRequest(requestId);
+    if (!row) throw notFound("Managed-work checkpoint request");
+    const session = this.#managedWorkCheckpointOwnerSession(row);
+    const state = await this.getManagedWorkCaptureState(row.thread_id);
+    this.database.transaction(() => {
+      const current = this.#managedWorkCheckpointByRequest(requestId);
+      if (!current) throw notFound("Managed-work checkpoint request");
+      this.#assertManagedWorkCheckpointAuthority(session, current, state);
+      if (current.status !== "assembling" || current.stage !== expectedStage) {
+        throw conflict("managed_work_checkpoint_stage_conflict");
+      }
+      this.database.exec(
+        "UPDATE managed_work_checkpoint_requests SET stage = ?, updated_at = ? WHERE request_id = ? AND status = 'assembling' AND stage = ?",
+        [nextStage, now(), requestId, expectedStage],
+      );
+    });
+  }
+
+  /** Records verified immutable output refs atomically with their completed stage. */
+  async recordManagedWorkCheckpointArtifacts(
+    requestId: string,
+    expectedStage: ManagedWorkCheckpointStage,
+    nextStage: ManagedWorkCheckpointStage,
+    artifacts: readonly ManagedWorkCheckpointArtifactReference[],
+    runtimeRequirements?: readonly string[],
+  ): Promise<void> {
+    const normalizedRuntimeRequirements =
+      normalizeManagedWorkRuntimeRequirements(runtimeRequirements);
+    if (
+      !validManagedWorkCheckpointArtifactTransition(
+        expectedStage,
+        nextStage,
+        artifacts,
+        runtimeRequirements,
+      )
+    ) {
+      throw new FactoryError(400, "invalid_checkpoint_artifact_transition");
+    }
+    const row = this.#managedWorkCheckpointByRequest(requestId);
+    if (!row) throw notFound("Managed-work checkpoint request");
+    const session = this.#managedWorkCheckpointOwnerSession(row);
+    const state = await this.getManagedWorkCaptureState(row.thread_id);
+    this.database.transaction(() => {
+      const current = this.#managedWorkCheckpointByRequest(requestId);
+      if (!current) throw notFound("Managed-work checkpoint request");
+      this.#assertManagedWorkCheckpointAuthority(session, current, state);
+      if (current.status !== "assembling" || current.stage !== expectedStage) {
+        throw conflict("managed_work_checkpoint_stage_conflict");
+      }
+      const timestamp = now();
+      if (
+        nextStage === "runtime-export-recorded" &&
+        current.runtime_requirements_json !== null
+      ) {
+        throw conflict("managed_work_checkpoint_runtime_requirements_conflict");
+      }
+      for (const artifact of artifacts) {
+        validateCheckpointArtifact(artifact);
+        const prior = this.database.all<ManagedWorkCheckpointArtifactRow>(
+          "SELECT * FROM managed_work_checkpoint_artifacts WHERE request_id = ? AND role = ? AND reference = ?",
+          [requestId, artifact.role, artifact.reference],
+        )[0];
+        if (prior && prior.size_bytes !== artifact.size) {
+          throw conflict("managed_work_checkpoint_artifact_conflict");
+        }
+        if (!prior) {
+          this.database.exec(
+            "INSERT INTO managed_work_checkpoint_artifacts(request_id, role, reference, size_bytes, verified_at) VALUES (?, ?, ?, ?, ?)",
+            [
+              requestId,
+              artifact.role,
+              artifact.reference,
+              artifact.size,
+              timestamp,
+            ],
+          );
+        }
+      }
+      if (nextStage === "runtime-export-recorded") {
+        if (!normalizedRuntimeRequirements) {
+          throw new FactoryError(
+            400,
+            "invalid_checkpoint_runtime_requirements",
+          );
+        }
+        this.database.exec(
+          "UPDATE managed_work_checkpoint_requests SET stage = ?, runtime_requirements_json = ?, updated_at = ? WHERE request_id = ? AND status = 'assembling' AND stage = ?",
+          [
+            nextStage,
+            JSON.stringify(normalizedRuntimeRequirements),
+            timestamp,
+            requestId,
+            expectedStage,
+          ],
+        );
+      } else {
+        this.database.exec(
+          "UPDATE managed_work_checkpoint_requests SET stage = ?, updated_at = ? WHERE request_id = ? AND status = 'assembling' AND stage = ?",
+          [nextStage, timestamp, requestId, expectedStage],
+        );
+      }
+    });
+  }
+
+  /** Terminally refuses an assembly without ever exposing a manifest reference. */
+  markManagedWorkCheckpointOutcome(
+    requestId: string,
+    outcome: "blocked" | "uncertain",
+  ): void {
+    this.database.transaction(() => {
+      const row = this.#managedWorkCheckpointByRequest(requestId);
+      if (!row) throw notFound("Managed-work checkpoint request");
+      if (row.status === "available") return;
+      if (row.status !== "assembling") return;
+      this.database.exec(
+        "UPDATE managed_work_checkpoint_requests SET status = ?, manifest_reference = NULL, updated_at = ? WHERE request_id = ? AND status = 'assembling'",
+        [outcome, now(), requestId],
+      );
+    });
+  }
+
+  /** Only the trusted controller may publish a closure verified against these persisted rows. */
+  async publishManagedWorkCheckpoint(
+    requestId: string,
+    manifestReference: string,
+    verification: unknown,
+  ) {
+    const row = this.#managedWorkCheckpointByRequest(requestId);
+    if (!row) throw notFound("Managed-work checkpoint request");
+    const session = this.#managedWorkCheckpointOwnerSession(row);
+    const state = await this.getManagedWorkCaptureState(row.thread_id);
+    return this.database.transaction(() => {
+      const current = this.#managedWorkCheckpointByRequest(requestId);
+      if (!current) throw notFound("Managed-work checkpoint request");
+      this.#assertManagedWorkCheckpointAuthority(session, current, state);
+      if (current.status === "available") {
+        if (current.manifest_reference !== manifestReference) {
+          throw conflict("managed_work_checkpoint_publication_conflict");
+        }
+        return this.#managedWorkCheckpointStatus(current);
+      }
+      if (
+        current.status !== "assembling" ||
+        current.stage !== "closure-verification-started" ||
+        !/^[a-f0-9]{64}$/.test(manifestReference)
+      ) {
+        throw conflict("managed_work_checkpoint_verification_mismatch");
+      }
+      const snapshot = this.#workspaceSnapshotByRequest(
+        current.workspace_snapshot_request_id,
+      );
+      if (!snapshot?.manifest_reference) {
+        throw conflict("managed_work_checkpoint_verification_mismatch");
+      }
+      const workspaceTotals = this.database.all<{
+        count: number;
+        total_size: number | null;
+      }>(
+        "SELECT COUNT(*) AS count, SUM(size_bytes) AS total_size FROM workspace_snapshot_blobs WHERE capture_id = ?",
+        [current.capture_id],
+      )[0];
+      const workspaceReferences = this.database.all<{
+        reference: string;
+        size_bytes: number;
+      }>(
+        "SELECT reference, size_bytes FROM workspace_snapshot_blobs WHERE capture_id = ? ORDER BY reference",
+        [current.capture_id],
+      );
+      const privateRows = this.database.all<ManagedWorkCheckpointArtifactRow>(
+        "SELECT * FROM managed_work_checkpoint_artifacts WHERE request_id = ? ORDER BY role, reference",
+        [requestId],
+      );
+      const runtimeRequirements = parsePersistedManagedWorkRuntimeRequirements(
+        current.runtime_requirements_json,
+      );
+      if (!runtimeRequirements) {
+        throw conflict("managed_work_checkpoint_verification_mismatch");
+      }
+      const privateObjects = new Map<string, number>();
+      for (const artifact of privateRows) {
+        const existing = privateObjects.get(artifact.reference);
+        if (existing !== undefined && existing !== artifact.size_bytes) {
+          throw conflict("managed_work_checkpoint_artifact_conflict");
+        }
+        privateObjects.set(artifact.reference, artifact.size_bytes);
+      }
+      if (
+        !isVerifiedManagedWorkCheckpointClosure(verification, {
+          checkpointRequestId: current.request_id,
+          captureId: current.capture_id,
+          sourceWorkspaceManifestReference: snapshot.manifest_reference,
+          manifestReference,
+          authoritativeWorkspaceReferences: workspaceReferences.map((blob) => ({
+            reference: blob.reference,
+            size: blob.size_bytes,
+          })),
+          expectedRuntimeRequirements: runtimeRequirements,
+          privateArtifacts: privateRows.map((artifact) => ({
+            role: artifact.role,
+            reference: artifact.reference,
+            size: artifact.size_bytes,
+          })),
+        })
+      ) {
+        throw conflict("managed_work_checkpoint_verification_mismatch");
+      }
+      const workspaceCount = Number(workspaceTotals?.count ?? 0);
+      const workspaceBytes = Number(workspaceTotals?.total_size ?? 0);
+      const privateBytes = [...privateObjects.values()].reduce(
+        (sum, size) => sum + size,
+        0,
+      );
+      const totalBytes = workspaceBytes + privateBytes;
+      if (
+        !workspaceTotals ||
+        !Number.isSafeInteger(workspaceCount) ||
+        !Number.isSafeInteger(workspaceBytes) ||
+        !Number.isSafeInteger(privateBytes) ||
+        workspaceCount !== verification.workspaceObjectCount ||
+        privateObjects.size !== verification.privateObjectCount ||
+        totalBytes !== verification.totalBytes ||
+        totalBytes > 512 * 1024 * 1024 ||
+        !privateRows.some(
+          (artifact) =>
+            artifact.role === "outer-manifest" &&
+            artifact.reference === manifestReference,
+        )
+      ) {
+        throw conflict("managed_work_checkpoint_verification_mismatch");
+      }
+      const timestamp = now();
+      this.database.exec(
+        "UPDATE managed_work_checkpoint_requests SET status = 'available', stage = 'available', manifest_reference = ?, updated_at = ? WHERE request_id = ? AND status = 'assembling' AND stage = 'closure-verification-started'",
+        [manifestReference, timestamp, requestId],
+      );
+      const published = this.#managedWorkCheckpointByRequest(requestId);
+      if (!published) throw notFound("Managed-work checkpoint request");
+      return this.#managedWorkCheckpointStatus(published);
+    });
+  }
+
+  /** Owner-only allowlist for one final binary response. */
+  async getAuthorizedManagedWorkCheckpointBlob(
+    session: FactorySession,
+    requestId: string,
+    reference: string,
+  ) {
+    this.#requireOwner(session);
+    const row = this.#managedWorkCheckpointByRequest(requestId);
+    if (!row) throw notFound("Managed-work checkpoint request");
+    if (row.actor_json !== encode(session.actor)) throw forbidden();
+    const state = await this.getManagedWorkCaptureState(row.thread_id);
+    return this.database.transaction(() => {
+      this.#requireOwner(session);
+      const current = this.#managedWorkCheckpointByRequest(requestId);
+      if (!current) throw notFound("Managed-work checkpoint request");
+      if (current.actor_json !== encode(session.actor)) throw forbidden();
+      this.#assertManagedWorkCheckpointAuthority(session, current, state);
+      if (current.status !== "available" || !current.manifest_reference) {
+        throw notFound("Available managed-work checkpoint blob");
+      }
+      const privateArtifact =
+        this.database.all<ManagedWorkCheckpointArtifactRow>(
+          "SELECT * FROM managed_work_checkpoint_artifacts WHERE request_id = ? AND reference = ? LIMIT 1",
+          [requestId, reference],
+        )[0];
+      if (privateArtifact) {
+        return {
+          scope: "private" as const,
+          requestId,
+          captureId: current.capture_id,
+          reference,
+          size: privateArtifact.size_bytes,
+        };
+      }
+      const workspaceBlob = this.database.all<{
+        reference: string;
+        size_bytes: number;
+      }>(
+        "SELECT reference, size_bytes FROM workspace_snapshot_blobs WHERE capture_id = ? AND reference = ?",
+        [current.capture_id, reference],
+      )[0];
+      if (!workspaceBlob) throw notFound("Managed-work checkpoint blob");
+      return {
+        scope: "workspace" as const,
+        requestId,
+        captureId: current.capture_id,
+        reference,
+        size: workspaceBlob.size_bytes,
+      };
+    });
   }
 
   claimWorkspaceSnapshot(
@@ -3578,6 +4373,472 @@ export class FactoryService {
         "A managed-work capture is already active for this work or workspace",
       );
     }
+  }
+
+  #managedWorkCheckpointOwnerSession(
+    row: ManagedWorkCheckpointRow,
+  ): FactorySession {
+    const actor = parseActor(row.actor_json);
+    if (actor.kind !== "human") {
+      throw new FactoryError(
+        403,
+        "forbidden",
+        "Managed-work checkpoint assembly requires its owner actor",
+      );
+    }
+    const credential = this.database.all<{ credential_id: string }>(
+      "SELECT credential_id FROM credentials WHERE actor_json = ? AND revoked_at IS NULL ORDER BY created_at LIMIT 1",
+      [row.actor_json],
+    )[0];
+    if (!credential) throw forbidden();
+    return { credentialId: credential.credential_id, actor };
+  }
+
+  #boundedManagedWorkCheckpointCommands(
+    threadId: string,
+    binding: ManagedWorkCheckpointBindingRow,
+  ): { commands: FactoryProvenanceCommand[]; serializedBytes: number } {
+    const maxRecords = 100_000;
+    const maxEvidenceBytes = 32 * 1024 * 1024;
+    const totals = this.database.all<{
+      command_receipt_count: number;
+      command_count: number;
+      command_bytes: number | null;
+      command_unsettled: number;
+      command_binding_mismatches: number;
+      effect_count: number;
+      effect_bytes: number | null;
+      effect_unsettled: number;
+      effect_unsupported_error_codes: number;
+      effect_completed_with_error_code: number;
+      effect_separators: number | null;
+    }>(
+      `WITH command_projection AS (
+         SELECT cr.request_id, cr.job_id, cr.thread_id, cr.payload_hash,
+           cr.accepted_at, di.project_id, di.node_id, di.workspace_id,
+           di.ownership_generation, di.payload_hash AS dispatch_payload_hash,
+           di.status AS dispatch_status, di.updated_at AS settled_at,
+           json_object(
+             'contractVersion', ${CONTRACT_VERSION},
+             'requestId', cr.request_id,
+             'jobId', cr.job_id,
+             'threadId', cr.thread_id,
+             'target', json_object('nodeId', di.node_id, 'workspaceId', di.workspace_id),
+             'ownershipGeneration', di.ownership_generation,
+             'payloadSha256', cr.payload_hash,
+             'dispatchStatus', di.status,
+             'acceptedAt', cr.accepted_at,
+             'settledAt', di.updated_at,
+             'executionEffects', json('[]')
+           ) AS projected_json
+         FROM command_receipts cr
+         JOIN dispatch_intents di ON di.request_id = cr.request_id
+         WHERE cr.thread_id = ?
+       ), effect_projection AS (
+         SELECT ej.request_id, ej.job_id, ej.node_id, ej.workspace_id,
+           ej.ownership_generation, ej.operation, ej.payload_sha256, ej.status,
+           ej.accepted_at, ej.finished_at, ej.error_code,
+           json_object(
+             'contractVersion', ${CONTRACT_VERSION},
+             'jobId', ej.job_id,
+             'nodeId', ej.node_id,
+             'target', json_object('nodeId', ej.node_id, 'workspaceId', ej.workspace_id),
+             'ownershipGeneration', ej.ownership_generation,
+             'operation', ej.operation,
+             'payloadSha256', ej.payload_sha256,
+             'status', ej.status,
+             'acceptedAt', ej.accepted_at,
+             'finishedAt', ej.finished_at,
+             'errorCode', ej.error_code
+           ) AS projected_json
+         FROM execution_jobs ej
+         JOIN command_receipts cr ON cr.request_id = ej.request_id
+         WHERE cr.thread_id = ?
+       ), effect_groups AS (
+         SELECT request_id, COUNT(*) AS effect_count
+         FROM effect_projection GROUP BY request_id
+       )
+       SELECT
+         (SELECT COUNT(*) FROM command_receipts WHERE thread_id = ?)
+           AS command_receipt_count,
+         (SELECT COUNT(*) FROM command_projection) AS command_count,
+         (SELECT COALESCE(SUM(length(CAST(projected_json AS BLOB))), 0)
+          FROM command_projection) AS command_bytes,
+         (SELECT COALESCE(SUM(CASE WHEN dispatch_status NOT IN ('completed', 'failed')
+              THEN 1 ELSE 0 END), 0) FROM command_projection) AS command_unsettled,
+         (SELECT COALESCE(SUM(CASE WHEN payload_hash <> dispatch_payload_hash
+              OR project_id <> ? OR thread_id <> ? OR node_id <> ? OR workspace_id <> ?
+              OR ownership_generation <> ? THEN 1 ELSE 0 END), 0)
+          FROM command_projection) AS command_binding_mismatches,
+         (SELECT COUNT(*) FROM effect_projection) AS effect_count,
+         (SELECT COALESCE(SUM(length(CAST(projected_json AS BLOB))), 0)
+          FROM effect_projection) AS effect_bytes,
+         (SELECT COALESCE(SUM(CASE WHEN status NOT IN ('completed', 'failed')
+              OR finished_at IS NULL THEN 1 ELSE 0 END), 0)
+          FROM effect_projection) AS effect_unsettled,
+         (SELECT COALESCE(SUM(CASE WHEN error_code IS NOT NULL
+              AND error_code NOT IN (${FACTORY_PROVENANCE_EXECUTION_ERROR_CODES.map(() => "?").join(", ")})
+              THEN 1 ELSE 0 END), 0)
+          FROM effect_projection) AS effect_unsupported_error_codes,
+         (SELECT COALESCE(SUM(CASE WHEN status = 'completed'
+              AND error_code IS NOT NULL THEN 1 ELSE 0 END), 0)
+          FROM effect_projection) AS effect_completed_with_error_code,
+         (SELECT COALESCE(SUM(CASE WHEN effect_count > 1
+              THEN effect_count - 1 ELSE 0 END), 0) FROM effect_groups)
+           AS effect_separators`,
+      [
+        threadId,
+        threadId,
+        threadId,
+        binding.project_id,
+        binding.thread_id,
+        binding.node_id,
+        binding.workspace_id,
+        binding.ownership_generation,
+        ...FACTORY_PROVENANCE_EXECUTION_ERROR_CODES,
+      ],
+    )[0];
+    const commandCount = Number(totals?.command_count ?? -1);
+    const effectCount = Number(totals?.effect_count ?? -1);
+    const projectedBytes =
+      Number(totals?.command_bytes ?? Number.NaN) +
+      Number(totals?.effect_bytes ?? Number.NaN) +
+      Number(totals?.effect_separators ?? Number.NaN) +
+      Math.max(0, commandCount - 1) +
+      16_384;
+    if (
+      !totals ||
+      !Number.isSafeInteger(commandCount) ||
+      !Number.isSafeInteger(effectCount) ||
+      Number(totals.command_receipt_count) !== commandCount ||
+      commandCount > maxRecords ||
+      effectCount > maxRecords ||
+      totals.command_unsettled !== 0 ||
+      totals.command_binding_mismatches !== 0 ||
+      totals.effect_unsettled !== 0 ||
+      !Number.isSafeInteger(projectedBytes) ||
+      projectedBytes > maxEvidenceBytes
+    ) {
+      throw checkpointConflict("managed_work_checkpoint_evidence_limit");
+    }
+    if (
+      totals.effect_unsupported_error_codes !== 0 ||
+      totals.effect_completed_with_error_code !== 0
+    ) {
+      throw checkpointConflict(
+        "managed_work_checkpoint_unsupported_effect_error_code",
+      );
+    }
+
+    const commandRows = this.database.all<{
+      request_id: string;
+      job_id: string;
+      thread_id: string;
+      project_id: string;
+      node_id: string;
+      workspace_id: string;
+      ownership_generation: number;
+      payload_hash: string;
+      dispatch_payload_hash: string;
+      dispatch_status: string;
+      accepted_at: string;
+      settled_at: string;
+    }>(
+      `SELECT cr.request_id, cr.job_id, cr.thread_id, di.project_id, di.node_id,
+         di.workspace_id, di.ownership_generation, cr.payload_hash,
+         di.payload_hash AS dispatch_payload_hash, di.status AS dispatch_status,
+         cr.accepted_at, di.updated_at AS settled_at
+       FROM command_receipts cr
+       JOIN dispatch_intents di ON di.request_id = cr.request_id
+       WHERE cr.thread_id = ? ORDER BY cr.accepted_at, cr.request_id LIMIT ?`,
+      [threadId, maxRecords + 1],
+    );
+    const effectRows = this.database.all<{
+      request_id: string | null;
+      job_id: string;
+      node_id: string;
+      workspace_id: string;
+      ownership_generation: number;
+      operation: string;
+      payload_sha256: string;
+      status: string;
+      accepted_at: string;
+      finished_at: string | null;
+      error_code: string | null;
+    }>(
+      `SELECT ej.request_id, ej.job_id, ej.node_id, ej.workspace_id,
+         ej.ownership_generation, ej.operation, ej.payload_sha256, ej.status,
+         ej.accepted_at, ej.finished_at, ej.error_code
+       FROM execution_jobs ej
+       JOIN command_receipts cr ON cr.request_id = ej.request_id
+       WHERE cr.thread_id = ? ORDER BY ej.accepted_at, ej.job_id LIMIT ?`,
+      [threadId, maxRecords + 1],
+    );
+    if (
+      commandRows.length !== commandCount ||
+      effectRows.length !== effectCount
+    ) {
+      throw checkpointConflict("managed_work_checkpoint_evidence_limit");
+    }
+
+    const effectsByRequest = new Map<
+      string,
+      FactoryProvenanceExecutionEffect[]
+    >();
+    for (const row of effectRows) {
+      if (
+        !row.request_id ||
+        (row.status !== "completed" && row.status !== "failed") ||
+        !row.finished_at ||
+        row.node_id !== binding.node_id ||
+        row.workspace_id !== binding.workspace_id ||
+        row.ownership_generation !== binding.ownership_generation
+      ) {
+        throw checkpointConflict("managed_work_checkpoint_unsettled_effect");
+      }
+      const effect = factoryProvenanceExecutionEffectSchema.parse({
+        contractVersion: CONTRACT_VERSION,
+        jobId: row.job_id,
+        nodeId: row.node_id,
+        target: { nodeId: row.node_id, workspaceId: row.workspace_id },
+        ownershipGeneration: row.ownership_generation,
+        operation: row.operation,
+        payloadSha256: row.payload_sha256,
+        status: row.status,
+        acceptedAt: row.accepted_at,
+        finishedAt: row.finished_at,
+        errorCode: row.error_code,
+      });
+      const list = effectsByRequest.get(row.request_id) ?? [];
+      list.push(effect);
+      effectsByRequest.set(row.request_id, list);
+    }
+
+    const commands: FactoryProvenanceCommand[] = [];
+    const encoder = new TextEncoder();
+    let serializedBytes = 2;
+    for (const row of commandRows) {
+      if (
+        row.thread_id !== binding.thread_id ||
+        row.project_id !== binding.project_id ||
+        row.node_id !== binding.node_id ||
+        row.workspace_id !== binding.workspace_id ||
+        row.ownership_generation !== binding.ownership_generation ||
+        row.payload_hash !== row.dispatch_payload_hash ||
+        (row.dispatch_status !== "completed" &&
+          row.dispatch_status !== "failed")
+      ) {
+        throw checkpointConflict("managed_work_checkpoint_unsettled_command");
+      }
+      const command = factoryProvenanceCommandSchema.parse({
+        contractVersion: CONTRACT_VERSION,
+        requestId: row.request_id,
+        jobId: row.job_id,
+        threadId: row.thread_id,
+        target: { nodeId: row.node_id, workspaceId: row.workspace_id },
+        ownershipGeneration: row.ownership_generation,
+        payloadSha256: row.payload_hash,
+        dispatchStatus: row.dispatch_status,
+        acceptedAt: row.accepted_at,
+        settledAt: row.settled_at,
+        executionEffects: effectsByRequest.get(row.request_id) ?? [],
+      });
+      const commandBytes = encoder.encode(JSON.stringify(command)).byteLength;
+      serializedBytes += commandBytes + (commands.length === 0 ? 0 : 1);
+      if (serializedBytes + 16_384 > maxEvidenceBytes) {
+        throw checkpointConflict("managed_work_checkpoint_evidence_limit");
+      }
+      commands.push(command);
+    }
+    return { commands, serializedBytes };
+  }
+
+  #managedWorkCheckpointByRequest(
+    requestId: string,
+  ): ManagedWorkCheckpointRow | undefined {
+    return this.database.all<ManagedWorkCheckpointRow>(
+      "SELECT * FROM managed_work_checkpoint_requests WHERE request_id = ?",
+      [requestId],
+    )[0];
+  }
+
+  #managedWorkCheckpointStatus(row: ManagedWorkCheckpointRow) {
+    return managedWorkCheckpointStatusSchema.parse({
+      contractVersion: CONTRACT_VERSION,
+      requestId: row.request_id,
+      captureRequestId: row.capture_request_id,
+      workspaceSnapshotRequestId: row.workspace_snapshot_request_id,
+      captureId: row.capture_id,
+      threadId: row.thread_id,
+      target: { nodeId: row.node_id, workspaceId: row.workspace_id },
+      ownershipGeneration: row.ownership_generation,
+      status: row.status,
+      stage: row.stage,
+      acceptedAt: row.accepted_at,
+      updatedAt: row.updated_at,
+      ...(row.status === "available" && row.manifest_reference
+        ? { manifestReference: row.manifest_reference }
+        : {}),
+    });
+  }
+
+  #assertManagedWorkCheckpointAuthority(
+    session: FactorySession,
+    receipt: ManagedWorkCheckpointBindingRow,
+    state: ManagedWorkCaptureState,
+  ): void {
+    this.#assertManagedWorkCheckpointPrerequisites(
+      session,
+      receipt,
+      this.#captureControlByRequest(receipt.capture_request_id),
+      this.#workspaceSnapshotByRequest(receipt.workspace_snapshot_request_id),
+    );
+    this.#assertManagedWorkCheckpointCaptureState(state, receipt);
+  }
+
+  #assertManagedWorkCheckpointPrerequisites(
+    session: FactorySession,
+    binding: ManagedWorkCheckpointBindingRow,
+    capture: CaptureControlRow | undefined,
+    snapshot: WorkspaceSnapshotRow | undefined,
+  ): void {
+    const ownerId = this.#requireOwner(session);
+    if (
+      session.actor.kind !== "human" ||
+      binding.actor_json !== encode(session.actor) ||
+      !capture ||
+      !snapshot
+    ) {
+      throw notFound("Owner-held source capture and workspace snapshot");
+    }
+    const lock = this.database.all<{
+      capture_id: string;
+      thread_id: string;
+      workspace_id: string;
+      owner_id: string;
+    }>(
+      "SELECT capture_id, thread_id, workspace_id, owner_id FROM managed_work_captures WHERE capture_id = ?",
+      [binding.capture_id],
+    )[0];
+    const thread = this.#captureThread(binding.thread_id);
+    if (
+      capture.request_id !== binding.capture_request_id ||
+      capture.capture_id !== binding.capture_id ||
+      capture.actor_json !== binding.actor_json ||
+      capture.project_id !== binding.project_id ||
+      capture.thread_id !== binding.thread_id ||
+      capture.node_id !== binding.node_id ||
+      capture.workspace_id !== binding.workspace_id ||
+      capture.ownership_generation !== binding.ownership_generation ||
+      capture.status !== "source-capture-fenced" ||
+      !capture.report_json ||
+      snapshot.request_id !== binding.workspace_snapshot_request_id ||
+      snapshot.capture_request_id !== binding.capture_request_id ||
+      snapshot.capture_id !== binding.capture_id ||
+      snapshot.actor_json !== binding.actor_json ||
+      snapshot.project_id !== binding.project_id ||
+      snapshot.thread_id !== binding.thread_id ||
+      snapshot.node_id !== binding.node_id ||
+      snapshot.workspace_id !== binding.workspace_id ||
+      snapshot.ownership_generation !== binding.ownership_generation ||
+      snapshot.status !== "workspace-checkpoint-available" ||
+      !snapshot.manifest_reference ||
+      !this.#hasVerifiedWorkspaceSnapshotReport(snapshot) ||
+      !lock ||
+      lock.thread_id !== binding.thread_id ||
+      lock.workspace_id !== binding.workspace_id ||
+      lock.owner_id !== ownerId ||
+      thread.project_id !== binding.project_id ||
+      thread.node_id !== binding.node_id ||
+      thread.workspace_id !== binding.workspace_id ||
+      thread.ownership_generation !== binding.ownership_generation ||
+      this.#ownershipGeneration() !== binding.ownership_generation ||
+      !this.#isWorkspaceSnapshotFenceValid(snapshot) ||
+      !this.#hasVerifiedWorkspaceSnapshotReferences(snapshot)
+    ) {
+      throw conflict(
+        "managed_work_checkpoint_prerequisite_unavailable",
+        "The exact held source capture and verified workspace snapshot are required",
+      );
+    }
+  }
+
+  #assertManagedWorkCheckpointCaptureState(
+    state: ManagedWorkCaptureState,
+    binding: ManagedWorkCheckpointBindingRow,
+  ): void {
+    if (
+      state.state !== "source-capture-fenced" ||
+      state.binding.captureId !== binding.capture_id ||
+      state.binding.captureRequestId !== binding.capture_request_id ||
+      state.binding.threadId !== binding.thread_id ||
+      state.binding.projectId !== binding.project_id ||
+      state.binding.target.nodeId !== binding.node_id ||
+      state.binding.target.workspaceId !== binding.workspace_id ||
+      state.binding.ownershipGeneration !== binding.ownership_generation
+    ) {
+      throw conflict(
+        "managed_work_checkpoint_source_unavailable",
+        "The original source capture is not currently confirmed fenced for this binding",
+      );
+    }
+  }
+
+  #hasVerifiedWorkspaceSnapshotReport(row: WorkspaceSnapshotRow): boolean {
+    if (!row.report_json || !row.report_sha256) return false;
+    try {
+      const report = workspaceSnapshotReportSchema.parse(
+        JSON.parse(row.report_json),
+      );
+      return (
+        /^[a-f0-9]{64}$/.test(row.report_sha256) &&
+        report.status === "workspace-checkpoint-available" &&
+        report.snapshotId === row.snapshot_id &&
+        report.requestId === row.request_id &&
+        report.captureRequestId === row.capture_request_id &&
+        report.captureId === row.capture_id &&
+        report.nodeId === row.node_id &&
+        report.target.nodeId === row.node_id &&
+        report.target.workspaceId === row.workspace_id &&
+        report.ownershipGeneration === row.ownership_generation &&
+        report.manifestReference === row.manifest_reference
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  #hasVerifiedWorkspaceSnapshotReferences(row: WorkspaceSnapshotRow): boolean {
+    if (
+      !row.manifest_reference ||
+      !/^[a-f0-9]{64}$/.test(row.manifest_reference)
+    ) {
+      return false;
+    }
+    const totals = this.database.all<{
+      count: number;
+      total_size: number | null;
+      manifest_count: number;
+      invalid_count: number;
+    }>(
+      `SELECT COUNT(*) AS count, SUM(size_bytes) AS total_size,
+        SUM(CASE WHEN reference = ? THEN 1 ELSE 0 END) AS manifest_count,
+        SUM(CASE WHEN length(reference) <> 64 OR reference GLOB '*[^a-f0-9]*'
+          OR size_bytes < 0 OR size_bytes > 536870912 THEN 1 ELSE 0 END) AS invalid_count
+       FROM workspace_snapshot_blobs WHERE capture_id = ?`,
+      [row.manifest_reference, row.capture_id],
+    )[0];
+    return Boolean(
+      totals &&
+      Number.isSafeInteger(totals.count) &&
+      totals.count > 0 &&
+      totals.count <= 100_003 &&
+      totals.manifest_count === 1 &&
+      totals.invalid_count === 0 &&
+      totals.total_size !== null &&
+      Number.isSafeInteger(totals.total_size) &&
+      totals.total_size <= 512 * 1024 * 1024,
+    );
   }
 
   #workspaceSnapshotByRequest(

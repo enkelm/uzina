@@ -231,6 +231,34 @@ const schema = [
     size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
     PRIMARY KEY (capture_id, reference)
   )`,
+  `CREATE TABLE IF NOT EXISTS managed_work_checkpoint_requests (
+    request_id TEXT PRIMARY KEY,
+    capture_request_id TEXT NOT NULL UNIQUE REFERENCES capture_control_requests(request_id),
+    workspace_snapshot_request_id TEXT NOT NULL UNIQUE REFERENCES workspace_snapshot_requests(request_id),
+    capture_id TEXT NOT NULL UNIQUE,
+    actor_json TEXT NOT NULL,
+    project_id TEXT NOT NULL REFERENCES projects(project_id),
+    thread_id TEXT NOT NULL REFERENCES threads(thread_id),
+    node_id TEXT NOT NULL REFERENCES nodes(node_id),
+    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id),
+    ownership_generation INTEGER NOT NULL CHECK (ownership_generation >= 0),
+    status TEXT NOT NULL CHECK (status IN ('assembling', 'available', 'blocked', 'uncertain')),
+    stage TEXT NOT NULL CHECK (stage IN ('admitted', 'runtime-export-started', 'runtime-export-recorded', 'evidence-write-started', 'evidence-recorded', 'bundle-compose-started', 'bundle-composed', 'closure-verification-started', 'available')),
+    accepted_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    manifest_reference TEXT,
+    runtime_requirements_json TEXT,
+    CHECK ((status = 'available' AND stage = 'available' AND manifest_reference IS NOT NULL)
+      OR (status <> 'available' AND manifest_reference IS NULL))
+  )`,
+  `CREATE TABLE IF NOT EXISTS managed_work_checkpoint_artifacts (
+    request_id TEXT NOT NULL REFERENCES managed_work_checkpoint_requests(request_id),
+    role TEXT NOT NULL CHECK (role IN ('runtime', 'evidence', 'attachment', 'inner-manifest', 'outer-manifest')),
+    reference TEXT NOT NULL CHECK (length(reference) = 64 AND reference NOT GLOB '*[^a-f0-9]*'),
+    size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0 AND size_bytes <= 536870912),
+    verified_at TEXT NOT NULL,
+    PRIMARY KEY (request_id, role, reference)
+  )`,
   `CREATE INDEX IF NOT EXISTS workspace_snapshot_queue_by_node ON workspace_snapshot_requests(status, node_id, accepted_at)`,
   `CREATE INDEX IF NOT EXISTS capture_control_queue_by_node ON capture_control_requests(status, node_id, accepted_at)`,
   `CREATE INDEX IF NOT EXISTS factory_events_by_cursor ON factory_events(cursor)`,
@@ -238,6 +266,18 @@ const schema = [
 
 export function initializeFactoryDatabase(database: FactoryDatabase): void {
   for (const statement of schema) database.exec(statement);
+  const managedWorkCheckpointColumns = new Set(
+    database
+      .all<{ name: string }>(
+        "PRAGMA table_info(managed_work_checkpoint_requests)",
+      )
+      .map((column) => column.name),
+  );
+  if (!managedWorkCheckpointColumns.has("runtime_requirements_json")) {
+    database.exec(
+      "ALTER TABLE managed_work_checkpoint_requests ADD COLUMN runtime_requirements_json TEXT",
+    );
+  }
   const columns = new Set(
     database
       .all<{ name: string }>("PRAGMA table_info(execution_jobs)")

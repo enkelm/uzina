@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -14,6 +15,8 @@ import {
   type BlobTransport,
   type CapturedManagedWorkBundle,
 } from "@uzina/checkpoints";
+import { canonicalManagedWorkJson } from "@uzina/checkpoints/managed-work-composition";
+import { portableWorkspaceBlobReferences } from "@uzina/checkpoints/portable";
 import { describe, expect, test } from "bun:test";
 import { openBunSqliteStorage } from "../../daemon/src/runtime/sqlite";
 
@@ -21,8 +24,12 @@ function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 }
 
+function sha256(bytes: Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
 describe("managed-work composition in Miniflare workerd", () => {
-  test("composes already-captured inputs using content-addressed R2 without source blob reads", async () => {
+  test("stores source and private bundle data separately and restores prepared-inactive", async () => {
     const directory = await mkdtemp(join(tmpdir(), "uzina-workerd-composer-"));
     const workerDirectory = join(directory, "worker");
     const workspacePath = join(directory, "workspace");
@@ -68,6 +75,38 @@ describe("managed-work composition in Miniflare workerd", () => {
     const reorderedWorkspaceManifest = Object.fromEntries(
       Object.entries(capturedWorkspace.manifest).reverse(),
     ) as typeof capturedWorkspace.manifest;
+    const captureId = "capture:composer-workerd";
+    const requestId = "checkpoint:composer-workerd";
+    const sourceObjects = portableWorkspaceBlobReferences(
+      capturedWorkspace.manifest,
+      capturedWorkspace.manifestReference,
+      capturedWorkspace.manifestBytes.byteLength,
+    );
+    const sourceReferences = new Set(
+      sourceObjects.map((object) => object.reference),
+    );
+    const evidence = new TextEncoder().encode(
+      JSON.stringify({ testFixture: "composer-only, not Core authority" }),
+    );
+    const compatibilityRequirements = [
+      "model:test/fixed",
+      "tool:remote_read_file:v1",
+    ];
+    const compositionRequest = {
+      requestId,
+      managedWork,
+      compatibilityRequirements,
+      attachments: [
+        {
+          name: "factory-provenance.json",
+          mediaType: "application/json",
+          bytes: [...evidence],
+        },
+      ],
+      workspaceManifest: reorderedWorkspaceManifest,
+      workspaceManifestReference: capturedWorkspace.manifestReference,
+      workspaceManifestBytes: [...capturedWorkspace.manifestBytes],
+    };
 
     const build = await Bun.build({
       entrypoints: [
@@ -93,52 +132,63 @@ describe("managed-work composition in Miniflare workerd", () => {
     });
     try {
       const baseUrl = (await miniflare.ready).toString();
-      const evidence = new TextEncoder().encode(
-        JSON.stringify({ profile: "factory-provenance-v1", commands: [] }),
-      );
-      const response = await fetch(new URL("/compose", baseUrl), {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          managedWork,
-          compatibilityRequirements: [
-            "model:test/fixed",
-            "tool:remote_read_file:v1",
-          ],
-          attachments: [
-            {
-              name: "factory-provenance.json",
-              mediaType: "application/json",
-              bytes: [...evidence],
-            },
-          ],
-          workspaceManifest: reorderedWorkspaceManifest,
-          workspaceManifestReference: capturedWorkspace.manifestReference,
-          workspaceManifestBytes: [...capturedWorkspace.manifestBytes],
-        }),
-      });
-      expect(response.status).toBe(200);
-      const result = (await response.json()) as {
+      for (const object of sourceObjects) {
+        const bytes =
+          object.reference === capturedWorkspace.manifestReference
+            ? capturedWorkspace.manifestBytes
+            : await workspaceTransport.getBlob(object.reference);
+        expect(bytes.byteLength).toBe(object.size);
+        const upload = await fetch(
+          new URL(`/source/${captureId}/${object.reference}`, baseUrl),
+          {
+            method: "PUT",
+            headers: { "content-length": String(bytes.byteLength) },
+            body: bytes.buffer.slice(
+              bytes.byteOffset,
+              bytes.byteOffset + bytes.byteLength,
+            ) as ArrayBuffer,
+          },
+        );
+        expect(upload.status).toBe(200);
+      }
+
+      async function compose(): Promise<{
         bundle: CapturedManagedWorkBundle;
-        writes: string[];
-      };
+        privateBlobs: Array<{ reference: string; size: number }>;
+      }> {
+        const response = await fetch(new URL("/compose", baseUrl), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(compositionRequest),
+        });
+        if (!response.ok) {
+          throw new Error(
+            `composition failed (${response.status}): ${await response.text()}`,
+          );
+        }
+        return (await response.json()) as {
+          bundle: CapturedManagedWorkBundle;
+          privateBlobs: Array<{ reference: string; size: number }>;
+        };
+      }
+
+      const result = await compose();
+      const repeatedComposition = await compose();
+      expect(repeatedComposition.bundle.manifestReference).toBe(
+        result.bundle.manifestReference,
+      );
+      expect(repeatedComposition.privateBlobs).toEqual(result.privateBlobs);
       expect(result.bundle.manifest.format).toBe(
         "uzina-coherent-managed-work-checkpoint",
       );
       expect(result.bundle.manifest.profile).toBe(
         "quiescent-current-documents-no-forks-v1",
       );
-      expect(result.writes).toHaveLength(4);
-      const sourceReferences = new Set([
-        capturedWorkspace.manifestReference,
-        capturedWorkspace.manifest.git.bundle.reference,
-        capturedWorkspace.manifest.git.stagedPatch.reference,
-        ...capturedWorkspace.manifest.workspace.entries.map(
-          (entry) => entry.sha256,
-        ),
-      ]);
+      expect(result.privateBlobs).toHaveLength(4);
       expect(
-        result.writes.some((reference) => sourceReferences.has(reference)),
+        result.privateBlobs.some((object) =>
+          sourceReferences.has(object.reference),
+        ),
       ).toBe(false);
       expect(result.bundle.manifest.workspace.git).toEqual(
         capturedWorkspace.manifest.git,
@@ -150,6 +200,44 @@ describe("managed-work composition in Miniflare workerd", () => {
         capturedWorkspace.manifest.policy,
       );
 
+      const runtimeArtifact = result.bundle.manifest.workspace.runtimeArtifact;
+      if (!runtimeArtifact)
+        throw new Error("Composed runtime artifact is absent");
+      const innerManifestBytes = new TextEncoder().encode(
+        JSON.stringify(result.bundle.manifest.workspace),
+      );
+      const outerManifestBytes = new TextEncoder().encode(
+        canonicalManagedWorkJson(result.bundle.manifest),
+      );
+      expect(sha256(innerManifestBytes)).toBe(
+        result.bundle.manifest.workspaceManifestReference,
+      );
+      expect(sha256(outerManifestBytes)).toBe(result.bundle.manifestReference);
+      expect(
+        result.privateBlobs.map(({ reference }) => reference).sort(),
+      ).toEqual(
+        [
+          runtimeArtifact.artifact.reference,
+          ...result.bundle.manifest.workspace.attachments.map(
+            (attachment) => attachment.blob.reference,
+          ),
+          result.bundle.manifest.workspaceManifestReference,
+          result.bundle.manifestReference,
+        ].sort(),
+      );
+
+      const sourceProbe = await fetch(
+        new URL(
+          `/source-probe/${captureId}/${runtimeArtifact.artifact.reference}`,
+          baseUrl,
+        ),
+      );
+      expect(await sourceProbe.json()).toEqual({ found: false });
+      const otherRequest = await fetch(
+        new URL("/private-list/checkpoint:other-request", baseUrl),
+      );
+      expect(await otherRequest.json()).toEqual([]);
+
       const assembledTransport: BlobTransport = {
         async putBlob() {
           throw new Error("local validation is read-only");
@@ -158,7 +246,9 @@ describe("managed-work composition in Miniflare workerd", () => {
           if (sourceReferences.has(reference)) {
             return workspaceTransport.getBlob(reference);
           }
-          const blob = await fetch(new URL(`/blob/${reference}`, baseUrl));
+          const blob = await fetch(
+            new URL(`/blob/${requestId}/${reference}`, baseUrl),
+          );
           if (!blob.ok)
             throw new Error(`workerd blob unavailable: ${reference}`);
           return new Uint8Array(await blob.arrayBuffer());
@@ -167,12 +257,7 @@ describe("managed-work composition in Miniflare workerd", () => {
       const validation = await validateManagedWorkBundle(
         result.bundle.manifestReference,
         assembledTransport,
-        {
-          supportedRuntimeRequirements: [
-            "model:test/fixed",
-            "tool:remote_read_file:v1",
-          ],
-        },
+        { supportedRuntimeRequirements: compatibilityRequirements },
       );
       expect(validation.managedWork).toEqual(managedWork);
 
@@ -180,10 +265,7 @@ describe("managed-work composition in Miniflare workerd", () => {
         manifestReference: result.bundle.manifestReference,
         transport: assembledTransport,
         destinationPath: join(directory, "prepared-inactive"),
-        supportedRuntimeRequirements: [
-          "model:test/fixed",
-          "tool:remote_read_file:v1",
-        ],
+        supportedRuntimeRequirements: compatibilityRequirements,
         async openStorage(path) {
           const storage = await openBunSqliteStorage(path);
           return {

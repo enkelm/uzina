@@ -284,6 +284,65 @@ export const workspaceSnapshotStatusSchema = z
   })
   .strict();
 
+export const managedWorkCheckpointRequestSchema = z
+  .object({
+    ...versioned,
+    requestId: identifier,
+    captureRequestId: identifier,
+    workspaceSnapshotRequestId: identifier,
+  })
+  .strict();
+export const managedWorkCheckpointStageSchema = z.enum([
+  "admitted",
+  "runtime-export-started",
+  "runtime-export-recorded",
+  "evidence-write-started",
+  "evidence-recorded",
+  "bundle-compose-started",
+  "bundle-composed",
+  "closure-verification-started",
+  "available",
+]);
+export const managedWorkCheckpointStatusSchema = z
+  .object({
+    ...versioned,
+    requestId: identifier,
+    captureRequestId: identifier,
+    workspaceSnapshotRequestId: identifier,
+    captureId: executionCaptureIdSchema,
+    threadId: identifier,
+    target: factoryTargetSchema,
+    ownershipGeneration: z.number().int().nonnegative().safe(),
+    status: z.enum(["assembling", "available", "blocked", "uncertain"]),
+    stage: managedWorkCheckpointStageSchema,
+    acceptedAt: z.string().datetime(),
+    updatedAt: z.string().datetime(),
+    manifestReference: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
+  })
+  .strict()
+  .superRefine((status, context) => {
+    if (
+      status.status === "available" &&
+      (status.stage !== "available" || !status.manifestReference)
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["manifestReference"],
+        message: "Available checkpoints require a verified manifest reference",
+      });
+    }
+    if (status.status !== "available" && status.manifestReference) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["manifestReference"],
+        message: "Unpublished checkpoints cannot expose a manifest reference",
+      });
+    }
+  });
+
 export const workspaceSnapshotClaimRequestSchema = z
   .object({
     contractVersion: z.literal(EXECUTION_CONTRACT_VERSION),
@@ -392,6 +451,92 @@ export const factoryCommandReceiptSchema = z.object({
   outcome: z.string().max(4_000).optional(),
   executionEffects: z.array(executionReceiptSchema).optional(),
 });
+/** Only known normalized executor/controller codes may appear in portable provenance. */
+export const FACTORY_PROVENANCE_EXECUTION_ERROR_CODES = [
+  "workspace_path_access_denied",
+  "workspace_path_is_directory",
+  "workspace_symlink_rejected",
+  "workspace_path_too_long",
+  "workspace_path_not_found",
+  "workspace_path_not_directory",
+  "workspace_path_not_file",
+  "file_size_limit_exceeded",
+  "unsafe_workspace_path",
+  "invalid_file_content",
+  "command_start_failed",
+  "command_failed",
+  "stale_ownership_generation",
+  "access_revoked",
+  "managed_effect_abandoned_before_claim",
+  "managed_input_interrupted_before_claim",
+] as const;
+export const factoryProvenanceExecutionErrorCodeSchema = z.enum(
+  FACTORY_PROVENANCE_EXECUTION_ERROR_CODES,
+);
+export const factoryProvenanceExecutionEffectSchema = z
+  .object({
+    ...versioned,
+    jobId: identifier,
+    nodeId: identifier,
+    target: factoryTargetSchema,
+    ownershipGeneration: z.number().int().nonnegative().safe(),
+    operation: z.enum(["read-file", "write-file", "argv-command"]),
+    payloadSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    status: z.enum(["completed", "failed"]),
+    acceptedAt: z.string().datetime(),
+    finishedAt: z.string().datetime(),
+    errorCode: factoryProvenanceExecutionErrorCodeSchema.nullable(),
+  })
+  .strict();
+export const factoryProvenanceCommandSchema = z
+  .object({
+    ...versioned,
+    requestId: identifier,
+    jobId: identifier,
+    threadId: identifier,
+    target: factoryTargetSchema,
+    ownershipGeneration: z.number().int().nonnegative().safe(),
+    payloadSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    dispatchStatus: z.enum(["completed", "failed"]),
+    acceptedAt: z.string().datetime(),
+    settledAt: z.string().datetime(),
+    executionEffects: z
+      .array(factoryProvenanceExecutionEffectSchema)
+      .max(100_000),
+  })
+  .strict();
+export const factoryProvenanceEvidenceSchema = z
+  .object({
+    contractVersion: z.literal(CONTRACT_VERSION),
+    format: z.literal("uzina-factory-managed-work-provenance"),
+    version: z.literal(1),
+    checkpointRequestId: identifier,
+    threadId: identifier,
+    projectId: identifier,
+    capture: z
+      .object({
+        requestId: identifier,
+        captureId: executionCaptureIdSchema,
+        controlId: executionCaptureControlIdSchema,
+        target: factoryTargetSchema,
+        ownershipGeneration: z.number().int().nonnegative().safe(),
+        reportSha256: z.string().regex(/^[a-f0-9]{64}$/),
+        sourceFence: executionCaptureFenceReceiptSchema,
+      })
+      .strict(),
+    workspaceSnapshot: z
+      .object({
+        requestId: identifier,
+        snapshotId: identifier,
+        captureId: executionCaptureIdSchema,
+        status: z.literal("workspace-checkpoint-available"),
+        manifestReference: z.string().regex(/^[a-f0-9]{64}$/),
+        reportSha256: z.string().regex(/^[a-f0-9]{64}$/),
+      })
+      .strict(),
+    commands: z.array(factoryProvenanceCommandSchema).max(100_000),
+  })
+  .strict();
 export const factoryQueueJobSchema = z.object({
   ...versioned,
   jobId: identifier,
@@ -475,6 +620,15 @@ export type WorkspaceSnapshotRequest = z.infer<
 export type WorkspaceSnapshotStatus = z.infer<
   typeof workspaceSnapshotStatusSchema
 >;
+export type ManagedWorkCheckpointRequest = z.infer<
+  typeof managedWorkCheckpointRequestSchema
+>;
+export type ManagedWorkCheckpointStage = z.infer<
+  typeof managedWorkCheckpointStageSchema
+>;
+export type ManagedWorkCheckpointStatus = z.infer<
+  typeof managedWorkCheckpointStatusSchema
+>;
 export type WorkspaceSnapshotClaim = z.infer<
   typeof workspaceSnapshotClaimSchema
 >;
@@ -484,6 +638,15 @@ export type WorkspaceSnapshotReport = z.infer<
 export type DiscussionEntry = z.infer<typeof discussionEntrySchema>;
 export type FactoryDispatchStatus = z.infer<typeof factoryDispatchStatusSchema>;
 export type FactoryCommandReceipt = z.infer<typeof factoryCommandReceiptSchema>;
+export type FactoryProvenanceCommand = z.infer<
+  typeof factoryProvenanceCommandSchema
+>;
+export type FactoryProvenanceExecutionEffect = z.infer<
+  typeof factoryProvenanceExecutionEffectSchema
+>;
+export type FactoryProvenanceEvidence = z.infer<
+  typeof factoryProvenanceEvidenceSchema
+>;
 export type FactoryQueueJob = z.infer<typeof factoryQueueJobSchema>;
 export type FactoryEvent = z.infer<typeof factoryEventSchema>;
 

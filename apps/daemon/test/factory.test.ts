@@ -301,6 +301,44 @@ describe("persistent Factory behavior over Bun SQLite", () => {
     expect(revokedNode.status).toBe(401);
   });
 
+  test("a Bun host without a private assembly adapter refuses admission before recording it", async () => {
+    const fixture = await provisionFixture(true);
+    const handler = createFactoryHttpHandler(fixture.factory);
+    const response = await handler(
+      new Request(
+        `https://factory.test/v1/threads/${fixture.thread.threadId}/managed-work-checkpoints`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${fixture.ownerCredential.credential}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            contractVersion: 1,
+            requestId: "checkpoint:bun-unsupported",
+            captureRequestId: "capture:held-source",
+            workspaceSnapshotRequestId: "snapshot:available",
+          }),
+        },
+      ),
+    );
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({
+      error: "managed_work_checkpoint_assembly_unavailable",
+    });
+    const missing = await handler(
+      new Request(
+        "https://factory.test/v1/managed-work-checkpoints/checkpoint:bun-unsupported",
+        {
+          headers: {
+            authorization: `Bearer ${fixture.ownerCredential.credential}`,
+          },
+        },
+      ),
+    );
+    expect(missing.status).toBe(404);
+  });
+
   test("a downgraded guest cannot dispatch a previously queued input or admit later Pi execution", async () => {
     const fixture = await provisionFixture(true);
     const invite = await fixture.factory.createInvitation(fixture.owner, {

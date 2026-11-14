@@ -10,6 +10,7 @@ export type {
   ManagedWorkCaptureBinding,
   ManagedWorkCaptureState,
   ManagedWorkRuntimeAdmission,
+  ManagedWorkCheckpointArtifactReference,
   RuntimeDispatchAdapter,
 } from "./factory";
 export { createFactoryHttpHandler } from "./http";

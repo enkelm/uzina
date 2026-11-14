@@ -1,5 +1,8 @@
 import { ROOT_CONVERSATION_ID } from "@earendil-works/pi-durable";
-import { prepareManagedWorkCheckpointArtifact } from "@uzina/pi-runtime/checkpoint";
+import {
+  prepareManagedWorkCheckpointArtifact,
+  validateManagedWorkCheckpoint,
+} from "@uzina/pi-runtime/checkpoint";
 import {
   portableWorkspaceBlobReferences,
   PORTABLE_WORKSPACE_ATTACHMENT_MAX_BYTES,
@@ -27,7 +30,7 @@ export const MANAGED_WORK_PROFILE =
 export const MANAGED_WORK_ARTIFACT_MEDIA_TYPE =
   "application/vnd.uzina.managed-work+json" as const;
 
-const RUNTIME_REQUIREMENTS = [
+export const MANAGED_WORK_RUNTIME_REQUIREMENTS = [
   "managed-work-profile:quiescent-current-documents-no-forks-v1",
   "pi-durable:1.4.0",
 ] as const;
@@ -55,6 +58,34 @@ export interface ManagedWorkBundleManifest {
 }
 
 type ManagedWorkBundleBody = Omit<ManagedWorkBundleManifest, "sha256">;
+
+export type ManagedWorkCheckpointArtifactRole =
+  "runtime" | "evidence" | "attachment" | "inner-manifest" | "outer-manifest";
+
+export interface ManagedWorkCheckpointArtifactReference {
+  role: ManagedWorkCheckpointArtifactRole;
+  reference: string;
+  size: number;
+}
+
+export interface ManagedWorkBundleMetadataVerification {
+  manifest: ManagedWorkBundleManifest;
+  sourceWorkspaceReferences: readonly {
+    reference: string;
+    size: number;
+  }[];
+  privateArtifacts: readonly ManagedWorkCheckpointArtifactReference[];
+}
+
+export interface ManagedWorkBundleMetadataVerificationOptions {
+  manifestBytes: Uint8Array;
+  manifestReference: string;
+  sourceWorkspaceManifestBytes: Uint8Array;
+  sourceWorkspaceManifestReference: string;
+  innerWorkspaceManifestBytes: Uint8Array;
+  expectedRuntimeRequirements: readonly string[];
+  runtimeArtifactBytes: Uint8Array;
+}
 
 export interface CapturedManagedWorkBundle {
   manifest: ManagedWorkBundleManifest;
@@ -98,19 +129,22 @@ export interface ComposeManagedWorkBundleFromWorkspaceOptions {
   transport: BlobTransport;
 }
 
-function canonicalJson(value: unknown): string {
+export function canonicalManagedWorkJson(value: unknown): string {
   if (value === null || typeof value !== "object") {
     const encoded = JSON.stringify(value);
     if (encoded === undefined) throw new Error("Bundle contains non-JSON data");
     return encoded;
   }
   if (Array.isArray(value)) {
-    return `[${value.map((entry) => canonicalJson(entry)).join(",")}]`;
+    return `[${value.map((entry) => canonicalManagedWorkJson(entry)).join(",")}]`;
   }
   const record = value as Record<string, unknown>;
   return `{${Object.keys(record)
     .sort()
-    .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+    .map(
+      (key) =>
+        `${JSON.stringify(key)}:${canonicalManagedWorkJson(record[key])}`,
+    )
     .join(",")}}`;
 }
 
@@ -120,8 +154,313 @@ function sha256(bytes: Uint8Array): string {
   return hash.digest();
 }
 
-function bundleChecksum(value: unknown): string {
-  return sha256(new TextEncoder().encode(canonicalJson(value)));
+export function managedWorkBundleChecksum(value: unknown): string {
+  return sha256(new TextEncoder().encode(canonicalManagedWorkJson(value)));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasOnlyKeys(
+  value: Record<string, unknown>,
+  keys: readonly string[],
+): boolean {
+  return Object.keys(value).every((key) => keys.includes(key));
+}
+
+export function assertManagedWorkBundleEnvelope(
+  value: unknown,
+): asserts value is ManagedWorkBundleManifest {
+  if (
+    !isRecord(value) ||
+    value.format !== MANAGED_WORK_BUNDLE_FORMAT ||
+    value.version !== MANAGED_WORK_BUNDLE_VERSION ||
+    value.profile !== MANAGED_WORK_PROFILE ||
+    typeof value.sha256 !== "string" ||
+    !isRecord(value.runtime) ||
+    !hasOnlyKeys(value, [
+      "format",
+      "version",
+      "profile",
+      "runtime",
+      "workspaceManifestReference",
+      "workspace",
+      "sha256",
+    ]) ||
+    !hasOnlyKeys(value.runtime, [
+      "formatVersion",
+      "mediaType",
+      "requirements",
+    ]) ||
+    value.runtime.formatVersion !== 1 ||
+    value.runtime.mediaType !== MANAGED_WORK_ARTIFACT_MEDIA_TYPE ||
+    !Array.isArray(value.runtime.requirements) ||
+    typeof value.workspaceManifestReference !== "string" ||
+    !isRecord(value.workspace)
+  ) {
+    throw new Error("Unsupported or malformed coherent managed-work bundle");
+  }
+}
+
+export function parseManagedWorkBundleManifestBytes(
+  bytes: Uint8Array,
+  manifestReference: string,
+): ManagedWorkBundleManifest {
+  if (!/^[a-f0-9]{64}$/.test(manifestReference)) {
+    throw new Error("Managed-work bundle reference is not a SHA-256 digest");
+  }
+  if (bytes.byteLength > MANIFEST_MAX_BYTES) {
+    throw new Error("Managed-work bundle manifest exceeds its size limit");
+  }
+  if (sha256(bytes) !== manifestReference) {
+    throw new Error("Managed-work bundle manifest content hash mismatch");
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } catch {
+    throw new Error("Managed-work bundle manifest is not valid JSON");
+  }
+  assertManagedWorkBundleEnvelope(value);
+  const { sha256: checksum, ...body } = value;
+  if (managedWorkBundleChecksum(body) !== checksum) {
+    throw new Error("Managed-work bundle manifest checksum mismatch");
+  }
+  if (
+    !/^[a-f0-9]{64}$/.test(value.workspaceManifestReference) ||
+    value.runtime.requirements.some(
+      (requirement) =>
+        typeof requirement !== "string" ||
+        !requirement.trim() ||
+        requirement.length > 256 ||
+        /[\r\n]/.test(requirement),
+    ) ||
+    new Set(value.runtime.requirements).size !==
+      value.runtime.requirements.length ||
+    MANAGED_WORK_RUNTIME_REQUIREMENTS.some(
+      (requirement) => !value.runtime.requirements.includes(requirement),
+    )
+  ) {
+    throw new Error("Managed-work bundle runtime requirements are unsupported");
+  }
+  return value;
+}
+
+export async function verifyManagedWorkBundleMetadata(
+  options: ManagedWorkBundleMetadataVerificationOptions,
+): Promise<ManagedWorkBundleMetadataVerification> {
+  const manifest = parseManagedWorkBundleManifestBytes(
+    options.manifestBytes,
+    options.manifestReference,
+  );
+  if (
+    !/^[a-f0-9]{64}$/.test(options.sourceWorkspaceManifestReference) ||
+    options.sourceWorkspaceManifestBytes.byteLength > MANIFEST_MAX_BYTES ||
+    sha256(options.sourceWorkspaceManifestBytes) !==
+      options.sourceWorkspaceManifestReference
+  ) {
+    throw new Error("Source workspace manifest reference or bytes are invalid");
+  }
+  if (
+    options.expectedRuntimeRequirements.some(
+      (requirement) =>
+        typeof requirement !== "string" ||
+        !requirement.trim() ||
+        requirement.length > 256 ||
+        /[\r\n]/.test(requirement),
+    ) ||
+    new Set(options.expectedRuntimeRequirements).size !==
+      options.expectedRuntimeRequirements.length ||
+    JSON.stringify(manifest.runtime.requirements) !==
+      JSON.stringify(options.expectedRuntimeRequirements)
+  ) {
+    throw new Error(
+      "Managed-work runtime requirements do not match the source",
+    );
+  }
+  let sourceWorkspace: unknown;
+  let innerWorkspace: unknown;
+  try {
+    sourceWorkspace = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(
+        options.sourceWorkspaceManifestBytes,
+      ),
+    );
+    innerWorkspace = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(
+        options.innerWorkspaceManifestBytes,
+      ),
+    );
+  } catch {
+    throw new Error("Workspace manifest is not valid JSON");
+  }
+  const sourceWorkspaceReferences = portableWorkspaceBlobReferences(
+    sourceWorkspace,
+    options.sourceWorkspaceManifestReference,
+    options.sourceWorkspaceManifestBytes.byteLength,
+  );
+  if (
+    !/^[a-f0-9]{64}$/.test(manifest.workspaceManifestReference) ||
+    options.innerWorkspaceManifestBytes.byteLength > MANIFEST_MAX_BYTES ||
+    sha256(options.innerWorkspaceManifestBytes) !==
+      manifest.workspaceManifestReference ||
+    canonicalManagedWorkJson(innerWorkspace) !==
+      canonicalManagedWorkJson(manifest.workspace)
+  ) {
+    throw new Error("Managed-work inner workspace manifest is invalid");
+  }
+  if (!isRecord(manifest.workspace)) {
+    throw new Error("Managed-work bundle workspace manifest is malformed");
+  }
+  const workspace = manifest.workspace as unknown as Record<string, unknown>;
+  if (
+    !isRecord(workspace.runtimeArtifact) ||
+    !hasOnlyKeys(workspace.runtimeArtifact, [
+      "formatVersion",
+      "mediaType",
+      "artifact",
+      "compatibilityRequirements",
+    ]) ||
+    workspace.runtimeArtifact.formatVersion !==
+      manifest.runtime.formatVersion ||
+    workspace.runtimeArtifact.mediaType !== manifest.runtime.mediaType ||
+    !Array.isArray(workspace.runtimeArtifact.compatibilityRequirements) ||
+    JSON.stringify(workspace.runtimeArtifact.compatibilityRequirements) !==
+      JSON.stringify(manifest.runtime.requirements) ||
+    !isRecord(workspace.runtimeArtifact.artifact) ||
+    !hasOnlyKeys(workspace.runtimeArtifact.artifact, [
+      "reference",
+      "size",
+      "sha256",
+    ])
+  ) {
+    throw new Error("Managed-work runtime artifact metadata is invalid");
+  }
+  const runtimeArtifact = workspace.runtimeArtifact.artifact;
+  if (
+    typeof runtimeArtifact.reference !== "string" ||
+    !/^[a-f0-9]{64}$/.test(runtimeArtifact.reference) ||
+    runtimeArtifact.sha256 !== runtimeArtifact.reference ||
+    !Number.isSafeInteger(runtimeArtifact.size) ||
+    (runtimeArtifact.size as number) < 0 ||
+    (runtimeArtifact.size as number) > PORTABLE_WORKSPACE_RUNTIME_MAX_BYTES ||
+    options.runtimeArtifactBytes.byteLength !== runtimeArtifact.size ||
+    options.runtimeArtifactBytes.byteLength >
+      PORTABLE_WORKSPACE_RUNTIME_MAX_BYTES ||
+    sha256(options.runtimeArtifactBytes) !== runtimeArtifact.reference
+  ) {
+    throw new Error("Managed-work runtime artifact content is invalid");
+  }
+  let runtimeValue: unknown;
+  try {
+    runtimeValue = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(
+        options.runtimeArtifactBytes,
+      ),
+    );
+  } catch {
+    throw new Error("Managed-work runtime artifact is not valid JSON");
+  }
+  const checkpoint = await validateManagedWorkCheckpoint(runtimeValue);
+  if (
+    checkpoint.profile !== MANAGED_WORK_PROFILE ||
+    checkpoint.rootConversationId !== ROOT_CONVERSATION_ID
+  ) {
+    throw new Error("Managed-work runtime profile does not match its bundle");
+  }
+  const sourceWithoutRuntime: Record<string, unknown> = {
+    ...workspace,
+    runtimeArtifact: null,
+    attachments: [],
+  };
+  if (
+    canonicalManagedWorkJson(sourceWithoutRuntime) !==
+    canonicalManagedWorkJson(sourceWorkspace)
+  ) {
+    throw new Error(
+      "Managed-work bundle changed its source workspace metadata",
+    );
+  }
+  if (
+    !Array.isArray(workspace.attachments) ||
+    workspace.attachments.length > PORTABLE_WORKSPACE_MAX_FILES
+  ) {
+    throw new Error("Managed-work bundle attachment count exceeds its limit");
+  }
+  const attachmentNames = new Set<string>();
+  let evidenceCount = 0;
+  const privateArtifacts: ManagedWorkCheckpointArtifactReference[] = [
+    {
+      role: "runtime",
+      reference: runtimeArtifact.reference,
+      size: runtimeArtifact.size as number,
+    },
+  ];
+  for (const value of workspace.attachments) {
+    if (
+      !isRecord(value) ||
+      !hasOnlyKeys(value, ["name", "mediaType", "blob"]) ||
+      typeof value.name !== "string" ||
+      typeof value.mediaType !== "string" ||
+      !isRecord(value.blob) ||
+      !hasOnlyKeys(value.blob, ["reference", "size", "sha256"])
+    ) {
+      throw new Error("Managed-work attachment metadata is malformed");
+    }
+    validatePortableAttachmentName(value.name);
+    validatePortableMediaType(value.mediaType);
+    if (attachmentNames.has(value.name)) {
+      throw new Error("Managed-work attachment names must be unique");
+    }
+    attachmentNames.add(value.name);
+    const blob = value.blob;
+    if (
+      typeof blob.reference !== "string" ||
+      !/^[a-f0-9]{64}$/.test(blob.reference) ||
+      blob.sha256 !== blob.reference ||
+      !Number.isSafeInteger(blob.size) ||
+      (blob.size as number) < 0 ||
+      (blob.size as number) > PORTABLE_WORKSPACE_ATTACHMENT_MAX_BYTES
+    ) {
+      throw new Error("Managed-work attachment reference is invalid");
+    }
+    const role =
+      value.name === "factory-provenance.json" ? "evidence" : "attachment";
+    if (role === "evidence") {
+      evidenceCount += 1;
+      if (value.mediaType !== "application/json") {
+        throw new Error("Factory provenance attachment must be JSON");
+      }
+    }
+    privateArtifacts.push({
+      role,
+      reference: blob.reference,
+      size: blob.size as number,
+    });
+  }
+  if (evidenceCount !== 1) {
+    throw new Error(
+      "Managed-work bundle requires one complete provenance attachment",
+    );
+  }
+  privateArtifacts.push(
+    {
+      role: "inner-manifest",
+      reference: manifest.workspaceManifestReference,
+      size: options.innerWorkspaceManifestBytes.byteLength,
+    },
+    {
+      role: "outer-manifest",
+      reference: options.manifestReference,
+      size: options.manifestBytes.byteLength,
+    },
+  );
+  return {
+    manifest,
+    sourceWorkspaceReferences,
+    privateArtifacts,
+  };
 }
 
 function resolveLimits(limits: CaptureLimits = {}): ResolvedCaptureLimits {
@@ -171,7 +510,7 @@ export async function prepareManagedWorkBundleComposition(
   }
   const requirements = [
     ...new Set([
-      ...RUNTIME_REQUIREMENTS,
+      ...MANAGED_WORK_RUNTIME_REQUIREMENTS,
       ...(options.compatibilityRequirements ?? []),
     ]),
   ];
@@ -267,7 +606,10 @@ function verifyWorkspaceSource(
     workspaceManifestReference,
     workspaceManifestBytes.byteLength,
   );
-  if (canonicalJson(decoded) !== canonicalJson(workspaceManifest)) {
+  if (
+    canonicalManagedWorkJson(decoded) !==
+    canonicalManagedWorkJson(workspaceManifest)
+  ) {
     throw new Error("Workspace manifest/reference/bytes mismatch");
   }
   const source = decoded as WorkspaceCheckpointManifest;
@@ -389,9 +731,11 @@ export async function composeManagedWorkBundleFromWorkspace(
   };
   const manifest: ManagedWorkBundleManifest = {
     ...body,
-    sha256: bundleChecksum(body),
+    sha256: managedWorkBundleChecksum(body),
   };
-  const outerManifestBytes = new TextEncoder().encode(canonicalJson(manifest));
+  const outerManifestBytes = new TextEncoder().encode(
+    canonicalManagedWorkJson(manifest),
+  );
   if (outerManifestBytes.byteLength > MANIFEST_MAX_BYTES) {
     throw new Error("Managed-work bundle manifest exceeds its size limit");
   }

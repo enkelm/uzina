@@ -28,11 +28,32 @@ export interface WorkspaceSnapshotStorage {
   ): Promise<readonly { reference: string; size: number }[]>;
 }
 
+export interface VerifiedWorkspaceManifestSource {
+  manifestBytes: Uint8Array;
+  references: readonly { reference: string; size: number }[];
+}
+
 export async function verifyPublishedWorkspaceManifest(
   storage: WorkspaceSnapshotStorage,
   captureId: string,
   manifestReference: string,
 ): Promise<Array<{ reference: string; size: number }>> {
+  return [
+    ...(
+      await verifyPublishedWorkspaceManifestDetails(
+        storage,
+        captureId,
+        manifestReference,
+      )
+    ).references,
+  ];
+}
+
+export async function verifyPublishedWorkspaceManifestDetails(
+  storage: WorkspaceSnapshotStorage,
+  captureId: string,
+  manifestReference: string,
+): Promise<VerifiedWorkspaceManifestSource> {
   const storedManifest = await storage.getBlob(captureId, manifestReference);
   if (
     !storedManifest ||
@@ -109,7 +130,7 @@ export async function verifyPublishedWorkspaceManifest(
       "Workspace checkpoint object references do not match the manifest exactly",
     );
   }
-  return references;
+  return { manifestBytes, references };
 }
 
 async function readBounded(

@@ -9,6 +9,12 @@ import {
 import { Type } from "typebox";
 
 export const REMOTE_TOOL_EXTENSION = "uzina.remote-execution";
+/** Compatibility IDs for the tool definitions installed by this extension. */
+export const MANAGED_REMOTE_TOOL_REQUIREMENTS = [
+  "tool:remote_read_file:v1",
+  "tool:remote_write_file:v1",
+  "tool:remote_run_command:v1",
+] as const;
 export const MAX_REMOTE_FILE_BYTES = 64 * 1024;
 export const MAX_REMOTE_OUTPUT_BYTES = 64 * 1024;
 export const MAX_REMOTE_TIMEOUT_MS = 60_000;
