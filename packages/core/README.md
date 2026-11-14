@@ -57,6 +57,12 @@ Assistant credentials are normal authenticated Core actors with an immutable ass
 
 For backwards compatibility, owner-provisioned assistant credentials created through the legacy request with no `assistantGrants` receive an explicit persisted factory-wide grant. Database initialization migrates pre-existing grantless assistant credentials to that same explicit row; there is no implicit assistant `isOwner` bypass. Scoped assistant grants apply through the same `FactoryAccessPolicy` for REST and MCP and are rechecked before dispatching queued input and authorizing new remote effects. A factory-wide assistant retains the previous access to owner-private context; human Guests/Viewers cannot access owner-private threads. Grant scope is not an OS sandbox, and revocation cannot undo external effects already admitted or dispatched.
 
+## Persistent owner-private Factory assistant ingress
+
+`GET /v1/me` now additively returns the active non-secret `credentialId` alongside the actor and participant. `FactoryClient.me()` runtime-decodes that identity; a host can require the configured assistant credential, immutable assistant ID, and accountable owner ID to match before opening/resuming tool-capable tasks. This endpoint does not disclose a bearer or cache grants.
+
+Standalone Bun exposes owner-only `GET /v1/private-assistant/status`, `GET /v1/private-assistant/context`, `GET /v1/private-assistant/receipts/:inputId`, and `POST /v1/private-assistant/inputs` (`{ inputId, text }`). Cloudflare exposes the same routes through its Worker router. Both authenticate a human owner through Core; role is never supplied by the client. These inputs are admission metadata correlated to a Pi Durable submission in a separate private storage unit, not rows in `threads`, `dispatch_intents`, or `command_receipts`. Guest, Viewer, node, and assistant credentials are denied access. An unavailable/revoked assistant credential parks new inputs/resume/tool calls without preventing an owner from reading existing history and receipts.
+
 ## Production seams and limits
 
 - `FactoryService.registerExecutionNode`, `heartbeatExecutionNode`, `claimExecutionJob`, and `reportExecutionJob` implement the node-facing Core operations.

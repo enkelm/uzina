@@ -107,6 +107,12 @@ describe("FactoryClient over the authorized Factory HTTP boundary", () => {
     });
 
     try {
+      const identity = await client.me();
+      expect(identity).toMatchObject({
+        credentialId: assistantCredential.credentialId,
+        actor: assistantCredential.actor,
+        participant: null,
+      });
       await expect(
         client.submitInput(thread.threadId, requestId, text),
       ).rejects.toBe(abortError);

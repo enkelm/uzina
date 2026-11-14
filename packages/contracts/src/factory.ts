@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { CONTRACT_VERSION, actorIdentitySchema } from "./index";
+import { EXECUTION_CONTRACT_VERSION } from "./execution";
 import {
   executionCaptureControlIdSchema,
   executionCaptureIdSchema,
@@ -136,6 +137,31 @@ export const submitInputRequestSchema = z
     text: z.string().min(1).max(100_000),
   })
   .strict();
+export const privateAssistantInputRequestSchema = z
+  .object({ inputId: identifier, text: z.string().min(1).max(100_000) })
+  .strict();
+export const privateAssistantReceiptSchema = z.object({
+  inputId: identifier,
+  payloadSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  requestId: identifier,
+  submissionId: identifier.nullable(),
+  acceptedAt: z.string().datetime(),
+  submission: z.unknown().optional(),
+});
+export const privateAssistantStatusSchema = z.object({
+  available: z.boolean(),
+  state: z.enum(["ready", "parked"]),
+  reason: z
+    .enum([
+      "configuration_missing",
+      "credential_unavailable",
+      "identity_mismatch",
+      "identity_persistence_unavailable",
+    ])
+    .nullable(),
+  detail: z.string().nullable(),
+  runtime: z.unknown(),
+});
 export const provisionedCredentialSchema = z.object({
   contractVersion: z.literal(CONTRACT_VERSION),
   credentialId: identifier,
@@ -227,6 +253,122 @@ export const captureControlStatusSchema = z
     errorCode: z.string().min(1).max(128).optional(),
   })
   .strict();
+
+export const workspaceSnapshotRequestSchema = z
+  .object({ ...versioned, requestId: identifier, captureRequestId: identifier })
+  .strict();
+export const workspaceSnapshotStatusSchema = z
+  .object({
+    ...versioned,
+    requestId: identifier,
+    snapshotId: identifier,
+    captureRequestId: identifier,
+    captureId: executionCaptureIdSchema,
+    threadId: identifier,
+    target: factoryTargetSchema,
+    ownershipGeneration: z.number().int().nonnegative().safe(),
+    status: z.enum([
+      "queued",
+      "claimed",
+      "workspace-checkpoint-available",
+      "blocked",
+      "uncertain",
+    ]),
+    acceptedAt: z.string().datetime(),
+    updatedAt: z.string().datetime(),
+    manifestReference: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
+    errorCode: z.string().min(1).max(128).optional(),
+  })
+  .strict();
+
+export const workspaceSnapshotClaimRequestSchema = z
+  .object({
+    contractVersion: z.literal(EXECUTION_CONTRACT_VERSION),
+    nodeId: identifier,
+  })
+  .strict();
+export const workspaceSnapshotClaimResponseSchema = z
+  .object({
+    contractVersion: z.literal(EXECUTION_CONTRACT_VERSION),
+    snapshot: z.lazy(() => workspaceSnapshotClaimSchema).nullable(),
+  })
+  .strict();
+export const workspaceSnapshotClaimSchema = z
+  .object({
+    contractVersion: z.literal(EXECUTION_CONTRACT_VERSION),
+    snapshotId: identifier,
+    requestId: identifier,
+    captureRequestId: identifier,
+    captureId: executionCaptureIdSchema,
+    nodeId: identifier,
+    target: factoryTargetSchema,
+    ownershipGeneration: z.number().int().nonnegative().safe(),
+  })
+  .strict();
+export const workspaceSnapshotReportResponseSchema = z
+  .object({
+    contractVersion: z.literal(EXECUTION_CONTRACT_VERSION),
+    nodeId: identifier,
+    snapshotId: identifier,
+    captureId: executionCaptureIdSchema,
+    accepted: z.literal(true),
+    status: z.enum(["workspace-checkpoint-available", "blocked", "uncertain"]),
+  })
+  .strict();
+export const workspaceSnapshotReportSchema = z
+  .object({
+    contractVersion: z.literal(EXECUTION_CONTRACT_VERSION),
+    snapshotId: identifier,
+    requestId: identifier,
+    captureRequestId: identifier,
+    captureId: executionCaptureIdSchema,
+    nodeId: identifier,
+    target: factoryTargetSchema,
+    ownershipGeneration: z.number().int().nonnegative().safe(),
+    status: z.enum(["workspace-checkpoint-available", "blocked", "uncertain"]),
+    reportedAt: z.string().datetime(),
+    manifestReference: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
+    errorCode: z.string().min(1).max(128).optional(),
+  })
+  .strict()
+  .superRefine((report, context) => {
+    if (
+      report.status === "workspace-checkpoint-available" &&
+      !report.manifestReference
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["manifestReference"],
+        message: "Available workspace checkpoint requires a manifest reference",
+      });
+    }
+    if (
+      report.status !== "workspace-checkpoint-available" &&
+      !report.errorCode
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["errorCode"],
+        message: "Blocked snapshot report requires an error code",
+      });
+    }
+    if (
+      report.status === "workspace-checkpoint-available" &&
+      report.errorCode
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["errorCode"],
+        message: "Available checkpoint cannot include an error",
+      });
+    }
+  });
 
 export const factoryDispatchStatusSchema = z.enum([
   "queued",
@@ -327,6 +469,18 @@ export type CaptureControlAdmissionRequest = z.infer<
   typeof captureControlAdmissionRequestSchema
 >;
 export type CaptureControlStatus = z.infer<typeof captureControlStatusSchema>;
+export type WorkspaceSnapshotRequest = z.infer<
+  typeof workspaceSnapshotRequestSchema
+>;
+export type WorkspaceSnapshotStatus = z.infer<
+  typeof workspaceSnapshotStatusSchema
+>;
+export type WorkspaceSnapshotClaim = z.infer<
+  typeof workspaceSnapshotClaimSchema
+>;
+export type WorkspaceSnapshotReport = z.infer<
+  typeof workspaceSnapshotReportSchema
+>;
 export type DiscussionEntry = z.infer<typeof discussionEntrySchema>;
 export type FactoryDispatchStatus = z.infer<typeof factoryDispatchStatusSchema>;
 export type FactoryCommandReceipt = z.infer<typeof factoryCommandReceiptSchema>;

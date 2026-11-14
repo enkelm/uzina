@@ -15,6 +15,18 @@ class_name = "FactoryObject"
 name = "MANAGED_WORK"
 class_name = "ManagedWorkObject"
 
+[[durable_objects.bindings]]
+name = "PRIVATE_ASSISTANT"
+class_name = "PrivateAssistantObject"
+
+[[r2_buckets]]
+binding = "CHECKPOINTS"
+bucket_name = "uzina-workspace-checkpoints"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["FactoryObject", "ManagedWorkObject"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["PrivateAssistantObject"]

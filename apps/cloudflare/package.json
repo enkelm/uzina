@@ -6,7 +6,9 @@
   "dependencies": {
     "@earendil-works/chord": "1.4.0",
     "@earendil-works/pi-durable": "1.4.0",
+    "@uzina/checkpoints": "workspace:*",
     "@uzina/contracts": "workspace:*",
+    "@uzina/client": "workspace:*",
     "@uzina/core": "workspace:*",
     "@uzina/pi-runtime": "workspace:*"
   },

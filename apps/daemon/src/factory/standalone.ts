@@ -1,24 +1,35 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync } from "node:fs";
-import { realpath } from "node:fs/promises";
+import { existsSync, mkdirSync, realpathSync } from "node:fs";
+import { chmod, mkdir, realpath } from "node:fs/promises";
 import {
   captureManagedWorkBundle,
   type BlobTransport,
   type CapturedManagedWorkBundle,
 } from "@uzina/checkpoints";
 import { homedir } from "node:os";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
+  createFactoryToolExtension,
   createManagedRemoteToolExecutor,
+  checkPrivateAssistantIdentity,
+  PrivateAssistantError,
+  PrivateAssistantRuntime,
   type ManagedModels,
   type ManagedPiWork,
 } from "@uzina/pi-runtime";
+import { FactoryClient, type FactoryFetch } from "@uzina/client";
+import {
+  createRegistry,
+  type ToolRegistration,
+} from "@earendil-works/pi-durable";
 import { createFactoryHttpHandler } from "@uzina/core/http";
+import { FileWorkspaceSnapshotStorage } from "./snapshot-storage";
 import { FactoryService } from "@uzina/core";
 import { BunFactoryDatabase } from "./sqlite";
 import type { FactoryQueueJob } from "@uzina/contracts/factory";
 import { openLocalManagedPiWork } from "../runtime/managed-work";
 import { assertLoopbackHostname } from "../loopback";
+import { BunPrivateAssistantStore } from "./private-assistant-store";
 
 export interface StandaloneFactoryServer {
   server: ReturnType<typeof Bun.serve>;
@@ -35,6 +46,7 @@ export interface StandaloneFactoryServer {
 export type StandaloneFactoryOptions = {
   databasePath?: string;
   runtimeDirectory?: string;
+  snapshotStorageDirectory?: string;
   bootstrapSecret: string;
   models: ManagedModels;
   modelProvider: string;
@@ -52,6 +64,13 @@ export type StandaloneFactoryOptions = {
       workspacePath: string;
       release(): void | Promise<void>;
     }>;
+  };
+  privateAssistant?: {
+    bearer?: string;
+    credentialId?: string;
+    assistantId?: string;
+    ownerId?: string;
+    fetch?: FactoryFetch;
   };
 };
 
@@ -91,7 +110,52 @@ export async function createStandaloneFactoryServer(
   const runtimeDirectory = resolve(
     options.runtimeDirectory ?? defaults.runtimeDirectory,
   );
+  const snapshotStorageDirectory = resolve(
+    options.snapshotStorageDirectory ?? `${databasePath}.workspace-checkpoints`,
+  );
   mkdirSync(runtimeDirectory, { recursive: true });
+  const canonicalWorkspaces = Object.values(
+    options.workspaceDirectories ?? {},
+  ).map((mappedDirectory) => realpathSync(mappedDirectory));
+  if (
+    canonicalWorkspaces.some((workspace) =>
+      workspaceRootsOverlap(snapshotStorageDirectory, workspace),
+    )
+  ) {
+    throw new Error(
+      "Workspace snapshot storage must be outside every selected workspace root",
+    );
+  }
+  let storageAncestor = snapshotStorageDirectory;
+  while (!existsSync(storageAncestor))
+    storageAncestor = dirname(storageAncestor);
+  const projectedStorage = resolve(
+    realpathSync(storageAncestor),
+    relative(storageAncestor, snapshotStorageDirectory),
+  );
+  if (
+    canonicalWorkspaces.some((workspace) =>
+      workspaceRootsOverlap(projectedStorage, workspace),
+    )
+  ) {
+    throw new Error(
+      "Workspace snapshot storage must be outside every selected workspace root",
+    );
+  }
+  mkdirSync(snapshotStorageDirectory, { recursive: true, mode: 0o700 });
+  const canonicalSnapshotStorage = realpathSync(snapshotStorageDirectory);
+  if (
+    canonicalWorkspaces.some((workspace) =>
+      workspaceRootsOverlap(canonicalSnapshotStorage, workspace),
+    )
+  ) {
+    throw new Error(
+      "Workspace snapshot storage must be outside every selected workspace root",
+    );
+  }
+  const snapshotStorage = new FileWorkspaceSnapshotStorage(
+    snapshotStorageDirectory,
+  );
   if (!options.models.getModel(options.modelProvider, options.modelId)) {
     throw new Error(
       "Standalone Factory model is absent from the configured provider catalog",
@@ -160,26 +224,140 @@ export async function createStandaloneFactoryServer(
     }
   };
 
-  const handler = createFactoryHttpHandler(factory, {
-    async context(threadId) {
-      const runtimePath = join(
-        runtimeDirectory,
-        `${stableFilePart(threadId)}.sqlite`,
+  let server!: ReturnType<typeof Bun.serve>;
+  let privateAssistant: PrivateAssistantRuntime | undefined;
+  let privateAssistantStore: BunPrivateAssistantStore | undefined;
+  let privateAssistantOpening: Promise<PrivateAssistantRuntime> | undefined;
+  const privateAssistantPath = join(runtimeDirectory, "private-assistant");
+  const openPrivateAssistant = async (): Promise<PrivateAssistantRuntime> => {
+    if (privateAssistant) return privateAssistant;
+    if (privateAssistantOpening) return privateAssistantOpening;
+    const opening = (async () => {
+      await mkdir(privateAssistantPath, { recursive: true, mode: 0o700 });
+      await chmod(privateAssistantPath, 0o700);
+      const store = await BunPrivateAssistantStore.open(
+        join(privateAssistantPath, "metadata.sqlite"),
       );
-      if (!existsSync(runtimePath)) {
-        throw new Error("Managed Pi work has not been created for this thread");
+      privateAssistantStore = store;
+      const config = options.privateAssistant;
+      const expected =
+        config?.credentialId && config.assistantId && config.ownerId
+          ? {
+              credentialId: config.credentialId,
+              assistantId: config.assistantId,
+              ownerId: config.ownerId,
+            }
+          : undefined;
+      let client: FactoryClient | undefined;
+      try {
+        if (config?.bearer && expected) {
+          client = new FactoryClient({
+            baseUrl: server.url,
+            credential: config.bearer,
+            ...(config.fetch ? { fetch: config.fetch } : {}),
+          });
+        }
+      } catch {
+        client = undefined;
       }
-      return (await openWork(threadId)).context();
-    },
-    async status(threadId) {
-      const runtimePath = join(
-        runtimeDirectory,
-        `${stableFilePart(threadId)}.sqlite`,
+      const identityCheck = await checkPrivateAssistantIdentity(
+        client,
+        expected,
+        store,
       );
-      if (!existsSync(runtimePath)) return { status: "not-created" };
-      return (await openWork(threadId)).status();
+      const registry = createRegistry<ToolRegistration>();
+      const factoryTools =
+        client && config?.bearer
+          ? createFactoryToolExtension(client, {
+              credentialToRedact: config.bearer,
+            })
+          : undefined;
+      let assistantRuntime: PrivateAssistantRuntime | undefined;
+      const work = await openLocalManagedPiWork(
+        join(privateAssistantPath, "pi-durable.sqlite"),
+        {
+          models: options.models,
+          registry,
+          agent: {
+            model: {
+              provider: options.modelProvider,
+              modelId: options.modelId,
+            },
+          },
+          beforeWork: async () => {
+            if (!assistantRuntime || !(await assistantRuntime.available())) {
+              throw new PrivateAssistantError(
+                503,
+                "private_assistant_unavailable",
+              );
+            }
+          },
+        },
+      );
+      const runtime = new PrivateAssistantRuntime(
+        work,
+        store,
+        client,
+        expected,
+        registry,
+        factoryTools,
+        identityCheck,
+      );
+      assistantRuntime = runtime;
+      if (identityCheck.available) await runtime.resume();
+      privateAssistantStore = store;
+      privateAssistant = runtime;
+      return runtime;
+    })();
+    privateAssistantOpening = opening;
+    try {
+      return await opening;
+    } finally {
+      if (privateAssistantOpening === opening)
+        privateAssistantOpening = undefined;
+    }
+  };
+
+  const handler = createFactoryHttpHandler(
+    factory,
+    {
+      async context(threadId) {
+        const runtimePath = join(
+          runtimeDirectory,
+          `${stableFilePart(threadId)}.sqlite`,
+        );
+        if (!existsSync(runtimePath)) {
+          throw new Error(
+            "Managed Pi work has not been created for this thread",
+          );
+        }
+        return (await openWork(threadId)).context();
+      },
+      async status(threadId) {
+        const runtimePath = join(
+          runtimeDirectory,
+          `${stableFilePart(threadId)}.sqlite`,
+        );
+        if (!existsSync(runtimePath)) return { status: "not-created" };
+        return (await openWork(threadId)).status();
+      },
     },
-  });
+    {
+      async context() {
+        return (await openPrivateAssistant()).context();
+      },
+      async status() {
+        return (await openPrivateAssistant()).status();
+      },
+      async receipt(inputId) {
+        return (await openPrivateAssistant()).receipt(inputId);
+      },
+      async submit(inputId, text) {
+        return (await openPrivateAssistant()).submit(inputId, text);
+      },
+    },
+    snapshotStorage,
+  );
 
   const dispatch = async (input: FactoryQueueJob) => {
     const managed = await openWork(input.threadId);
@@ -241,7 +419,7 @@ export async function createStandaloneFactoryServer(
     });
   };
 
-  const server = Bun.serve({
+  server = Bun.serve({
     port: options.port ?? 8788,
     hostname,
     async fetch(request) {
@@ -269,6 +447,11 @@ export async function createStandaloneFactoryServer(
   });
 
   startDrain();
+  try {
+    await openPrivateAssistant();
+  } catch {
+    console.error("Private Factory assistant is parked and unavailable");
+  }
 
   return {
     server,
@@ -388,6 +571,8 @@ export async function createStandaloneFactoryServer(
       );
       await Promise.all([...work.values()].map((managed) => managed.close()));
       work.clear();
+      if (privateAssistant) await privateAssistant.close().catch(() => {});
+      privateAssistantStore?.close();
       database.close();
     },
   };

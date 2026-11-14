@@ -198,6 +198,33 @@ const schema = [
   )`,
   `CREATE INDEX IF NOT EXISTS dispatch_queue_by_node ON dispatch_intents(status, node_id, created_at)`,
   `CREATE INDEX IF NOT EXISTS execution_queue_by_node ON execution_jobs(status, node_id, accepted_at)`,
+  `CREATE TABLE IF NOT EXISTS workspace_snapshot_requests (
+    request_id TEXT PRIMARY KEY,
+    capture_request_id TEXT NOT NULL UNIQUE REFERENCES capture_control_requests(request_id),
+    snapshot_id TEXT NOT NULL UNIQUE,
+    capture_id TEXT NOT NULL UNIQUE,
+    actor_json TEXT NOT NULL,
+    project_id TEXT NOT NULL REFERENCES projects(project_id),
+    thread_id TEXT NOT NULL REFERENCES threads(thread_id),
+    node_id TEXT NOT NULL REFERENCES nodes(node_id),
+    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id),
+    ownership_generation INTEGER NOT NULL CHECK (ownership_generation >= 0),
+    status TEXT NOT NULL CHECK (status IN ('queued', 'claimed', 'workspace-checkpoint-available', 'blocked', 'uncertain')),
+    accepted_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    claimed_at TEXT,
+    manifest_reference TEXT,
+    report_json TEXT,
+    report_sha256 TEXT,
+    error_code TEXT
+  )`,
+  `CREATE TABLE IF NOT EXISTS workspace_snapshot_blobs (
+    capture_id TEXT NOT NULL,
+    reference TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+    PRIMARY KEY (capture_id, reference)
+  )`,
+  `CREATE INDEX IF NOT EXISTS workspace_snapshot_queue_by_node ON workspace_snapshot_requests(status, node_id, accepted_at)`,
   `CREATE INDEX IF NOT EXISTS capture_control_queue_by_node ON capture_control_requests(status, node_id, accepted_at)`,
   `CREATE INDEX IF NOT EXISTS factory_events_by_cursor ON factory_events(cursor)`,
 ];

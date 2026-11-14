@@ -17,6 +17,13 @@ import {
   factoryQueueJobSchema,
   captureControlAdmissionRequestSchema,
   captureControlStatusSchema,
+  workspaceSnapshotRequestSchema,
+  workspaceSnapshotStatusSchema,
+  workspaceSnapshotClaimRequestSchema,
+  workspaceSnapshotClaimSchema,
+  workspaceSnapshotReportSchema,
+  workspaceSnapshotReportResponseSchema,
+  type WorkspaceSnapshotClaim,
   factoryThreadSchema,
   factoryWorkspaceSchema,
   invitationCreateRequestSchema,
@@ -176,6 +183,31 @@ type ExecutionWorkspaceRow = {
   workspace_id: string;
   ownership_generation: number;
   state: "active" | "fenced";
+};
+type WorkspaceSnapshotRow = {
+  request_id: string;
+  capture_request_id: string;
+  snapshot_id: string;
+  capture_id: string;
+  actor_json: string;
+  project_id: string;
+  thread_id: string;
+  node_id: string;
+  workspace_id: string;
+  ownership_generation: number;
+  status:
+    | "queued"
+    | "claimed"
+    | "workspace-checkpoint-available"
+    | "blocked"
+    | "uncertain";
+  accepted_at: string;
+  updated_at: string;
+  claimed_at: string | null;
+  manifest_reference: string | null;
+  report_json: string | null;
+  report_sha256: string | null;
+  error_code: string | null;
 };
 type CaptureControlRow = {
   request_id: string;
@@ -779,6 +811,11 @@ export class FactoryService {
       credential: credential.credential,
       actor,
     };
+  }
+
+  /** Rejects every non-owner actor before exposing owner-private assistant state. */
+  requirePrivateAssistantOwner(session: FactorySession): string {
+    return this.#requireOwner(session);
   }
 
   currentParticipant(session: FactorySession): FactoryParticipant | null {
@@ -1557,6 +1594,294 @@ export class FactoryService {
       return this.#captureControlByRequest(input.requestId)!;
     });
     return this.#captureControlStatus(row);
+  }
+
+  /** Accept one snapshot only after the same capture control is durably source-fenced. */
+  requestWorkspaceSnapshot(session: FactorySession, request: unknown) {
+    this.#requireOwner(session);
+    const input = workspaceSnapshotRequestSchema.parse(request);
+    const result = this.database.transaction(() => {
+      this.#requireOwner(session);
+      const existing = this.#workspaceSnapshotByRequest(input.requestId);
+      if (existing) {
+        if (
+          existing.capture_request_id !== input.captureRequestId ||
+          existing.actor_json !== encode(session.actor)
+        ) {
+          throw conflict(
+            "workspace_snapshot_request_conflict",
+            "The stable snapshot request ID is already bound to another capture or actor",
+          );
+        }
+        return existing;
+      }
+      const capture = this.#captureControlByRequest(input.captureRequestId);
+      if (!capture || capture.actor_json !== encode(session.actor)) {
+        throw notFound("Source-fenced capture control");
+      }
+      const snapshotForCapture = this.database.all<WorkspaceSnapshotRow>(
+        "SELECT * FROM workspace_snapshot_requests WHERE capture_request_id = ? OR capture_id = ?",
+        [input.captureRequestId, capture.capture_id],
+      )[0];
+      if (snapshotForCapture) {
+        throw conflict(
+          "workspace_snapshot_capture_already_bound",
+          "A source-fenced capture may be bound to only one durable snapshot request",
+        );
+      }
+      if (capture.status !== "source-capture-fenced" || !capture.report_json) {
+        throw conflict(
+          "workspace_snapshot_source_unavailable",
+          "A snapshot requires confirmed source-capture-fenced evidence",
+        );
+      }
+      const thread = this.#captureThread(capture.thread_id);
+      const lock = this.database.all<{ capture_id: string }>(
+        "SELECT capture_id FROM managed_work_captures WHERE capture_id = ? AND thread_id = ? AND workspace_id = ?",
+        [capture.capture_id, capture.thread_id, capture.workspace_id],
+      )[0];
+      if (
+        !lock ||
+        thread.node_id !== capture.node_id ||
+        thread.workspace_id !== capture.workspace_id ||
+        thread.ownership_generation !== capture.ownership_generation
+      ) {
+        throw conflict(
+          "workspace_snapshot_fence_missing",
+          "The original source fence or immutable target is no longer valid",
+        );
+      }
+      const control = executionCaptureControlSchema.parse(
+        JSON.parse(capture.payload_json),
+      );
+      const snapshotId = makeId("workspace-snapshot");
+      const acceptedAt = now();
+      this.database.exec(
+        `INSERT INTO workspace_snapshot_requests(
+          request_id, capture_request_id, snapshot_id, capture_id, actor_json,
+          project_id, thread_id, node_id, workspace_id, ownership_generation,
+          status, accepted_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`,
+        [
+          input.requestId,
+          input.captureRequestId,
+          snapshotId,
+          control.captureId,
+          encode(session.actor),
+          capture.project_id,
+          capture.thread_id,
+          capture.node_id,
+          capture.workspace_id,
+          capture.ownership_generation,
+          acceptedAt,
+          acceptedAt,
+        ],
+      );
+      return this.#workspaceSnapshotByRequest(input.requestId)!;
+    });
+    return this.#workspaceSnapshotStatus(result);
+  }
+
+  getWorkspaceSnapshotStatus(session: FactorySession, requestId: string) {
+    this.#requireOwner(session);
+    const row = this.#workspaceSnapshotByRequest(requestId);
+    if (!row) throw notFound("Workspace snapshot request");
+    if (row.actor_json !== encode(session.actor)) throw forbidden();
+    return this.#workspaceSnapshotStatus(row);
+  }
+
+  claimWorkspaceSnapshot(
+    session: FactorySession,
+    request: unknown,
+  ): WorkspaceSnapshotClaim | null {
+    const input = workspaceSnapshotClaimRequestSchema.parse(request);
+    this.#requireNode(session, input.nodeId);
+    return this.database.transaction(() => {
+      this.#requireNode(session, input.nodeId);
+      const node = this.database.all<NodeRow>(
+        "SELECT node_id, name, availability, last_seen_at FROM nodes WHERE node_id = ?",
+        [input.nodeId],
+      )[0];
+      if (!node || !this.#isNodeOnline(node)) return null;
+      const row = this.database.all<WorkspaceSnapshotRow>(
+        `SELECT * FROM workspace_snapshot_requests WHERE node_id = ?
+         AND status IN ('queued', 'claimed') ORDER BY accepted_at, snapshot_id LIMIT 1`,
+        [input.nodeId],
+      )[0];
+      if (!row) return null;
+      if (!this.#isWorkspaceSnapshotFenceValid(row)) return null;
+      if (row.status === "queued") {
+        this.database.exec(
+          "UPDATE workspace_snapshot_requests SET status = 'claimed', claimed_at = ?, updated_at = ? WHERE snapshot_id = ? AND status = 'queued'",
+          [now(), now(), row.snapshot_id],
+        );
+      }
+      return workspaceSnapshotClaimSchema.parse({
+        contractVersion: EXECUTION_CONTRACT_VERSION,
+        snapshotId: row.snapshot_id,
+        requestId: row.request_id,
+        captureRequestId: row.capture_request_id,
+        captureId: row.capture_id,
+        nodeId: row.node_id,
+        target: { nodeId: row.node_id, workspaceId: row.workspace_id },
+        ownershipGeneration: row.ownership_generation,
+      });
+    });
+  }
+
+  async reportWorkspaceSnapshot(
+    session: FactorySession,
+    nodeId: string,
+    snapshotId: string,
+    report: unknown,
+    verifiedBlobs: readonly { reference: string; size: number }[] = [],
+  ) {
+    const input = workspaceSnapshotReportSchema.parse(report);
+    this.#requireNode(session, nodeId);
+    const row = this.#workspaceSnapshotById(snapshotId);
+    if (!row) throw notFound("Assigned workspace snapshot");
+    if (
+      input.nodeId !== nodeId ||
+      row.node_id !== nodeId ||
+      row.snapshot_id !== snapshotId ||
+      row.request_id !== input.requestId ||
+      row.capture_request_id !== input.captureRequestId ||
+      row.capture_id !== input.captureId ||
+      row.workspace_id !== input.target.workspaceId ||
+      row.node_id !== input.target.nodeId ||
+      row.ownership_generation !== input.ownershipGeneration
+    ) {
+      throw conflict(
+        "workspace_snapshot_assignment_mismatch",
+        "Snapshot report does not match its persisted assignment",
+      );
+    }
+    const reportHash = await sha256(stableJson(input));
+    this.database.transaction(() => {
+      this.#requireNode(session, nodeId);
+      const current = this.#workspaceSnapshotById(snapshotId);
+      if (!current) throw notFound("Assigned workspace snapshot");
+      if (current.report_json !== null) {
+        if (current.report_sha256 !== reportHash) {
+          throw conflict(
+            "workspace_snapshot_report_conflict",
+            "A different workspace snapshot report is already committed",
+          );
+        }
+        return;
+      }
+      if (current.status !== "claimed") {
+        throw conflict(
+          "workspace_snapshot_not_claimed",
+          "Snapshot report has no persisted claim",
+        );
+      }
+      if (!this.#isWorkspaceSnapshotFenceValid(current)) {
+        throw conflict(
+          "workspace_snapshot_source_fence_lost",
+          "The original source capture fence is no longer valid",
+        );
+      }
+      if (input.status === "workspace-checkpoint-available") {
+        const references = new Map(
+          verifiedBlobs.map(({ reference, size }) => [reference, size]),
+        );
+        if (
+          references.size !== verifiedBlobs.length ||
+          !input.manifestReference ||
+          !references.has(input.manifestReference) ||
+          references.size === 0 ||
+          references.size > 100_003 ||
+          [...references.values()].some(
+            (size) =>
+              !Number.isSafeInteger(size) ||
+              size < 0 ||
+              size > 512 * 1024 * 1024,
+          ) ||
+          [...references.values()].reduce((sum, size) => sum + size, 0) >
+            512 * 1024 * 1024
+        ) {
+          throw conflict(
+            "workspace_snapshot_integrity_unverified",
+            "Available snapshots require bounded verified manifest references",
+          );
+        }
+        for (const [reference, size] of references) {
+          if (!/^[a-f0-9]{64}$/.test(reference)) {
+            throw conflict(
+              "workspace_snapshot_integrity_unverified",
+              "Snapshot blob references must be lowercase SHA-256 digests",
+            );
+          }
+          this.database.exec(
+            "INSERT INTO workspace_snapshot_blobs(capture_id, reference, size_bytes) VALUES (?, ?, ?)",
+            [current.capture_id, reference, size],
+          );
+        }
+      } else if (verifiedBlobs.length > 0) {
+        throw conflict(
+          "workspace_snapshot_unavailable_with_blobs",
+          "A blocked snapshot cannot publish blob references",
+        );
+      }
+      this.database.exec(
+        `UPDATE workspace_snapshot_requests SET status = ?, updated_at = ?, manifest_reference = ?,
+          report_json = ?, report_sha256 = ?, error_code = ? WHERE snapshot_id = ? AND status = 'claimed'`,
+        [
+          input.status,
+          input.reportedAt,
+          input.manifestReference ?? null,
+          encode(input),
+          reportHash,
+          input.errorCode ?? null,
+          snapshotId,
+        ],
+      );
+    });
+    return workspaceSnapshotReportResponseSchema.parse({
+      contractVersion: EXECUTION_CONTRACT_VERSION,
+      nodeId,
+      snapshotId,
+      captureId: input.captureId,
+      accepted: true,
+      status: input.status,
+    });
+  }
+
+  authorizeWorkspaceSnapshotUpload(
+    session: FactorySession,
+    nodeId: string,
+    captureId: string,
+  ): boolean {
+    this.#requireNode(session, nodeId);
+    const row = this.#workspaceSnapshotByCapture(captureId);
+    return Boolean(
+      row &&
+      row.node_id === nodeId &&
+      row.status === "claimed" &&
+      this.#isWorkspaceSnapshotFenceValid(row),
+    );
+  }
+
+  getAuthorizedWorkspaceSnapshotBlobReferences(
+    session: FactorySession,
+    captureId: string,
+  ): string[] {
+    this.#requireOwner(session);
+    const row = this.#workspaceSnapshotByCapture(captureId);
+    if (
+      !row ||
+      row.actor_json !== encode(session.actor) ||
+      row.status !== "workspace-checkpoint-available"
+    ) {
+      throw notFound("Workspace checkpoint");
+    }
+    return this.database
+      .all<{ reference: string }>(
+        "SELECT reference FROM workspace_snapshot_blobs WHERE capture_id = ? ORDER BY reference",
+        [captureId],
+      )
+      .map((item) => item.reference);
   }
 
   /** Owner-only durable status lookup; a fenced result never means a checkpoint exists. */
@@ -2971,6 +3296,79 @@ export class FactoryService {
         "A managed-work capture is already active for this work or workspace",
       );
     }
+  }
+
+  #workspaceSnapshotByRequest(
+    requestId: string,
+  ): WorkspaceSnapshotRow | undefined {
+    return this.database.all<WorkspaceSnapshotRow>(
+      "SELECT * FROM workspace_snapshot_requests WHERE request_id = ?",
+      [requestId],
+    )[0];
+  }
+
+  #workspaceSnapshotById(snapshotId: string): WorkspaceSnapshotRow | undefined {
+    return this.database.all<WorkspaceSnapshotRow>(
+      "SELECT * FROM workspace_snapshot_requests WHERE snapshot_id = ?",
+      [snapshotId],
+    )[0];
+  }
+
+  #workspaceSnapshotByCapture(
+    captureId: string,
+  ): WorkspaceSnapshotRow | undefined {
+    return this.database.all<WorkspaceSnapshotRow>(
+      "SELECT * FROM workspace_snapshot_requests WHERE capture_id = ?",
+      [captureId],
+    )[0];
+  }
+
+  #isWorkspaceSnapshotFenceValid(row: WorkspaceSnapshotRow): boolean {
+    const control = this.#captureControlByRequest(row.capture_request_id);
+    const lock = this.database.all<{ capture_id: string }>(
+      "SELECT capture_id FROM managed_work_captures WHERE capture_id = ? AND thread_id = ? AND workspace_id = ?",
+      [row.capture_id, row.thread_id, row.workspace_id],
+    )[0];
+    const thread = this.#captureThread(row.thread_id);
+    return Boolean(
+      control &&
+      control.status === "source-capture-fenced" &&
+      control.capture_id === row.capture_id &&
+      control.node_id === row.node_id &&
+      control.thread_id === row.thread_id &&
+      control.workspace_id === row.workspace_id &&
+      control.ownership_generation === row.ownership_generation &&
+      lock &&
+      thread.node_id === row.node_id &&
+      thread.workspace_id === row.workspace_id &&
+      thread.ownership_generation === row.ownership_generation &&
+      this.#ownershipGeneration() === row.ownership_generation &&
+      this.#hasActiveWorkspaceReport(
+        row.node_id,
+        row.workspace_id,
+        row.ownership_generation,
+      ),
+    );
+  }
+
+  #workspaceSnapshotStatus(row: WorkspaceSnapshotRow) {
+    return workspaceSnapshotStatusSchema.parse({
+      contractVersion: CONTRACT_VERSION,
+      requestId: row.request_id,
+      snapshotId: row.snapshot_id,
+      captureRequestId: row.capture_request_id,
+      captureId: row.capture_id,
+      threadId: row.thread_id,
+      target: { nodeId: row.node_id, workspaceId: row.workspace_id },
+      ownershipGeneration: row.ownership_generation,
+      status: row.status,
+      acceptedAt: row.accepted_at,
+      updatedAt: row.updated_at,
+      ...(row.manifest_reference
+        ? { manifestReference: row.manifest_reference }
+        : {}),
+      ...(row.error_code ? { errorCode: row.error_code } : {}),
+    });
   }
 
   #captureControlByRequest(requestId: string): CaptureControlRow | undefined {

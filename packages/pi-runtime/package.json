@@ -11,10 +11,13 @@
     "./worker-provider": "./src/worker-provider.ts",
     "./work": "./src/work.ts",
     "./model-config": "./src/model-config.ts",
-    "./remote-bridge": "./src/remote-bridge.ts"
+    "./remote-bridge": "./src/remote-bridge.ts",
+    "./factory-tools": "./src/factory-tools.ts",
+    "./private-assistant": "./src/private-assistant.ts"
   },
   "dependencies": {
     "@uzina/contracts": "workspace:*",
+    "@uzina/client": "workspace:*",
     "@earendil-works/pi-ai": "1.4.0",
     "@earendil-works/chord": "1.4.0",
     "@earendil-works/pi-durable": "1.4.0",

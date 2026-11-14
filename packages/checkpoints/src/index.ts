@@ -29,6 +29,13 @@ import {
   resolve,
   sep,
 } from "node:path";
+import {
+  normalizeWorkspaceGlobs as normalizeGlobs,
+  workspaceGlobCouldMatchDescendant as globCouldMatchDescendant,
+  workspacePathMatchesAny as matchesAny,
+  workspacePathMatchesPolicy as matchesPolicy,
+  WORKSPACE_CHECKPOINT_DEFAULT_EXCLUSIONS as DEFAULT_EXCLUSIONS,
+} from "./portable";
 
 export const WORKSPACE_CHECKPOINT_FORMAT =
   "uzina-workspace-checkpoint" as const;
@@ -38,17 +45,6 @@ const REQUIRED_CAPABILITIES = [
   "workspace-files-v1",
   "git-bundle-v1",
   "git-index-patch-v1",
-] as const;
-const DEFAULT_EXCLUSIONS = [
-  "**/.env",
-  "**/.env.*",
-  "**/credentials",
-  "**/credentials.*",
-  "**/auth.json",
-  ".pi/agent/**",
-  "**/.pi/agent/**",
-  "**/.ssh/**",
-  "**/node_modules/**",
 ] as const;
 const HARD_LIMITS = {
   files: 100_000,
@@ -66,7 +62,6 @@ export const WORKSPACE_CHECKPOINT_MANIFEST_MAX_BYTES =
 export const WORKSPACE_CHECKPOINT_ATTACHMENT_MAX_BYTES =
   HARD_LIMITS.attachmentBytes;
 const FORMAT_CAPABILITIES = new Set<string>(REQUIRED_CAPABILITIES);
-const globCache = new Map<string, RegExp>();
 
 export interface BlobTransport {
   /** Store bytes immutably and return their lowercase SHA-256 content address. */
@@ -80,7 +75,7 @@ export class FileBlobTransport implements BlobTransport {
 
   async putBlob(bytes: Uint8Array): Promise<string> {
     const digest = sha256(bytes);
-    await mkdir(this.rootDirectory, { recursive: true });
+    await mkdir(this.rootDirectory, { recursive: true, mode: 0o700 });
     const destination = join(this.rootDirectory, digest);
     try {
       const existing = await readSafeBlobFile(destination);
@@ -98,7 +93,7 @@ export class FileBlobTransport implements BlobTransport {
       `.${digest}.${randomUUID()}.tmp`,
     );
     try {
-      await writeFile(temporary, bytes, { flag: "wx" });
+      await writeFile(temporary, bytes, { flag: "wx", mode: 0o600 });
       await rename(temporary, destination);
     } catch (error) {
       await rm(temporary, { force: true });
@@ -1187,7 +1182,7 @@ async function collectWorkspaceFiles(
       if (pathError) throw new Error(pathError);
       const absolutePath = join(directory, name);
       const stat = await lstat(absolutePath);
-      if (isExcluded(path, excludeGlobs)) {
+      if (matchesAny(path, excludeGlobs)) {
         recordOmission(path, "excluded");
         continue;
       }
@@ -1583,83 +1578,6 @@ function resolveLimits(limits: CaptureLimits = {}) {
       "maxAttachmentBytes",
     ),
   };
-}
-
-function normalizeGlobs(globs: string[]): string[] {
-  if (!Array.isArray(globs)) throw new Error("path globs must be an array");
-  if (globs.length > 128)
-    throw new Error("path pattern count exceeds the safety limit");
-  return [
-    ...new Set(
-      globs.map((glob) => {
-        if (
-          typeof glob !== "string" ||
-          !glob ||
-          glob.length > 1024 ||
-          glob.includes("\\") ||
-          isAbsolute(glob) ||
-          glob.split("/").includes("..")
-        ) {
-          throw new Error(`invalid workspace path pattern: ${String(glob)}`);
-        }
-        return glob.replace(/^\.\//, "");
-      }),
-    ),
-  ].sort();
-}
-
-function globExpression(glob: string): RegExp {
-  const cached = globCache.get(glob);
-  if (cached) return cached;
-  let expression = "^";
-  for (let index = 0; index < glob.length; index += 1) {
-    const char = glob[index]!;
-    if (char === "*" && glob[index + 1] === "*") {
-      index += 1;
-      if (glob[index + 1] === "/") {
-        index += 1;
-        expression += "(?:.*/)?";
-      } else {
-        expression += ".*";
-      }
-    } else if (char === "*") expression += "[^/]*";
-    else if (char === "?") expression += "[^/]";
-    else expression += char.replace(/[|\\{}()[\]^$+?.]/g, "\\$&");
-  }
-  const compiled = new RegExp(`${expression}$`);
-  if (globCache.size >= 512) globCache.delete(globCache.keys().next().value!);
-  globCache.set(glob, compiled);
-  return compiled;
-}
-
-function matchesAny(path: string, globs: string[]): boolean {
-  return globs.some((glob) => globExpression(glob).test(path));
-}
-
-function matchesPolicy(
-  path: string,
-  includeGlobs: string[] | null,
-  excludeGlobs: string[],
-): boolean {
-  return (
-    !isExcluded(path, excludeGlobs) &&
-    (!includeGlobs || matchesAny(path, includeGlobs))
-  );
-}
-
-function isExcluded(path: string, globs: string[]): boolean {
-  return matchesAny(path, globs);
-}
-
-function globCouldMatchDescendant(glob: string, directory: string): boolean {
-  if (globExpression(glob).test(directory)) return true;
-  const wildcardIndex = glob.search(/[?*]/);
-  const literalPrefix = wildcardIndex < 0 ? glob : glob.slice(0, wildcardIndex);
-  return (
-    literalPrefix.length === 0 ||
-    literalPrefix.startsWith(`${directory}/`) ||
-    directory.startsWith(literalPrefix)
-  );
 }
 
 function validateRelativePath(path: string): string | null {

@@ -17,6 +17,8 @@
       "dependencies": {
         "@earendil-works/chord": "1.4.0",
         "@earendil-works/pi-durable": "1.4.0",
+        "@uzina/checkpoints": "workspace:*",
+        "@uzina/client": "workspace:*",
         "@uzina/contracts": "workspace:*",
         "@uzina/core": "workspace:*",
         "@uzina/pi-runtime": "workspace:*",
@@ -34,13 +36,13 @@
         "@earendil-works/chord": "1.4.0",
         "@earendil-works/pi-durable": "1.4.0",
         "@uzina/checkpoints": "workspace:*",
+        "@uzina/client": "workspace:*",
         "@uzina/contracts": "workspace:*",
         "@uzina/core": "workspace:*",
         "@uzina/pi-runtime": "workspace:*",
       },
       "devDependencies": {
         "@modelcontextprotocol/sdk": "1.32.2",
-        "@uzina/client": "workspace:*",
       },
     },
     "packages/checkpoints": {
@@ -71,6 +73,7 @@
       "version": "0.0.0",
       "dependencies": {
         "@modelcontextprotocol/sdk": "1.32.2",
+        "@uzina/checkpoints": "workspace:*",
         "@uzina/contracts": "workspace:*",
         "zod": "^3.25.76",
       },
@@ -82,6 +85,7 @@
         "@earendil-works/chord": "1.4.0",
         "@earendil-works/pi-ai": "1.4.0",
         "@earendil-works/pi-durable": "1.4.0",
+        "@uzina/client": "workspace:*",
         "@uzina/contracts": "workspace:*",
         "typebox": "1.3.27",
       },

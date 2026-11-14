@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const cloudflareDirectory = resolve(scriptDirectory, "..");
+const productionEntrypoint = join(cloudflareDirectory, "src/index.ts");
 const piAiEntry = fileURLToPath(import.meta.resolve("@earendil-works/pi-ai"));
 const piAiDist = dirname(piAiEntry);
 const piAiPackage = JSON.parse(
@@ -59,16 +60,23 @@ export interface CloudflareWorkerArtifact {
 
 let buildPromise: Promise<CloudflareWorkerArtifact> | undefined;
 
-/** The checked-in Wrangler build and Miniflare tests consume this identical compatibility bundle. */
-export function buildCloudflareWorkerArtifact(): Promise<CloudflareWorkerArtifact> {
-  buildPromise ??= buildWorkerArtifact();
+/** Production and test entrypoints share the reviewed Worker compatibility bundle. */
+export function buildCloudflareWorkerArtifact(
+  entrypoint = productionEntrypoint,
+): Promise<CloudflareWorkerArtifact> {
+  if (entrypoint !== productionEntrypoint) {
+    return buildWorkerArtifact(entrypoint);
+  }
+  buildPromise ??= buildWorkerArtifact(productionEntrypoint);
   return buildPromise;
 }
 
-async function buildWorkerArtifact(): Promise<CloudflareWorkerArtifact> {
+async function buildWorkerArtifact(
+  entrypoint: string,
+): Promise<CloudflareWorkerArtifact> {
   const outdir = join(cloudflareDirectory, "build");
   const result = await Bun.build({
-    entrypoints: [join(cloudflareDirectory, "src/index.ts")],
+    entrypoints: [entrypoint],
     outdir,
     target: "browser",
     packages: "bundle",
@@ -87,9 +95,9 @@ async function buildWorkerArtifact(): Promise<CloudflareWorkerArtifact> {
       "Expected Pi AI Worker auth and OAuth modules were not replaced; refusing an unreviewed bundle",
     );
   }
-  const output = result.outputs.find((file) => file.path.endsWith("index.js"));
+  const output = result.outputs.find((file) => file.path.endsWith(".js"));
   if (!output)
-    throw new Error("Cloudflare compatibility bundle has no index.js entry");
+    throw new Error("Cloudflare compatibility bundle has no JavaScript entry");
   return { path: output.path, script: await output.text() };
 }
 

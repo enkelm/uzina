@@ -32,6 +32,19 @@ export class FactoryObject
     return this.#controller.fetch(request);
   }
 
+  factoryHttp(request: {
+    url: string;
+    method: "GET" | "POST";
+    headers: Record<string, string>;
+    body?: string;
+  }) {
+    return this.#controller.factoryHttp(request);
+  }
+
+  authorizePrivateAssistant(credential: string) {
+    return this.#controller.authorizePrivateAssistant(credential);
+  }
+
   alarm(): Promise<void> {
     return this.#controller.alarm();
   }

@@ -120,6 +120,38 @@ export class ExecutionLoop {
             this.#daemon.markCaptureControlReported(report.controlId, report);
           }
 
+          for (const report of this.#daemon.pendingWorkspaceSnapshotReports()) {
+            if (shutdown.signal.aborted) break;
+            await this.#controller.reportWorkspaceSnapshot(report);
+            this.#daemon.markWorkspaceSnapshotReported(
+              report.snapshotId,
+              report,
+            );
+          }
+
+          if (shutdown.signal.aborted) break;
+          const snapshot = await this.#controller.claimWorkspaceSnapshot();
+          if (shutdown.signal.aborted) break;
+          if (snapshot) {
+            const report = await this.#daemon.executeWorkspaceSnapshot(
+              snapshot,
+              (captureId, reference, stream, contentLength) =>
+                this.#controller.uploadCaptureBlob(
+                  captureId,
+                  reference,
+                  stream,
+                  contentLength,
+                ),
+            );
+            if (!credentialRejected) {
+              await this.#controller.reportWorkspaceSnapshot(report);
+              this.#daemon.markWorkspaceSnapshotReported(
+                report.snapshotId,
+                report,
+              );
+            }
+          }
+
           if (shutdown.signal.aborted) break;
           const captureControl = await this.#controller.claimCaptureControl();
           if (shutdown.signal.aborted) break;

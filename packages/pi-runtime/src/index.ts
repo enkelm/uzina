@@ -220,6 +220,22 @@ export type { RemoteToolExecutor } from "./tools";
 export { createManagedRemoteToolExecutor } from "./remote-bridge";
 export type { ManagedRemoteExecutionBridge } from "./remote-bridge";
 export {
+  PrivateAssistantError,
+  PrivateAssistantRuntime,
+  checkPrivateAssistantIdentity,
+  verifyPrivateAssistantIdentity,
+} from "./private-assistant";
+export type {
+  PrivateAssistantAdmission,
+  PrivateAssistantIdentity,
+  PrivateAssistantIdentityCheck,
+  PrivateAssistantStore,
+} from "./private-assistant";
+export {
+  createFactoryToolExtension,
+  FACTORY_INPUT_REQUEST_MEMO,
+} from "./factory-tools";
+export {
   createConfiguredModels,
   createManagedRuntimeOptions,
   readManagedModelConfig,

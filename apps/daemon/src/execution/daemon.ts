@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
   constants,
+  createReadStream,
   existsSync,
   fsyncSync,
   lstatSync,
@@ -14,7 +15,20 @@ import {
   statSync,
   writeSync,
 } from "node:fs";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { Readable } from "node:stream";
+import { tmpdir } from "node:os";
+import {
+  captureWorkspaceCheckpoint,
+  FileBlobTransport,
+  type WorkspaceCheckpointManifest,
+} from "@uzina/checkpoints";
+import {
+  workspaceSnapshotClaimSchema,
+  workspaceSnapshotReportSchema,
+  type WorkspaceSnapshotClaim,
+  type WorkspaceSnapshotReport,
+} from "@uzina/contracts/factory";
 import { Database } from "bun:sqlite";
 import {
   EXECUTION_CONTRACT_VERSION,
@@ -61,6 +75,7 @@ export interface ExecutionDaemonOptions {
   workspaces: readonly WorkspaceMapping[];
   daemonVersion?: string;
   rexExecutable?: string;
+  snapshotCacheDirectory?: string;
 }
 
 interface WorkspaceRow {
@@ -84,6 +99,21 @@ interface CaptureControlRow {
   report_sha256: string;
   reported_at: string | null;
   error_code: string | null;
+}
+
+interface WorkspaceSnapshotReceiptRow {
+  snapshot_id: string;
+  request_id: string;
+  capture_request_id: string;
+  capture_id: string;
+  node_id: string;
+  workspace_id: string;
+  ownership_generation: number;
+  status: "producing" | "captured" | "available" | "blocked" | "uncertain";
+  manifest_reference: string | null;
+  report_json: string | null;
+  report_sha256: string | null;
+  reported_at: string | null;
 }
 
 interface JobRow {
@@ -256,6 +286,7 @@ export class ExecutionDaemon {
   readonly #db: Database;
   readonly #nodeId: string;
   readonly #daemonVersion: string;
+  readonly #snapshotCacheDirectory: string;
   readonly #workspaces = new Map<string, string>();
   readonly rex: RexProcessManager;
   #closed = false;
@@ -272,6 +303,12 @@ export class ExecutionDaemon {
     }
     this.#nodeId = options.nodeId;
     this.#daemonVersion = options.daemonVersion ?? "0.0.0";
+    this.#snapshotCacheDirectory = resolve(
+      options.snapshotCacheDirectory ??
+        (options.databasePath === ":memory:"
+          ? join(tmpdir(), `uzina-snapshot-cache-${randomUUID()}`)
+          : `${resolve(options.databasePath)}.snapshot-cache`),
+    );
     this.#db = new Database(options.databasePath);
     try {
       this.#db.exec(`
@@ -326,6 +363,21 @@ export class ExecutionDaemon {
         report_sha256 TEXT NOT NULL,
         reported_at TEXT,
         error_code TEXT
+      );
+      CREATE TABLE IF NOT EXISTS execution_workspace_snapshots (
+        snapshot_id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL UNIQUE,
+        capture_request_id TEXT NOT NULL UNIQUE,
+        capture_id TEXT NOT NULL UNIQUE,
+        node_id TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        ownership_generation INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('producing', 'captured', 'available', 'blocked', 'uncertain')),
+        manifest_reference TEXT,
+        report_json TEXT,
+        report_sha256 TEXT,
+        accepted_at TEXT NOT NULL,
+        reported_at TEXT
       );
       CREATE TABLE IF NOT EXISTS execution_rex_processes (
         process_id TEXT PRIMARY KEY,
@@ -892,6 +944,191 @@ export class ExecutionDaemon {
       .run(new Date().toISOString(), controlId);
   }
 
+  pendingWorkspaceSnapshotReports(): WorkspaceSnapshotReport[] {
+    this.#assertOpen();
+    return this.#db
+      .query<{ report_json: string }, []>(
+        "SELECT report_json FROM execution_workspace_snapshots WHERE report_json IS NOT NULL AND reported_at IS NULL ORDER BY accepted_at, snapshot_id",
+      )
+      .all()
+      .map((row) =>
+        workspaceSnapshotReportSchema.parse(JSON.parse(row.report_json)),
+      );
+  }
+
+  markWorkspaceSnapshotReported(
+    snapshotId: string,
+    report: WorkspaceSnapshotReport,
+  ): void {
+    this.#assertOpen();
+    const row = this.#workspaceSnapshotRow(snapshotId);
+    if (!row || row.report_sha256 !== executionPayloadSha256(report)) {
+      throw new ExecutionError("workspace_snapshot_report_ack_mismatch");
+    }
+    this.#db
+      .query(
+        "UPDATE execution_workspace_snapshots SET reported_at = ?, status = CASE WHEN status IN ('blocked', 'uncertain') THEN status ELSE 'available' END WHERE snapshot_id = ? AND reported_at IS NULL",
+      )
+      .run(new Date().toISOString(), snapshotId);
+  }
+
+  /** Produces once under the held CONTROL fence, then retries only immutable cached uploads. */
+  async executeWorkspaceSnapshot(
+    input: unknown,
+    uploadBlob: (
+      captureId: string,
+      reference: string,
+      stream: ReadableStream<Uint8Array>,
+      contentLength: number,
+    ) => Promise<void>,
+  ): Promise<WorkspaceSnapshotReport> {
+    this.#assertOpen();
+    const snapshot = workspaceSnapshotClaimSchema.parse(input);
+    const previous = this.#workspaceSnapshotRow(snapshot.snapshotId);
+    if (previous) {
+      this.#assertWorkspaceSnapshotIdentity(snapshot, previous);
+      if (previous.report_json) {
+        return workspaceSnapshotReportSchema.parse(
+          JSON.parse(previous.report_json),
+        );
+      }
+      if (previous.status === "producing") {
+        return this.#storeWorkspaceSnapshotReport(
+          snapshot,
+          "uncertain",
+          "snapshot_production_interrupted",
+        );
+      }
+      if (previous.status === "blocked" || previous.status === "uncertain") {
+        return this.#storeWorkspaceSnapshotReport(
+          snapshot,
+          previous.status,
+          previous.status === "blocked"
+            ? "snapshot_production_blocked"
+            : "snapshot_cache_uncertain",
+        );
+      }
+    } else {
+      this.#assertWorkspaceSnapshotFence(snapshot);
+      this.#transaction(() => {
+        this.#db
+          .query(
+            `INSERT INTO execution_workspace_snapshots(
+              snapshot_id, request_id, capture_request_id, capture_id, node_id,
+              workspace_id, ownership_generation, status, accepted_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'producing', ?)`,
+          )
+          .run(
+            snapshot.snapshotId,
+            snapshot.requestId,
+            snapshot.captureRequestId,
+            snapshot.captureId,
+            snapshot.nodeId,
+            snapshot.target.workspaceId,
+            snapshot.ownershipGeneration,
+            new Date().toISOString(),
+          );
+      });
+    }
+
+    let manifestReference: string;
+    let manifest: WorkspaceCheckpointManifest;
+    const cacheDirectory = join(
+      this.#snapshotCacheDirectory,
+      sha256(snapshot.captureId),
+    );
+    const cache = new FileBlobTransport(cacheDirectory);
+    const captured = this.#workspaceSnapshotRow(snapshot.snapshotId);
+    try {
+      this.#assertWorkspaceSnapshotFence(snapshot);
+      await this.#assertSnapshotCacheOutsideWorkspaces(cacheDirectory);
+      if (captured?.status === "captured") {
+        if (!captured.manifest_reference) throw new Error("missing_manifest");
+        manifestReference = captured.manifest_reference;
+        const manifestBytes = await cache.getBlob(manifestReference);
+        manifest = JSON.parse(
+          new TextDecoder().decode(manifestBytes),
+        ) as WorkspaceCheckpointManifest;
+        this.#assertSnapshotManifestReferences(manifest, manifestReference);
+      } else {
+        const result = await captureWorkspaceCheckpoint({
+          workspacePath: this.#workspaceRoot(snapshot.target.workspaceId),
+          transport: cache,
+        });
+        manifestReference = result.manifestReference;
+        manifest = result.manifest;
+        this.#assertSnapshotManifestReferences(manifest, manifestReference);
+        this.#transaction(() => {
+          this.#db
+            .query(
+              "UPDATE execution_workspace_snapshots SET status = 'captured', manifest_reference = ? WHERE snapshot_id = ? AND status = 'producing'",
+            )
+            .run(manifestReference, snapshot.snapshotId);
+        });
+      }
+    } catch {
+      const row = this.#workspaceSnapshotRow(snapshot.snapshotId);
+      if (row?.status === "producing") {
+        return this.#storeWorkspaceSnapshotReport(
+          snapshot,
+          "blocked",
+          "workspace_checkpoint_capture_failed",
+        );
+      }
+      return this.#storeWorkspaceSnapshotReport(
+        snapshot,
+        "uncertain",
+        "snapshot_cache_missing_or_corrupt",
+      );
+    }
+
+    const references = this.#snapshotBlobReferences(
+      manifest,
+      manifestReference,
+    );
+    for (const reference of references) {
+      this.#assertWorkspaceSnapshotFence(snapshot);
+      const path = join(cacheDirectory, reference);
+      let size: number;
+      try {
+        size = statSync(path).size;
+        if (
+          !Number.isSafeInteger(size) ||
+          size < 0 ||
+          size > 512 * 1024 * 1024
+        ) {
+          throw new Error("invalid_cache_size");
+        }
+        const hasher = createHash("sha256");
+        let actualSize = 0;
+        for await (const part of createReadStream(path)) {
+          const bytes = Buffer.isBuffer(part) ? part : Buffer.from(part);
+          actualSize += bytes.byteLength;
+          hasher.update(bytes);
+        }
+        if (actualSize !== size || hasher.digest("hex") !== reference) {
+          throw new Error("cache_hash_mismatch");
+        }
+      } catch {
+        return this.#storeWorkspaceSnapshotReport(
+          snapshot,
+          "uncertain",
+          "snapshot_cache_missing_or_corrupt",
+        );
+      }
+      const stream = Readable.toWeb(
+        createReadStream(path),
+      ) as unknown as ReadableStream<Uint8Array>;
+      await uploadBlob(snapshot.captureId, reference, stream, size);
+    }
+    return this.#storeWorkspaceSnapshotReport(
+      snapshot,
+      "workspace-checkpoint-available",
+      undefined,
+      manifestReference,
+    );
+  }
+
   /** Ordinary local capture cleanup cannot clear a fence owned by remote CONTROL. */
   endWorkspaceCapture(captureId: string): void {
     this.#assertOpen();
@@ -1346,7 +1583,10 @@ export class ExecutionDaemon {
     }
   }
 
-  #assertWorkspaceCapturePreflight(workspaceId: string): void {
+  #assertWorkspaceCapturePreflight(
+    workspaceId: string,
+    expectedControlId?: string,
+  ): void {
     const workspace = this.#workspaceRow(workspaceId);
     if (!workspace) throw new ExecutionError("workspace_not_found");
     this.#assertActiveRow(workspace, workspace.ownership_generation);
@@ -1391,7 +1631,262 @@ export class ExecutionDaemon {
     if (this.rex.hasBlockingProcesses(workspaceId)) {
       throw new ExecutionError("workspace_has_running_rex_processes");
     }
-    this.#assertWorkspaceAdmission(workspaceId);
+    if (expectedControlId) {
+      const fence = this.#db
+        .query<{ capture_id: string; control_id: string | null }, [string]>(
+          "SELECT capture_id, control_id FROM execution_workspace_captures WHERE workspace_id = ?",
+        )
+        .get(workspaceId);
+      if (!fence || fence.control_id !== expectedControlId) {
+        throw new ExecutionError("capture_control_fence_missing");
+      }
+    } else {
+      this.#assertWorkspaceAdmission(workspaceId);
+    }
+  }
+
+  #assertWorkspaceSnapshotFence(snapshot: WorkspaceSnapshotClaim): void {
+    const control = this.#captureControlRowByRequest(snapshot.captureRequestId);
+    const fence = this.#db
+      .query<{ capture_id: string; control_id: string | null }, [string]>(
+        "SELECT capture_id, control_id FROM execution_workspace_captures WHERE workspace_id = ?",
+      )
+      .get(snapshot.target.workspaceId);
+    const workspace = this.#workspaceRow(snapshot.target.workspaceId);
+    if (
+      !control ||
+      control.status !== "source-capture-fenced" ||
+      control.capture_id !== snapshot.captureId ||
+      !fence ||
+      control.control_id !== fence.control_id ||
+      fence.capture_id !== snapshot.captureId ||
+      !fence.control_id ||
+      workspace?.ownership_generation !== snapshot.ownershipGeneration
+    ) {
+      throw new ExecutionError("capture_control_fence_missing");
+    }
+    this.#assertActiveRow(workspace, snapshot.ownershipGeneration);
+    this.#assertWorkspaceCapturePreflight(
+      snapshot.target.workspaceId,
+      fence.control_id,
+    );
+  }
+
+  #assertWorkspaceSnapshotIdentity(
+    snapshot: WorkspaceSnapshotClaim,
+    row: WorkspaceSnapshotReceiptRow,
+  ): void {
+    if (
+      row.request_id !== snapshot.requestId ||
+      row.capture_request_id !== snapshot.captureRequestId ||
+      row.capture_id !== snapshot.captureId ||
+      row.node_id !== snapshot.nodeId ||
+      row.workspace_id !== snapshot.target.workspaceId ||
+      row.ownership_generation !== snapshot.ownershipGeneration
+    ) {
+      throw new ExecutionError("workspace_snapshot_id_conflict");
+    }
+  }
+
+  #storeWorkspaceSnapshotReport(
+    snapshot: WorkspaceSnapshotClaim,
+    status: WorkspaceSnapshotReport["status"],
+    errorCode?: string,
+    manifestReference?: string,
+  ): WorkspaceSnapshotReport {
+    const existing = this.#workspaceSnapshotRow(snapshot.snapshotId);
+    if (existing?.report_json) {
+      return workspaceSnapshotReportSchema.parse(
+        JSON.parse(existing.report_json),
+      );
+    }
+    const report = workspaceSnapshotReportSchema.parse({
+      contractVersion: EXECUTION_CONTRACT_VERSION,
+      snapshotId: snapshot.snapshotId,
+      requestId: snapshot.requestId,
+      captureRequestId: snapshot.captureRequestId,
+      captureId: snapshot.captureId,
+      nodeId: this.#nodeId,
+      target: snapshot.target,
+      ownershipGeneration: snapshot.ownershipGeneration,
+      status,
+      reportedAt: new Date().toISOString(),
+      ...(manifestReference ? { manifestReference } : {}),
+      ...(errorCode ? { errorCode } : {}),
+    });
+    const reportJson = JSON.stringify(report);
+    this.#transaction(() => {
+      const row = this.#workspaceSnapshotRow(snapshot.snapshotId);
+      if (!row)
+        throw new ExecutionError("workspace_snapshot_receipt_not_found");
+      this.#assertWorkspaceSnapshotIdentity(snapshot, row);
+      this.#db
+        .query(
+          "UPDATE execution_workspace_snapshots SET status = ?, manifest_reference = COALESCE(?, manifest_reference), report_json = ?, report_sha256 = ? WHERE snapshot_id = ? AND report_json IS NULL",
+        )
+        .run(
+          status === "workspace-checkpoint-available" ? "captured" : status,
+          manifestReference ?? null,
+          reportJson,
+          executionPayloadSha256(report),
+          snapshot.snapshotId,
+        );
+    });
+    return report;
+  }
+
+  async #assertSnapshotCacheOutsideWorkspaces(
+    captureCacheDirectory: string,
+  ): Promise<void> {
+    const roots = this.#db
+      .query<{ directory: string }, []>(
+        "SELECT directory FROM execution_workspaces",
+      )
+      .all()
+      .map((row) => realpathSync(resolve(row.directory)));
+    const candidate = resolve(this.#snapshotCacheDirectory);
+    let existingAncestor = candidate;
+    while (!existsSync(existingAncestor))
+      existingAncestor = dirname(existingAncestor);
+    const physicalAncestor = realpathSync(existingAncestor);
+    const projected = resolve(
+      physicalAncestor,
+      relative(existingAncestor, candidate),
+    );
+    if (
+      roots.some((root) => within(root, projected) || within(projected, root))
+    ) {
+      throw new ExecutionError("snapshot_cache_workspace_overlap");
+    }
+    mkdirSync(candidate, { recursive: true, mode: 0o700 });
+    const cacheStat = lstatSync(candidate);
+    if (
+      !cacheStat.isDirectory() ||
+      cacheStat.isSymbolicLink() ||
+      (cacheStat.mode & 0o077) !== 0
+    ) {
+      throw new ExecutionError("snapshot_cache_permissions_unsafe");
+    }
+    const cacheRoot = realpathSync(candidate);
+    if (
+      roots.some((root) => within(root, cacheRoot) || within(cacheRoot, root))
+    ) {
+      throw new ExecutionError("snapshot_cache_workspace_overlap");
+    }
+    const captureCache = resolve(captureCacheDirectory);
+    if (captureCache === candidate || !within(candidate, captureCache)) {
+      throw new ExecutionError("snapshot_cache_namespace_invalid");
+    }
+    mkdirSync(captureCache, { recursive: true, mode: 0o700 });
+    const captureStat = lstatSync(captureCache);
+    const canonicalCaptureCache = realpathSync(captureCache);
+    if (
+      !captureStat.isDirectory() ||
+      captureStat.isSymbolicLink() ||
+      (captureStat.mode & 0o077) !== 0 ||
+      !within(cacheRoot, canonicalCaptureCache)
+    ) {
+      throw new ExecutionError("snapshot_cache_namespace_invalid");
+    }
+  }
+
+  #assertSnapshotManifestReferences(
+    manifest: WorkspaceCheckpointManifest,
+    manifestReference: string,
+  ): void {
+    if (
+      manifest.format !== "uzina-workspace-checkpoint" ||
+      manifest.version !== 1 ||
+      !Array.isArray(manifest.workspace?.entries) ||
+      manifest.workspace.entries.length > 100_000 ||
+      !Array.isArray(manifest.workspace?.omissions) ||
+      manifest.workspace.omissions.length > 10_000
+    ) {
+      throw new ExecutionError("invalid_workspace_checkpoint_manifest");
+    }
+    const references = this.#snapshotBlobReferences(
+      manifest,
+      manifestReference,
+    );
+    if (references.length > 200_002) {
+      throw new ExecutionError("workspace_checkpoint_reference_limit");
+    }
+  }
+
+  #snapshotBlobReferences(
+    manifest: WorkspaceCheckpointManifest,
+    manifestReference: string,
+  ): string[] {
+    const references = new Map<string, number>();
+    const add = (reference: string, size: number) => {
+      if (
+        !/^[a-f0-9]{64}$/.test(reference) ||
+        !Number.isSafeInteger(size) ||
+        size < 0 ||
+        size > 512 * 1024 * 1024
+      ) {
+        throw new ExecutionError("invalid_workspace_checkpoint_reference");
+      }
+      const previous = references.get(reference);
+      if (previous !== undefined && previous !== size) {
+        throw new ExecutionError("workspace_checkpoint_reference_conflict");
+      }
+      references.set(reference, size);
+    };
+    add(manifest.git.bundle.reference, manifest.git.bundle.size);
+    add(manifest.git.stagedPatch.reference, manifest.git.stagedPatch.size);
+    let aggregate = manifest.git.bundle.size + manifest.git.stagedPatch.size;
+    for (const entry of manifest.workspace.entries) {
+      if (entry.size > 64 * 1024 * 1024) {
+        throw new ExecutionError("workspace_checkpoint_file_limit");
+      }
+      add(entry.sha256, entry.size);
+      aggregate += entry.size;
+    }
+    if (manifest.runtimeArtifact) {
+      add(
+        manifest.runtimeArtifact.artifact.reference,
+        manifest.runtimeArtifact.artifact.size,
+      );
+      aggregate += manifest.runtimeArtifact.artifact.size;
+    }
+    for (const attachment of manifest.attachments) {
+      add(attachment.blob.reference, attachment.blob.size);
+      aggregate += attachment.blob.size;
+    }
+    if (
+      aggregate > 512 * 1024 * 1024 ||
+      manifest.workspace.entries.length > 100_000 ||
+      manifest.workspace.omissions.length > 10_000
+    ) {
+      throw new ExecutionError("workspace_checkpoint_bounds_exceeded");
+    }
+    add(manifestReference, 0);
+    return [...references.keys()].sort();
+  }
+
+  #workspaceSnapshotRow(
+    snapshotId: string,
+  ): WorkspaceSnapshotReceiptRow | undefined {
+    return (
+      this.#db
+        .query<WorkspaceSnapshotReceiptRow, [string]>(
+          "SELECT * FROM execution_workspace_snapshots WHERE snapshot_id = ?",
+        )
+        .get(snapshotId) ?? undefined
+    );
+  }
+
+  #captureControlRowByRequest(
+    requestId: string,
+  ): (CaptureControlRow & { control_id: string }) | undefined {
+    return (
+      this.#db
+        .query<CaptureControlRow & { control_id: string }, [string]>(
+          "SELECT * FROM execution_capture_controls WHERE request_id = ?",
+        )
+        .get(requestId) ?? undefined
+    );
   }
 
   #captureControlRow(controlId: string): CaptureControlRow | undefined {

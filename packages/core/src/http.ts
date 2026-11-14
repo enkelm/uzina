@@ -12,7 +12,12 @@ import {
   participantAccessRequestSchema,
   provisionCredentialRequestSchema,
   provisionNodeRequestSchema,
+  privateAssistantInputRequestSchema,
   submitInputRequestSchema,
+  workspaceSnapshotRequestSchema,
+  workspaceSnapshotClaimRequestSchema,
+  workspaceSnapshotClaimResponseSchema,
+  workspaceSnapshotReportSchema,
 } from "@uzina/contracts/factory";
 import {
   executionCaptureControlClaimRequestSchema,
@@ -26,6 +31,10 @@ import {
 } from "@uzina/contracts/execution";
 import { FactoryError, FactoryService } from "./factory";
 import { createFactoryMcpHandler } from "./mcp";
+import {
+  verifyPublishedWorkspaceManifest,
+  type WorkspaceSnapshotStorage,
+} from "./snapshot-storage";
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -82,9 +91,18 @@ export interface ManagedWorkQueries {
   status(threadId: string): Promise<unknown>;
 }
 
+export interface PrivateAssistantQueries {
+  context(): Promise<unknown>;
+  status(): Promise<unknown>;
+  receipt(inputId: string): Promise<unknown>;
+  submit(inputId: string, text: string): Promise<unknown>;
+}
+
 export function createFactoryHttpHandler(
   factory: FactoryService,
   managedWork?: ManagedWorkQueries,
+  privateAssistant?: PrivateAssistantQueries,
+  snapshotStorage?: WorkspaceSnapshotStorage,
 ): (request: Request) => Promise<Response> {
   const mcp = createFactoryMcpHandler(factory, managedWork);
   return async (request) => {
@@ -136,9 +154,42 @@ export function createFactoryHttpHandler(
       if (request.method === "GET" && path === "/v1/me")
         return json({
           contractVersion: CONTRACT_VERSION,
+          credentialId: session.credentialId,
           actor: session.actor,
           participant: factory.currentParticipant(session),
         });
+      if (path.startsWith("/v1/private-assistant/")) {
+        factory.requirePrivateAssistantOwner(session);
+        if (!privateAssistant)
+          throw new FactoryError(503, "private_assistant_unavailable");
+        if (request.method === "GET" && path === "/v1/private-assistant/status")
+          return json(await privateAssistant.status());
+        if (
+          request.method === "GET" &&
+          path === "/v1/private-assistant/context"
+        )
+          return json(await privateAssistant.context());
+        const receiptMatch = path.match(
+          /^\/v1\/private-assistant\/receipts\/([^/]+)$/,
+        );
+        if (request.method === "GET" && receiptMatch)
+          return json(
+            await privateAssistant.receipt(
+              decodeURIComponent(receiptMatch[1]!),
+            ),
+          );
+        if (
+          request.method === "POST" &&
+          path === "/v1/private-assistant/inputs"
+        ) {
+          const input = await body(request, privateAssistantInputRequestSchema);
+          return json(
+            await privateAssistant.submit(input.inputId, input.text),
+            202,
+          );
+        }
+        return json({ error: "not_found" }, 404);
+      }
       if (request.method === "GET" && path === "/v1/projects")
         return json({
           contractVersion: CONTRACT_VERSION,
@@ -247,6 +298,86 @@ export function createFactoryHttpHandler(
             input,
           ),
           202,
+        );
+      }
+      const snapshotBlobUploadMatch = path.match(
+        /^\/v1\/nodes\/([^/]+)\/captures\/([^/]+)\/blobs\/([a-f0-9]{64})$/,
+      );
+      if (request.method === "PUT" && snapshotBlobUploadMatch) {
+        const nodeId = decodeURIComponent(snapshotBlobUploadMatch[1]!);
+        const captureId = decodeURIComponent(snapshotBlobUploadMatch[2]!);
+        const reference = snapshotBlobUploadMatch[3]!;
+        if (
+          !factory.authorizeWorkspaceSnapshotUpload(session, nodeId, captureId)
+        ) {
+          await request.body?.cancel();
+          throw new FactoryError(404, "workspace_snapshot_not_found");
+        }
+        if (!snapshotStorage || !request.body) {
+          await request.body?.cancel();
+          throw new FactoryError(503, "workspace_snapshot_storage_unavailable");
+        }
+        const rawLength = request.headers.get("content-length");
+        const declaredSize = rawLength === null ? null : Number(rawLength);
+        if (
+          declaredSize !== null &&
+          (!Number.isSafeInteger(declaredSize) ||
+            declaredSize < 0 ||
+            declaredSize > 512 * 1024 * 1024)
+        ) {
+          await request.body.cancel();
+          throw new FactoryError(413, "workspace_blob_size_limit");
+        }
+        await snapshotStorage.putBlob(
+          captureId,
+          reference,
+          request.body,
+          declaredSize,
+        );
+        return new Response(null, { status: 204 });
+      }
+      const snapshotBlobDownloadMatch = path.match(
+        /^\/v1\/workspace-snapshots\/([^/]+)\/blobs\/([a-f0-9]{64})$/,
+      );
+      if (request.method === "GET" && snapshotBlobDownloadMatch) {
+        if (!snapshotStorage) {
+          throw new FactoryError(503, "workspace_snapshot_storage_unavailable");
+        }
+        const requestId = decodeURIComponent(snapshotBlobDownloadMatch[1]!);
+        const status = factory.getWorkspaceSnapshotStatus(session, requestId);
+        const references = factory.getAuthorizedWorkspaceSnapshotBlobReferences(
+          session,
+          status.captureId,
+        );
+        const reference = snapshotBlobDownloadMatch[2]!;
+        if (!references.includes(reference)) {
+          throw new FactoryError(404, "workspace_checkpoint_blob_not_found");
+        }
+        const blob = await snapshotStorage.getBlob(status.captureId, reference);
+        if (!blob)
+          throw new FactoryError(404, "workspace_checkpoint_blob_not_found");
+        return new Response(blob.body, {
+          headers: {
+            "content-type": "application/octet-stream",
+            "content-length": String(blob.size),
+            "cache-control": "private, no-store",
+            "x-content-sha256": reference,
+          },
+        });
+      }
+      if (request.method === "POST" && path === "/v1/workspace-snapshots") {
+        const input = await body(request, workspaceSnapshotRequestSchema);
+        return json(factory.requestWorkspaceSnapshot(session, input), 202);
+      }
+      const workspaceSnapshotStatusMatch = path.match(
+        /^\/v1\/workspace-snapshots\/([^/]+)$/,
+      );
+      if (request.method === "GET" && workspaceSnapshotStatusMatch) {
+        return json(
+          factory.getWorkspaceSnapshotStatus(
+            session,
+            decodeURIComponent(workspaceSnapshotStatusMatch[1]!),
+          ),
         );
       }
       const captureStatusMatch = path.match(
@@ -457,6 +588,79 @@ export function createFactoryHttpHandler(
           }),
         );
       }
+      const workspaceSnapshotClaimMatch = path.match(
+        /^\/v1\/nodes\/([^/]+)\/workspace-snapshots\/claim$/,
+      );
+      if (request.method === "POST" && workspaceSnapshotClaimMatch) {
+        const input = await body(request, workspaceSnapshotClaimRequestSchema);
+        if (
+          input.nodeId !== decodeURIComponent(workspaceSnapshotClaimMatch[1]!)
+        ) {
+          throw new FactoryError(403, "node_identity_mismatch");
+        }
+        return json(
+          workspaceSnapshotClaimResponseSchema.parse({
+            contractVersion: CONTRACT_VERSION,
+            snapshot: factory.claimWorkspaceSnapshot(session, input),
+          }),
+        );
+      }
+      const workspaceSnapshotReportMatch = path.match(
+        /^\/v1\/nodes\/([^/]+)\/workspace-snapshots\/([^/]+)\/report$/,
+      );
+      if (request.method === "POST" && workspaceSnapshotReportMatch) {
+        const input = await body(request, workspaceSnapshotReportSchema);
+        const nodeId = decodeURIComponent(workspaceSnapshotReportMatch[1]!);
+        const snapshotId = decodeURIComponent(workspaceSnapshotReportMatch[2]!);
+        let verifiedBlobs: { reference: string; size: number }[] = [];
+        if (input.status === "workspace-checkpoint-available") {
+          try {
+            return json(
+              await factory.reportWorkspaceSnapshot(
+                session,
+                nodeId,
+                snapshotId,
+                input,
+              ),
+            );
+          } catch (error) {
+            if (
+              !(error instanceof FactoryError) ||
+              error.code !== "workspace_snapshot_integrity_unverified"
+            ) {
+              throw error;
+            }
+          }
+          if (!snapshotStorage || !input.manifestReference) {
+            throw new FactoryError(
+              503,
+              "workspace_snapshot_storage_unavailable",
+            );
+          }
+          try {
+            verifiedBlobs = await verifyPublishedWorkspaceManifest(
+              snapshotStorage,
+              input.captureId,
+              input.manifestReference,
+            );
+          } catch {
+            throw new FactoryError(
+              422,
+              "workspace_checkpoint_integrity_failed",
+              "Workspace checkpoint failed bounded manifest or object integrity checks",
+            );
+          }
+        }
+        return json(
+          await factory.reportWorkspaceSnapshot(
+            session,
+            nodeId,
+            snapshotId,
+            input,
+            verifiedBlobs,
+          ),
+        );
+      }
       const captureControlReportMatch = path.match(
         /^\/v1\/nodes\/([^/]+)\/capture-controls\/([^/]+)\/report$/,
       );
@@ -505,6 +709,17 @@ export function createFactoryHttpHandler(
           { error: error.code, message: error.message },
           error.status,
         );
+      if (
+        error &&
+        typeof error === "object" &&
+        "httpStatus" in error &&
+        "code" in error &&
+        typeof error.httpStatus === "number" &&
+        typeof error.code === "string" &&
+        error.code.startsWith("private_assistant_")
+      ) {
+        return json({ error: error.code }, error.httpStatus);
+      }
       return json({ error: "internal_error" }, 500);
     }
   };

@@ -7,7 +7,10 @@ import { buildCloudflareWorkerArtifact } from "../scripts/build-worker";
 import { ExecutionDaemon } from "../../daemon/src/execution/daemon";
 import { HttpExecutionControllerConnector } from "../../daemon/src/execution/connector";
 import { ExecutionLoop } from "../../daemon/src/execution/loop";
-import { FACTORY_DURABLE_OBJECT_NAME } from "../src/factory-object";
+import {
+  FACTORY_DURABLE_OBJECT_NAME,
+  PRIVATE_ASSISTANT_DURABLE_OBJECT_NAME,
+} from "../src/factory-object";
 
 type WorkerdId = { toString(): string };
 type WorkerdNamespace = { idFromName(name: string): WorkerdId };
@@ -563,6 +566,688 @@ describe("production-shaped Cloudflare composition in Miniflare workerd", () => 
       await rm(directory, { recursive: true, force: true });
     }
   }, 90_000);
+
+  test("composes the owner-private assistant with authenticated Factory tools and isolated Durable storage", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "uzina-workerd-private-assistant-"),
+    );
+    const workspaceDirectory = join(directory, "workspace");
+    await mkdir(workspaceDirectory);
+    const artifact = await buildCloudflareWorkerArtifact(
+      join(import.meta.dir, "private-assistant-faulted-entry.ts"),
+    );
+    const bindings = {
+      UZINA_BOOTSTRAP_SECRET: "workerd-private-bootstrap",
+      UZINA_MODEL_PROVIDER: "openai",
+      UZINA_MODEL_ID: "gpt-4o-mini",
+      UZINA_MODEL_API_KEY: "sk-test-only-not-a-provider-credential",
+    };
+    const durableObjects = {
+      FACTORY: { className: "FactoryObject", useSQLite: true },
+      MANAGED_WORK: { className: "ManagedWorkObject", useSQLite: true },
+      PRIVATE_ASSISTANT: {
+        className: "FaultedPrivateAssistantObject",
+        useSQLite: true,
+      },
+    };
+    const requestBodies: Array<Record<string, unknown>> = [];
+    const openAITransport = async (request: Request): Promise<Response> => {
+      const url = new URL(request.url);
+      if (
+        url.origin !== "https://api.openai.com" ||
+        url.pathname !== "/v1/responses"
+      ) {
+        return new Response("Unexpected outbound request", { status: 502 });
+      }
+      const body = (await request.clone().json()) as Record<string, unknown>;
+      requestBodies.push(body);
+      const tools = JSON.stringify(body.tools);
+      const input = JSON.stringify(body.input);
+      let item: Record<string, unknown>;
+      if (tools.includes("factory_list_projects")) {
+        if (input.includes("factory_submit_input")) {
+          item = {
+            id: "msg_private_assistant_final",
+            type: "message",
+            status: "completed",
+            role: "assistant",
+            content: [
+              {
+                type: "output_text",
+                annotations: [],
+                text: "Private worker coordination finished.",
+              },
+            ],
+          };
+        } else if (input.includes("factory_list_projects")) {
+          item = {
+            id: "fc_private_submit",
+            type: "function_call",
+            status: "completed",
+            call_id: "call_private_submit",
+            name: "factory_submit_input",
+            arguments: JSON.stringify({
+              threadId: "thread:workerd-private-assistant",
+              text: "BOUNDED-WORKER-EFFECT",
+            }),
+          };
+        } else {
+          item = {
+            id: "fc_private_list",
+            type: "function_call",
+            status: "completed",
+            call_id: "call_private_list",
+            name: "factory_list_projects",
+            arguments: JSON.stringify({ limit: 20 }),
+          };
+        }
+      } else if (tools.includes("remote_write_file")) {
+        if (input.includes("remote_write_file")) {
+          item = {
+            id: "msg_worker_final",
+            type: "message",
+            status: "completed",
+            role: "assistant",
+            content: [
+              {
+                type: "output_text",
+                annotations: [],
+                text: "Worker workspace effect completed.",
+              },
+            ],
+          };
+        } else {
+          item = {
+            id: "fc_worker_write",
+            type: "function_call",
+            status: "completed",
+            call_id: "call_worker_write",
+            name: "remote_write_file",
+            arguments: JSON.stringify({
+              path: "workerd-private-assistant.txt",
+              content: "private assistant reached the assigned workspace",
+            }),
+          };
+        }
+      } else {
+        item = {
+          id: "msg_unexpected_toolset",
+          type: "message",
+          status: "completed",
+          role: "assistant",
+          content: [
+            { type: "output_text", annotations: [], text: "No action" },
+          ],
+        };
+      }
+      return new Response(openAIResponseStream(item), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    };
+    const options = {
+      name: "worker",
+      script: artifact.script,
+      modules: true,
+      compatibilityDate: "2026-05-01",
+      host: "127.0.0.1",
+      port: 0,
+      outboundService: openAITransport,
+      bindings,
+      durableObjects,
+    };
+    const miniflare = new Miniflare(options);
+    let daemon: ExecutionDaemon | undefined;
+    let abort: AbortController | undefined;
+    let runningLoop: Promise<void> | undefined;
+    try {
+      const baseUrl = (await miniflare.ready).toString();
+      const bootstrapped = await call<{ credential: string }>(
+        baseUrl,
+        "/v1/bootstrap",
+        {
+          credential: "workerd-private-bootstrap",
+          bootstrap: true,
+          body: { name: "Private assistant owner" },
+        },
+      );
+      const owner = bootstrapped.value.credential;
+      const project = await call<{ projectId: string }>(
+        baseUrl,
+        "/v1/projects",
+        {
+          credential: owner,
+          body: {
+            projectId: "project:workerd-private-assistant",
+            name: "Private assistant proof",
+          },
+        },
+      );
+      const provisioned = await call<{
+        node: { nodeId: string };
+        credential: string;
+      }>(baseUrl, "/v1/nodes", {
+        credential: owner,
+        body: {
+          nodeId: "node:workerd-private-assistant",
+          name: "Private assistant executor",
+        },
+      });
+      const workspace = await call<{ workspaceId: string }>(
+        baseUrl,
+        "/v1/workspaces",
+        {
+          credential: owner,
+          body: {
+            workspaceId: "workspace:workerd-private-assistant",
+            nodeId: provisioned.value.node.nodeId,
+            name: "Private assistant workspace",
+          },
+        },
+      );
+      const thread = await call<{ threadId: string }>(baseUrl, "/v1/threads", {
+        credential: owner,
+        body: {
+          threadId: "thread:workerd-private-assistant",
+          projectId: project.value.projectId,
+          title: "Explicit private assistant target",
+          target: {
+            nodeId: provisioned.value.node.nodeId,
+            workspaceId: workspace.value.workspaceId,
+          },
+        },
+      });
+      const assistant = await call<{
+        credentialId: string;
+        credential: string;
+        actor: { kind: "assistant"; assistantId: string; ownerId: string };
+      }>(baseUrl, "/v1/credentials", {
+        credential: owner,
+        body: {
+          kind: "assistant",
+          name: "Private assistant test actor",
+          assistantGrants: [
+            { type: "project", resourceId: project.value.projectId },
+          ],
+        },
+      });
+      expect(assistant.status).toBe(201);
+      await miniflare.setOptions({
+        ...options,
+        bindings: {
+          ...bindings,
+          UZINA_PRIVATE_ASSISTANT_BEARER: assistant.value.credential,
+          UZINA_PRIVATE_ASSISTANT_CREDENTIAL_ID: assistant.value.credentialId,
+          UZINA_PRIVATE_ASSISTANT_ASSISTANT_ID:
+            assistant.value.actor.assistantId,
+          UZINA_PRIVATE_ASSISTANT_OWNER_ID: assistant.value.actor.ownerId,
+        },
+      });
+      daemon = new ExecutionDaemon({
+        databasePath: join(directory, "executor.sqlite"),
+        nodeId: provisioned.value.node.nodeId,
+        nodeCredential: provisioned.value.credential,
+        workspaces: [
+          {
+            workspaceId: workspace.value.workspaceId,
+            directory: workspaceDirectory,
+          },
+        ],
+        daemonVersion: "private-assistant-workerd-test",
+      });
+      abort = new AbortController();
+      runningLoop = new ExecutionLoop({
+        daemon,
+        controller: new HttpExecutionControllerConnector({
+          controllerUrl: baseUrl,
+          nodeId: provisioned.value.node.nodeId,
+          credential: provisioned.value.credential,
+        }),
+        pollIntervalMs: 20,
+        heartbeatIntervalMs: 500,
+      }).run(abort.signal);
+      await until(async () => {
+        const nodes = await call<{ nodes: Array<{ availability: string }> }>(
+          baseUrl,
+          "/v1/nodes",
+          { credential: owner },
+        );
+        return nodes.value.nodes.some((node) => node.availability === "online");
+      });
+
+      const invitation = await call<{ code: string }>(
+        baseUrl,
+        "/v1/invitations",
+        {
+          credential: owner,
+          body: {
+            role: "guest",
+            grants: [{ type: "thread", resourceId: thread.value.threadId }],
+            expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          },
+        },
+      );
+      const guest = await call<{ credential: string }>(
+        baseUrl,
+        "/v1/invitations/redeem",
+        {
+          body: {
+            code: invitation.value.code,
+            displayName: "Private assistant isolation test guest",
+          },
+        },
+      );
+      const guestStatus = await call(baseUrl, "/v1/private-assistant/status", {
+        credential: guest.value.credential,
+      });
+      expect(guestStatus.status).toBe(403);
+
+      const input = {
+        inputId: "private-input:workerd-owner",
+        text: "OWNER-PRIVATE-WORKER-COORDINATION",
+      };
+      const initialAssistantStatus = await call<{ available: boolean }>(
+        baseUrl,
+        "/v1/private-assistant/status",
+        { credential: owner },
+      );
+      expect(initialAssistantStatus).toMatchObject({
+        status: 200,
+        value: { available: false },
+      });
+      const recovery = await call<{
+        identityFailuresTriggered: number;
+      }>(baseUrl, "/__test/private-assistant/recover");
+      expect(recovery.value.identityFailuresTriggered).toBe(2);
+      expect(requestBodies).toHaveLength(0);
+      const assistantStatus = await call<{ available: boolean }>(
+        baseUrl,
+        "/v1/private-assistant/status",
+        { credential: owner },
+      );
+      expect(assistantStatus).toMatchObject({
+        status: 200,
+        value: { available: true },
+      });
+      const accepted = await call<{ submissionId: string | null }>(
+        baseUrl,
+        "/v1/private-assistant/inputs",
+        {
+          credential: owner,
+          body: input,
+        },
+      );
+      if (accepted.status !== 202) {
+        throw new Error(
+          `Private assistant input failed: ${JSON.stringify(accepted.value)}`,
+        );
+      }
+      await until(async () => {
+        const runs = await call<{ runs: Array<{ dispatchStatus: string }> }>(
+          baseUrl,
+          `/v1/threads/${thread.value.threadId}/runs`,
+          { credential: owner },
+        );
+        return runs.value.runs.some(
+          (run) => run.dispatchStatus === "completed",
+        );
+      });
+      await until(async () => {
+        const context = await call<Record<string, unknown>>(
+          baseUrl,
+          "/v1/private-assistant/context",
+          { credential: owner },
+        );
+        return JSON.stringify(context.value).includes(
+          "Private worker coordination finished.",
+        );
+      });
+      expect(
+        await readFile(
+          join(workspaceDirectory, "workerd-private-assistant.txt"),
+          "utf8",
+        ),
+      ).toBe("private assistant reached the assigned workspace");
+      const runs = await call<{
+        runs: Array<{ requestId: string; dispatchStatus: string }>;
+      }>(baseUrl, `/v1/threads/${thread.value.threadId}/runs`, {
+        credential: owner,
+      });
+      expect(runs.value.runs).toHaveLength(1);
+      expect(runs.value.runs[0]?.dispatchStatus).toBe("completed");
+      const events = await call<{
+        events: Array<{
+          type: string;
+          actor: { kind: string; assistantId?: string; ownerId?: string };
+        }>;
+      }>(baseUrl, "/v1/events", { credential: owner });
+      expect(
+        events.value.events.find((event) => event.type === "command.accepted")
+          ?.actor,
+      ).toMatchObject({
+        kind: "assistant",
+        assistantId: assistant.value.actor.assistantId,
+        ownerId: assistant.value.actor.ownerId,
+      });
+      const privateToolRequest = requestBodies.find((body) =>
+        JSON.stringify(body.tools).includes("factory_list_projects"),
+      );
+      const workerToolRequest = requestBodies.find((body) =>
+        JSON.stringify(body.tools).includes("remote_write_file"),
+      );
+      expect(JSON.stringify(privateToolRequest?.tools)).not.toContain(
+        "remote_write_file",
+      );
+      expect(JSON.stringify(privateToolRequest?.tools)).not.toContain(
+        "remote_run_command",
+      );
+      expect(JSON.stringify(workerToolRequest?.tools)).not.toContain(
+        "factory_list_projects",
+      );
+      expect(JSON.stringify(requestBodies)).not.toContain(
+        assistant.value.credential,
+      );
+
+      const privateNamespace = (await miniflare.getDurableObjectNamespace(
+        "PRIVATE_ASSISTANT",
+      )) as unknown as WorkerdNamespace;
+      const assistantId = privateNamespace.idFromName(
+        PRIVATE_ASSISTANT_DURABLE_OBJECT_NAME,
+      );
+      await call(baseUrl, "/__test/private-assistant/close");
+      await miniflare.unsafeEvictDurableObject(
+        "worker",
+        "FaultedPrivateAssistantObject",
+        {
+          id: assistantId.toString(),
+        },
+      );
+      const receipt = await call<{
+        inputId: string;
+        submissionId: string | null;
+      }>(baseUrl, `/v1/private-assistant/receipts/${input.inputId}`, {
+        credential: owner,
+      });
+      expect(receipt.value).toMatchObject({
+        inputId: input.inputId,
+        submissionId: accepted.value.submissionId,
+      });
+      const reopened = await call<{ available: boolean }>(
+        baseUrl,
+        "/v1/private-assistant/status",
+        { credential: owner },
+      );
+      expect(reopened.value.available).toBe(true);
+
+      const denied = await call(baseUrl, "/v1/private-assistant/status", {
+        credential: provisioned.value.credential,
+      });
+      expect(denied.status).toBe(403);
+      const revoke = await fetch(
+        new URL(
+          `/v1/credentials/${assistant.value.credentialId}/revoke`,
+          baseUrl,
+        ),
+        {
+          method: "POST",
+          headers: { authorization: `Bearer ${owner}` },
+        },
+      );
+      expect(revoke.status).toBe(200);
+      expect(
+        (
+          await call(baseUrl, "/v1/private-assistant/context", {
+            credential: owner,
+          })
+        ).status,
+      ).toBe(200);
+      expect(
+        (
+          await call<{ available: boolean }>(
+            baseUrl,
+            "/v1/private-assistant/status",
+            { credential: owner },
+          )
+        ).value.available,
+      ).toBe(false);
+      expect(
+        (
+          await call(baseUrl, "/v1/private-assistant/inputs", {
+            credential: owner,
+            body: {
+              inputId: "private-input:revoked-worker",
+              text: "must stay parked",
+            },
+          })
+        ).status,
+      ).toBe(503);
+    } finally {
+      abort?.abort();
+      if (runningLoop) await runningLoop;
+      daemon?.close();
+      await miniflare.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  test("wakes a sleeping private-assistant task through its later Durable alarm", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "uzina-workerd-private-assistant-alarm-"),
+    );
+    const artifact = await buildCloudflareWorkerArtifact(
+      join(import.meta.dir, "private-assistant-alarm-entry.ts"),
+    );
+    const modelCalls: Array<{ status: number; body: Record<string, unknown> }> =
+      [];
+    const apiKey = "sk-test-private-alarm-dummy-credential";
+    const openAITransport = async (request: Request): Promise<Response> => {
+      const url = new URL(request.url);
+      if (
+        url.origin !== "https://api.openai.com" ||
+        url.pathname !== "/v1/responses"
+      ) {
+        return new Response("Unexpected outbound request", { status: 502 });
+      }
+      const body = (await request.clone().json()) as Record<string, unknown>;
+      const recovered = modelCalls.length > 0;
+      const status = recovered ? 200 : 503;
+      modelCalls.push({ status, body });
+      return new Response(
+        recovered
+          ? openAIResponseStream({
+              id: "msg_private_alarm_recovered",
+              type: "message",
+              status: "completed",
+              role: "assistant",
+              content: [
+                {
+                  type: "output_text",
+                  annotations: [],
+                  text: "The real Durable alarm resumed the same private task.",
+                },
+              ],
+            })
+          : JSON.stringify({
+              error: {
+                message:
+                  "The server had an error while processing your request.",
+                type: "server_error",
+                code: "internal_error",
+              },
+            }),
+        {
+          status,
+          headers: {
+            "content-type": recovered
+              ? "text/event-stream"
+              : "application/json",
+          },
+        },
+      );
+    };
+    const bindings = {
+      UZINA_BOOTSTRAP_SECRET: "workerd-private-alarm-bootstrap",
+      UZINA_MODEL_PROVIDER: "openai",
+      UZINA_MODEL_ID: "gpt-4o-mini",
+      UZINA_MODEL_API_KEY: apiKey,
+    };
+    const options = {
+      name: "worker",
+      script: artifact.script,
+      modules: true,
+      compatibilityDate: "2026-05-01",
+      host: "127.0.0.1",
+      port: 0,
+      outboundService: openAITransport,
+      bindings,
+      durableObjects: {
+        FACTORY: { className: "FactoryObject", useSQLite: true },
+        MANAGED_WORK: { className: "ManagedWorkObject", useSQLite: true },
+        PRIVATE_ASSISTANT: {
+          className: "ObservedPrivateAssistantObject",
+          useSQLite: true,
+        },
+      },
+    };
+    const miniflare = new Miniflare(options);
+    try {
+      const baseUrl = (await miniflare.ready).toString();
+      const bootstrapped = await call<{ credential: string }>(
+        baseUrl,
+        "/v1/bootstrap",
+        {
+          credential: bindings.UZINA_BOOTSTRAP_SECRET,
+          bootstrap: true,
+          body: { name: "Private alarm owner" },
+        },
+      );
+      expect(bootstrapped.status).toBe(201);
+      const owner = bootstrapped.value.credential;
+      const project = await call<{ projectId: string }>(
+        baseUrl,
+        "/v1/projects",
+        {
+          credential: owner,
+          body: {
+            projectId: "project:workerd-private-alarm",
+            name: "Private assistant alarm proof",
+          },
+        },
+      );
+      const assistant = await call<{
+        credentialId: string;
+        credential: string;
+        actor: { kind: "assistant"; assistantId: string; ownerId: string };
+      }>(baseUrl, "/v1/credentials", {
+        credential: owner,
+        body: {
+          kind: "assistant",
+          name: "Private alarm test actor",
+          assistantGrants: [
+            { type: "project", resourceId: project.value.projectId },
+          ],
+        },
+      });
+      expect(assistant.status).toBe(201);
+      await miniflare.setOptions({
+        ...options,
+        bindings: {
+          ...bindings,
+          UZINA_PRIVATE_ASSISTANT_BEARER: assistant.value.credential,
+          UZINA_PRIVATE_ASSISTANT_CREDENTIAL_ID: assistant.value.credentialId,
+          UZINA_PRIVATE_ASSISTANT_ASSISTANT_ID:
+            assistant.value.actor.assistantId,
+          UZINA_PRIVATE_ASSISTANT_OWNER_ID: assistant.value.actor.ownerId,
+        },
+      });
+
+      const input = {
+        inputId: "private-input:workerd-alarm-retry",
+        text: "PRIVATE-ALARM-RETRY-INPUT",
+      };
+      const accepted = await call<{
+        inputId: string;
+        requestId: string;
+        submissionId: string;
+      }>(baseUrl, "/v1/private-assistant/inputs", {
+        credential: owner,
+        body: input,
+      });
+      expect(accepted.status).toBe(202);
+      expect(accepted.value).toMatchObject({
+        inputId: input.inputId,
+        requestId: input.inputId,
+      });
+      expect(typeof accepted.value.submissionId).toBe("string");
+
+      await until(async () => {
+        const context = await call(baseUrl, "/v1/private-assistant/context", {
+          credential: owner,
+        });
+        return (
+          modelCalls.length >= 1 &&
+          JSON.stringify(context.value).includes('"stopReason":"error"')
+        );
+      });
+      const sleepingReceipt = await call<{
+        inputId: string;
+        requestId: string;
+        submissionId: string | null;
+      }>(baseUrl, `/v1/private-assistant/receipts/${input.inputId}`, {
+        credential: owner,
+      });
+      expect(sleepingReceipt.value).toMatchObject({
+        inputId: input.inputId,
+        requestId: input.inputId,
+        submissionId: accepted.value.submissionId,
+      });
+      expect(modelCalls.map((entry) => entry.status)).toEqual([503]);
+
+      const privateNamespace = (await miniflare.getDurableObjectNamespace(
+        "PRIVATE_ASSISTANT",
+      )) as unknown as WorkerdNamespace & {
+        get(id: WorkerdId): { alarmInvocations(): Promise<number> };
+      };
+      const assistantId = privateNamespace.idFromName(
+        PRIVATE_ASSISTANT_DURABLE_OBJECT_NAME,
+      );
+      const observedAssistant = privateNamespace.get(assistantId);
+      await until(async () => (await observedAssistant.alarmInvocations()) > 0);
+
+      const retryDeadline = Date.now() + 10_000;
+      while (modelCalls.length < 2 && Date.now() < retryDeadline) {
+        await Bun.sleep(25);
+      }
+      expect(modelCalls.map((entry) => entry.status)).toEqual([503, 200]);
+      const finalReceipt = await call<{
+        inputId: string;
+        requestId: string;
+        submissionId: string | null;
+      }>(baseUrl, `/v1/private-assistant/receipts/${input.inputId}`, {
+        credential: owner,
+      });
+      expect(finalReceipt.value).toMatchObject({
+        inputId: input.inputId,
+        requestId: input.inputId,
+        submissionId: sleepingReceipt.value.submissionId,
+      });
+      const finalContext = await call(
+        baseUrl,
+        "/v1/private-assistant/context",
+        {
+          credential: owner,
+        },
+      );
+      expect(JSON.stringify(finalContext.value)).toContain(
+        "The real Durable alarm resumed the same private task.",
+      );
+      expect(JSON.stringify(modelCalls)).toContain(input.text);
+      expect(JSON.stringify(finalContext.value)).not.toContain(apiKey);
+    } finally {
+      await miniflare.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 45_000);
 
   test("routes accepted Pi work through Durable Objects and real HTTP execution into a persistent workspace", async () => {
     const directory = await mkdtemp(join(tmpdir(), "uzina-composed-workerd-"));

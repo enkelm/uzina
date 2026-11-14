@@ -1,4 +1,11 @@
 import {
+  workspaceSnapshotClaimRequestSchema,
+  workspaceSnapshotClaimResponseSchema,
+  workspaceSnapshotReportSchema,
+  workspaceSnapshotReportResponseSchema,
+  type WorkspaceSnapshotClaim,
+} from "@uzina/contracts/factory";
+import {
   executionCaptureControlClaimRequestSchema,
   executionCaptureControlClaimResponseSchema,
   executionCaptureControlReportResponseSchema,
@@ -65,6 +72,14 @@ export interface ExecutionControllerConnector {
   report(report: unknown): Promise<void>;
   claimCaptureControl(): Promise<ExecutionCaptureControl | null>;
   reportCaptureControl(report: unknown): Promise<void>;
+  claimWorkspaceSnapshot(): Promise<WorkspaceSnapshotClaim | null>;
+  reportWorkspaceSnapshot(report: unknown): Promise<void>;
+  uploadCaptureBlob(
+    captureId: string,
+    reference: string,
+    stream: ReadableStream<Uint8Array>,
+    contentLength: number,
+  ): Promise<void>;
 }
 
 export interface HttpExecutionControllerConnectorOptions {
@@ -190,6 +205,99 @@ export class HttpExecutionControllerConnector implements ExecutionControllerConn
     ) {
       throw new ControllerProtocolError(
         "Controller capture-control acknowledgement mismatch",
+      );
+    }
+  }
+
+  async claimWorkspaceSnapshot(): Promise<WorkspaceSnapshotClaim | null> {
+    const body = workspaceSnapshotClaimRequestSchema.parse({
+      contractVersion: 1,
+      nodeId: this.#nodeId,
+    });
+    const response = await this.#post(
+      `/v1/nodes/${this.#nodeId}/workspace-snapshots/claim`,
+      body,
+      workspaceSnapshotClaimResponseSchema,
+    );
+    if (response.snapshot) {
+      this.#assertNode(response.snapshot.nodeId);
+      this.#assertNode(response.snapshot.target.nodeId);
+    }
+    return response.snapshot;
+  }
+
+  async reportWorkspaceSnapshot(report: unknown): Promise<void> {
+    const body = workspaceSnapshotReportSchema.parse(report);
+    this.#assertNode(body.nodeId);
+    this.#assertNode(body.target.nodeId);
+    const response = await this.#post(
+      `/v1/nodes/${this.#nodeId}/workspace-snapshots/${body.snapshotId}/report`,
+      body,
+      workspaceSnapshotReportResponseSchema,
+    );
+    if (
+      response.nodeId !== this.#nodeId ||
+      response.snapshotId !== body.snapshotId ||
+      response.captureId !== body.captureId ||
+      response.status !== body.status
+    ) {
+      throw new ControllerProtocolError(
+        "Controller snapshot acknowledgement mismatch",
+      );
+    }
+  }
+
+  async uploadCaptureBlob(
+    captureId: string,
+    reference: string,
+    stream: ReadableStream<Uint8Array>,
+    contentLength: number,
+  ): Promise<void> {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(captureId)) {
+      throw new ControllerProtocolError("Invalid capture namespace");
+    }
+    if (!/^[a-f0-9]{64}$/.test(reference)) {
+      throw new ControllerProtocolError("Invalid workspace blob reference");
+    }
+    if (
+      !Number.isSafeInteger(contentLength) ||
+      contentLength < 0 ||
+      contentLength > 512 * 1024 * 1024
+    ) {
+      throw new ControllerProtocolError(
+        "Workspace blob exceeds its transfer bound",
+      );
+    }
+    const timeout = AbortSignal.timeout(10 * 60_000);
+    let response: Response;
+    try {
+      response = await fetch(
+        `${this.#baseUrl}/v1/nodes/${this.#nodeId}/captures/${encodeURIComponent(captureId)}/blobs/${reference}`,
+        {
+          method: "PUT",
+          headers: {
+            authorization: `Bearer ${this.#credential}`,
+            "content-type": "application/octet-stream",
+            "content-length": String(contentLength),
+          },
+          body: stream,
+          redirect: "manual",
+          signal: timeout,
+          duplex: "half",
+        } as RequestInit & { duplex: "half" },
+      );
+    } catch (error) {
+      if (isTransportFailure(error)) throw new ControllerTransportError();
+      throw error;
+    }
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new ControllerHttpError(response.status);
+    }
+    if (response.status !== 204) {
+      await response.body?.cancel();
+      throw new ControllerProtocolError(
+        "Controller returned invalid blob acknowledgement",
       );
     }
   }

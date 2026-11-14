@@ -1,11 +1,19 @@
-import { CONTRACT_VERSION, capabilitySetSchema } from "@uzina/contracts";
+import {
+  CONTRACT_VERSION,
+  actorIdentitySchema,
+  capabilitySetSchema,
+} from "@uzina/contracts";
 import {
   factoryCommandReceiptSchema,
   factoryEventSchema,
+  factoryParticipantSchema,
   factoryNodeSchema,
   factoryProjectSchema,
   factoryThreadSchema,
   factoryWorkspaceSchema,
+  privateAssistantInputRequestSchema,
+  privateAssistantReceiptSchema,
+  privateAssistantStatusSchema,
   submitInputRequestSchema,
 } from "@uzina/contracts/factory";
 import { z } from "zod";
@@ -67,6 +75,12 @@ const eventsResponseSchema = z.object({
 });
 const receiptResponseSchema = factoryCommandReceiptSchema;
 const capabilitiesResponseSchema = capabilitySetSchema;
+const meResponseSchema = z.object({
+  contractVersion: z.literal(CONTRACT_VERSION),
+  credentialId: z.string().min(1).max(128),
+  actor: actorIdentitySchema,
+  participant: factoryParticipantSchema.nullable(),
+});
 const jsonObjectResponseSchema = z.record(z.unknown());
 
 function query(values: Record<string, string | number | undefined>): string {
@@ -165,6 +179,53 @@ export class FactoryClient {
     this.#origin = baseUrl.origin;
     this.#credential = options.credential;
     this.#fetch = options.fetch ?? fetch;
+  }
+
+  async me(options: RequestOptions = {}) {
+    return this.#get("/v1/me", meResponseSchema, options.signal);
+  }
+
+  async getPrivateAssistantStatus(options: RequestOptions = {}) {
+    return this.#get(
+      "/v1/private-assistant/status",
+      privateAssistantStatusSchema,
+      options.signal,
+    );
+  }
+
+  async getPrivateAssistantContext(options: RequestOptions = {}) {
+    return this.#get(
+      "/v1/private-assistant/context",
+      jsonObjectResponseSchema,
+      options.signal,
+    );
+  }
+
+  async getPrivateAssistantReceipt(
+    inputId: string,
+    options: RequestOptions = {},
+  ) {
+    const id = checkedIdentifier(inputId, "inputId");
+    return this.#get(
+      `/v1/private-assistant/receipts/${id}`,
+      privateAssistantReceiptSchema,
+      options.signal,
+    );
+  }
+
+  async submitPrivateAssistantInput(
+    inputId: string,
+    text: string,
+    options: RequestOptions = {},
+  ) {
+    const input = privateAssistantInputRequestSchema.parse({ inputId, text });
+    return this.#request(
+      "/v1/private-assistant/inputs",
+      "POST",
+      input,
+      privateAssistantReceiptSchema,
+      options.signal,
+    );
   }
 
   async listProjects(options: RequestOptions & { limit?: number } = {}) {
@@ -356,3 +417,10 @@ export class FactoryClient {
 }
 
 export type FactoryCommandReceipt = z.infer<typeof factoryCommandReceiptSchema>;
+export type FactoryIdentity = z.infer<typeof meResponseSchema>;
+export type PrivateAssistantReceipt = z.infer<
+  typeof privateAssistantReceiptSchema
+>;
+export type PrivateAssistantStatus = z.infer<
+  typeof privateAssistantStatusSchema
+>;

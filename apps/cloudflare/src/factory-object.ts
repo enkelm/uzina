@@ -1,10 +1,16 @@
-import { FactoryService } from "@uzina/core";
+import { FactoryError, FactoryService } from "@uzina/core";
 import { createFactoryHttpHandler } from "@uzina/core/http";
 import type { FactoryDatabase, SqlRow, SqlValue } from "@uzina/core/database";
 import type { FactoryQueueJob } from "@uzina/contracts/factory";
 import type { ManagedInputSettlement } from "./work-object";
+import {
+  R2WorkspaceSnapshotStorage,
+  type R2WorkspaceBucket,
+} from "./snapshot-storage";
 
 export const FACTORY_DURABLE_OBJECT_NAME = "uzina-single-factory";
+export const PRIVATE_ASSISTANT_DURABLE_OBJECT_NAME =
+  "uzina-owner-private-assistant";
 
 interface DurableSqlCursor<
   T extends Record<string, unknown> = Record<string, unknown>,
@@ -54,6 +60,28 @@ export interface FactoryRpc {
   ): import("@uzina/contracts/execution").ExecutionReceipt | null;
   markManagedEffectUncertain(jobId: string, detail: string): void;
   fetch(request: Request): Promise<Response>;
+  factoryHttp(request: {
+    url: string;
+    method: "GET" | "POST";
+    headers: Record<string, string>;
+    body?: string;
+  }): Promise<{
+    status: number;
+    headers: Record<string, string>;
+    body: string;
+  }>;
+  authorizePrivateAssistant(credential: string): Promise<{
+    authorized: boolean;
+    status: number;
+    code: string;
+  }>;
+}
+
+export interface PrivateAssistantRpc {
+  status(): Promise<unknown>;
+  context(): Promise<unknown>;
+  receipt(inputId: string): Promise<unknown>;
+  submit(inputId: string, text: string): Promise<unknown>;
 }
 
 export interface FactoryDurableObjectEnvironment {
@@ -66,6 +94,54 @@ export interface FactoryDurableObjectEnvironment {
     get(id: unknown): FactoryRpc;
   };
   MANAGED_WORK: ManagedWorkNamespace;
+  /** Operator-configured R2 bucket; absence disables remote snapshot publication. */
+  CHECKPOINTS?: R2WorkspaceBucket;
+}
+
+const MAX_FACTORY_HTTP_RESPONSE_BYTES = 256 * 1024;
+
+async function readBoundedFactoryHttpResponseBody(
+  response: Response,
+): Promise<string | undefined> {
+  const body = response.body;
+  if (!body) return "";
+
+  const bytes = new Uint8Array(MAX_FACTORY_HTTP_RESPONSE_BYTES);
+  const reader = body.getReader();
+  let length = 0;
+  let completed = false;
+  let cancellationStarted = false;
+  const cancel = (reason?: unknown): void => {
+    if (cancellationStarted) return;
+    cancellationStarted = true;
+    try {
+      void reader.cancel(reason).catch(() => {});
+    } catch {
+      // Preserve the original read or size result when the body refuses cancellation.
+    }
+  };
+
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) {
+        completed = true;
+        break;
+      }
+      if (chunk.value.byteLength > MAX_FACTORY_HTTP_RESPONSE_BYTES - length) {
+        cancel();
+        return undefined;
+      }
+      bytes.set(chunk.value, length);
+      length += chunk.value.byteLength;
+    }
+    return new TextDecoder("utf-8").decode(bytes.subarray(0, length));
+  } catch (error) {
+    if (!completed) cancel(error);
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 class DurableObjectFactoryDatabase implements FactoryDatabase {
@@ -101,10 +177,62 @@ export class FactoryController {
       new DurableObjectFactoryDatabase(state.storage),
       environment.UZINA_BOOTSTRAP_SECRET,
     );
-    this.#handle = createFactoryHttpHandler(this.#factory, {
-      context: async (threadId) => this.#managedWork(threadId).context(),
-      status: async (threadId) => this.#managedWork(threadId).status(),
-    });
+    const snapshotStorage = environment.CHECKPOINTS
+      ? new R2WorkspaceSnapshotStorage(environment.CHECKPOINTS)
+      : undefined;
+    this.#handle = createFactoryHttpHandler(
+      this.#factory,
+      {
+        context: async (threadId) => this.#managedWork(threadId).context(),
+        status: async (threadId) => this.#managedWork(threadId).status(),
+      },
+      undefined,
+      snapshotStorage,
+    );
+  }
+
+  async factoryHttp(input: {
+    url: string;
+    method: "GET" | "POST";
+    headers: Record<string, string>;
+    body?: string;
+  }) {
+    const url = new URL(input.url);
+    const requestBytes =
+      input.body === undefined
+        ? 0
+        : new TextEncoder().encode(input.body).byteLength;
+    if (
+      url.origin !== "https://uzina-factory.internal" ||
+      !url.pathname.startsWith("/v1/") ||
+      requestBytes > 640 * 1024
+    ) {
+      return {
+        status: 400,
+        headers: { "content-type": "application/json" },
+        body: '{"error":"invalid_request"}',
+      };
+    }
+    const response = await this.fetch(
+      new Request(url, {
+        method: input.method,
+        headers: input.headers,
+        ...(input.body === undefined ? {} : { body: input.body }),
+      }),
+    );
+    const responseBody = await readBoundedFactoryHttpResponseBody(response);
+    if (responseBody === undefined) {
+      return {
+        status: 502,
+        headers: { "content-type": "application/json" },
+        body: '{"error":"response_too_large"}',
+      };
+    }
+    return {
+      status: response.status,
+      headers: Object.fromEntries(response.headers.entries()),
+      body: responseBody,
+    };
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -122,6 +250,19 @@ export class FactoryController {
       }
     }
     return response;
+  }
+
+  /** Core-authenticated owner gate used by the Worker before private-runtime RPC. */
+  async authorizePrivateAssistant(credential: string) {
+    try {
+      const session = await this.#factory.authenticate(credential);
+      this.#factory.requirePrivateAssistantOwner(session);
+      return { authorized: true, status: 200, code: "authorized" };
+    } catch (error) {
+      return error instanceof FactoryError
+        ? { authorized: false, status: error.status, code: error.code }
+        : { authorized: false, status: 500, code: "internal_error" };
+    }
   }
 
   /** Trusted Durable Object RPC used only by the sibling managed-work binding. */

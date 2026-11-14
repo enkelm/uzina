@@ -1,14 +1,28 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { Database } from "bun:sqlite";
 import {
+  chmodSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  captureWorkspaceCheckpoint,
+  restoreWorkspaceCheckpoint,
+  type BlobTransport,
+  type WorkspaceCheckpointManifest,
+} from "@uzina/checkpoints";
+import { portableWorkspaceBlobReferences } from "@uzina/checkpoints/portable";
+import {
+  executionCaptureControlSchema,
   executionJobSchema,
   executionRexLaunchRequestSchema,
   executionRegisterRequestSchema,
@@ -17,11 +31,13 @@ import {
   type ExecutionJob,
   type ExecutionRegisterRequest,
 } from "@uzina/contracts/execution";
+import type { WorkspaceSnapshotClaim } from "@uzina/contracts/factory";
 import {
   createLocalFactoryServer,
   type LocalFactoryServer,
 } from "../src/factory/server";
 import { ExecutionDaemon } from "../src/execution/daemon";
+import { executionPayloadSha256 } from "../src/execution/payload";
 import {
   ControllerProtocolError,
   HttpExecutionControllerConnector,
@@ -33,6 +49,35 @@ const directories: string[] = [];
 const servers: Array<ReturnType<typeof Bun.serve>> = [];
 let localFactory: LocalFactoryServer | undefined;
 let executionDaemon: ExecutionDaemon | undefined;
+
+function git(directory: string, ...args: string[]): string {
+  return execFileSync("git", args, {
+    cwd: directory,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+    },
+  });
+}
+
+function initializeDirtyGitWorkspace(directory: string): void {
+  git(directory, "init", "--initial-branch=main");
+  git(directory, "config", "user.name", "Snapshot fixture");
+  git(directory, "config", "user.email", "snapshot@example.invalid");
+  writeFileSync(join(directory, "tracked.txt"), "base\n");
+  git(directory, "add", "tracked.txt");
+  git(directory, "commit", "-m", "base");
+  writeFileSync(join(directory, "tracked.txt"), "staged state\n");
+  git(directory, "add", "tracked.txt");
+  writeFileSync(join(directory, "tracked.txt"), "working state\n");
+  writeFileSync(
+    join(directory, "binary-and-mode"),
+    Buffer.from([0, 255, 4, 128]),
+  );
+  chmodSync(join(directory, "binary-and-mode"), 0o755);
+}
 
 function temporaryRoot(): string {
   const directory = mkdtempSync(join(tmpdir(), "uzina-execution-controller-"));
@@ -80,6 +125,164 @@ function waitFor(timeoutMs = 5_000) {
 }
 
 describe("authenticated Factory execution controller protocol", () => {
+  test("keeps interrupted or corrupt cached workspace snapshots uncertain across reopen", async () => {
+    const root = temporaryRoot();
+    const cachedWorkspace = join(root, "cached-workspace");
+    const interruptedWorkspace = join(root, "interrupted-workspace");
+    mkdirSync(cachedWorkspace);
+    mkdirSync(interruptedWorkspace);
+    initializeDirtyGitWorkspace(cachedWorkspace);
+    initializeDirtyGitWorkspace(interruptedWorkspace);
+    const databasePath = join(root, "snapshot-recovery.sqlite");
+    const cacheDirectory = join(root, "snapshot-cache");
+    const nodeId = "node:snapshot-recovery";
+    const workspaces = [
+      { workspaceId: "workspace:cached", directory: cachedWorkspace },
+      { workspaceId: "workspace:interrupted", directory: interruptedWorkspace },
+    ];
+    executionDaemon = new ExecutionDaemon({
+      databasePath,
+      snapshotCacheDirectory: cacheDirectory,
+      nodeId,
+      nodeCredential: "snapshot-recovery-credential",
+      workspaces,
+    });
+    const makeControl = (
+      label: string,
+      workspaceId: string,
+    ): ExecutionCaptureControl => {
+      const payload = {
+        contractVersion: 1 as const,
+        controlId: `control:${label}`,
+        captureId: `capture:${label}`,
+        requestId: `request:${label}`,
+        nodeId,
+        target: { nodeId, workspaceId },
+        ownershipGeneration: 0,
+      };
+      return executionCaptureControlSchema.parse({
+        ...payload,
+        payloadSha256: executionPayloadSha256(payload),
+      });
+    };
+    const fenceSource = (control: ExecutionCaptureControl) => {
+      const report = executionDaemon!.executeCaptureControl(control);
+      expect(report.status).toBe("source-capture-fenced");
+      executionDaemon!.markCaptureControlReported(control.controlId, report);
+    };
+    const cachedControl = makeControl("cached", "workspace:cached");
+    fenceSource(cachedControl);
+    const cachedClaim: WorkspaceSnapshotClaim = {
+      contractVersion: 1,
+      snapshotId: "workspace-snapshot:cached",
+      requestId: "snapshot-request:cached",
+      captureRequestId: cachedControl.requestId,
+      captureId: cachedControl.captureId,
+      nodeId,
+      target: cachedControl.target,
+      ownershipGeneration: 0,
+    };
+    let firstReference: string | undefined;
+    await expect(
+      executionDaemon.executeWorkspaceSnapshot(
+        cachedClaim,
+        async (_captureId, reference, stream) => {
+          firstReference = reference;
+          await stream.cancel("simulated upload interruption").catch(() => {});
+          throw new Error("simulated_upload_interruption");
+        },
+      ),
+    ).rejects.toThrow("simulated_upload_interruption");
+    if (!firstReference)
+      throw new Error("The first cached reference was not uploaded");
+    const captureCacheDirectory = join(
+      cacheDirectory,
+      createHash("sha256").update(cachedClaim.captureId).digest("hex"),
+    );
+    writeFileSync(
+      join(captureCacheDirectory, firstReference),
+      Buffer.from([0xff]),
+    );
+    let retryUploads = 0;
+    const corruptReport = await executionDaemon.executeWorkspaceSnapshot(
+      cachedClaim,
+      async () => {
+        retryUploads += 1;
+      },
+    );
+    expect(corruptReport).toMatchObject({
+      status: "uncertain",
+      errorCode: "snapshot_cache_missing_or_corrupt",
+    });
+    expect(retryUploads).toBe(0);
+
+    const interruptedControl = makeControl(
+      "interrupted",
+      "workspace:interrupted",
+    );
+    fenceSource(interruptedControl);
+    const interruptedClaim: WorkspaceSnapshotClaim = {
+      contractVersion: 1,
+      snapshotId: "workspace-snapshot:interrupted",
+      requestId: "snapshot-request:interrupted",
+      captureRequestId: interruptedControl.requestId,
+      captureId: interruptedControl.captureId,
+      nodeId,
+      target: interruptedControl.target,
+      ownershipGeneration: 0,
+    };
+    const database = new Database(databasePath);
+    try {
+      database
+        .query(
+          `INSERT INTO execution_workspace_snapshots(
+            snapshot_id, request_id, capture_request_id, capture_id, node_id,
+            workspace_id, ownership_generation, status, accepted_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'producing', ?)`,
+        )
+        .run(
+          interruptedClaim.snapshotId,
+          interruptedClaim.requestId,
+          interruptedClaim.captureRequestId,
+          interruptedClaim.captureId,
+          interruptedClaim.nodeId,
+          interruptedClaim.target.workspaceId,
+          interruptedClaim.ownershipGeneration,
+          new Date().toISOString(),
+        );
+    } finally {
+      database.close();
+    }
+    const cacheBeforeRestart = readdirSync(cacheDirectory).sort();
+    executionDaemon.close();
+    executionDaemon = new ExecutionDaemon({
+      databasePath,
+      snapshotCacheDirectory: cacheDirectory,
+      nodeId,
+      nodeCredential: "snapshot-recovery-credential",
+      workspaces,
+    });
+    let interruptedUploads = 0;
+    const interruptedReport = await executionDaemon.executeWorkspaceSnapshot(
+      interruptedClaim,
+      async () => {
+        interruptedUploads += 1;
+      },
+    );
+    expect(interruptedReport).toMatchObject({
+      status: "uncertain",
+      errorCode: "snapshot_production_interrupted",
+    });
+    expect(interruptedUploads).toBe(0);
+    expect(readdirSync(cacheDirectory).sort()).toEqual(cacheBeforeRestart);
+    const cachedReportAfterRestart =
+      await executionDaemon.executeWorkspaceSnapshot(cachedClaim, async () => {
+        interruptedUploads += 1;
+      });
+    expect(cachedReportAfterRestart).toEqual(corruptReport);
+    expect(interruptedUploads).toBe(0);
+  });
+
   test("executes one durable file job, reconciles lost acknowledgements and reopens both stores", async () => {
     const root = temporaryRoot();
     const workspaceDirectory = join(root, "workspace");
@@ -523,6 +726,9 @@ describe("authenticated Factory execution controller protocol", () => {
     mkdirSync(selectedDirectory);
     mkdirSync(unrelatedDirectory);
     mkdirSync(offlineDirectory);
+    initializeDirtyGitWorkspace(selectedDirectory);
+    initializeDirtyGitWorkspace(unrelatedDirectory);
+    writeFileSync(join(unrelatedDirectory, ".env"), "private fixture bytes\n");
     localFactory = createLocalFactoryServer({
       databasePath: join(root, "controller.sqlite"),
       bootstrapSecret,
@@ -603,6 +809,12 @@ describe("authenticated Factory execution controller protocol", () => {
     let loseAcceptanceAcknowledgement = true;
     let loseClaimAcknowledgement = true;
     let loseReportAcknowledgement = true;
+    let loseSnapshotAdmissionAcknowledgement = true;
+    let loseSnapshotClaimAcknowledgement = true;
+    let loseSnapshotUploadAcknowledgement = true;
+    let loseSnapshotReportAcknowledgement = true;
+    let snapshotBlobUploadCount = 0;
+    let snapshotClaimRequestCount = 0;
     const claimedControlIds: string[] = [];
     const claimedControls: ExecutionCaptureControl[] = [];
     const receivedReports: string[] = [];
@@ -611,13 +823,66 @@ describe("authenticated Factory execution controller protocol", () => {
       port: 0,
       async fetch(request) {
         const path = new URL(request.url).pathname;
+        const streamingUpload = /\/captures\/[^/]+\/blobs\//.test(path);
         const requestBody =
-          request.method === "GET" ? undefined : await request.text();
+          request.method === "GET" || streamingUpload
+            ? undefined
+            : await request.text();
         const upstream = await fetch(new URL(path, controllerUrl), {
           method: request.method,
           headers: request.headers,
-          ...(requestBody === undefined ? {} : { body: requestBody }),
-        });
+          ...(streamingUpload
+            ? { body: request.body, duplex: "half" }
+            : requestBody === undefined
+              ? {}
+              : { body: requestBody }),
+        } as RequestInit & { duplex?: "half" });
+        if (
+          path === "/v1/workspace-snapshots" &&
+          requestBody?.includes('"snapshot:workspace-only"') &&
+          loseSnapshotAdmissionAcknowledgement
+        ) {
+          loseSnapshotAdmissionAcknowledgement = false;
+          return new Response("lost snapshot admission acknowledgement", {
+            status: 502,
+          });
+        }
+        if (streamingUpload && upstream.ok) {
+          snapshotBlobUploadCount += 1;
+          if (loseSnapshotUploadAcknowledgement) {
+            loseSnapshotUploadAcknowledgement = false;
+            return new Response("lost immutable upload acknowledgement", {
+              status: 502,
+            });
+          }
+        }
+        if (path.endsWith("/workspace-snapshots/claim"))
+          snapshotClaimRequestCount += 1;
+        if (
+          path.endsWith("/workspace-snapshots/claim") &&
+          loseSnapshotClaimAcknowledgement
+        ) {
+          const claimed = (await upstream.clone().json()) as {
+            snapshot: unknown;
+          };
+          if (claimed.snapshot) {
+            loseSnapshotClaimAcknowledgement = false;
+            return new Response("lost snapshot claim acknowledgement", {
+              status: 502,
+            });
+          }
+        }
+        if (
+          path.includes("/workspace-snapshots/") &&
+          path.endsWith("/report") &&
+          loseSnapshotReportAcknowledgement &&
+          upstream.ok
+        ) {
+          loseSnapshotReportAcknowledgement = false;
+          return new Response("lost snapshot report acknowledgement", {
+            status: 502,
+          });
+        }
         if (
           path ===
             `/v1/threads/${selectedThread.value.threadId}/capture-controls` &&
@@ -886,6 +1151,184 @@ describe("authenticated Factory execution controller protocol", () => {
           ).response.status,
         ).toBe(409);
       }
+      const unavailableSnapshot = await postJson(
+        proxy.url.toString(),
+        "/v1/workspace-snapshots",
+        owner.credential,
+        {
+          contractVersion: 1,
+          requestId: "snapshot:source-offline",
+          captureRequestId: "request:offline-capture-control",
+        },
+      );
+      expect(unavailableSnapshot.response.status).toBe(409);
+      const snapshotRequest = {
+        contractVersion: 1,
+        requestId: "snapshot:workspace-only",
+        captureRequestId: accepted.requestId,
+      };
+      const lostSnapshotAdmission = await fetch(
+        new URL("/v1/workspace-snapshots", proxy.url),
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${owner.credential}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify(snapshotRequest),
+        },
+      );
+      expect(lostSnapshotAdmission.status).toBe(502);
+      const acceptedSnapshotResponse = await fetch(
+        new URL("/v1/workspace-snapshots", proxy.url),
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${owner.credential}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify(snapshotRequest),
+        },
+      );
+      expect(acceptedSnapshotResponse.status).toBe(202);
+      const acceptedSnapshot = (await acceptedSnapshotResponse.json()) as {
+        requestId: string;
+        captureId: string;
+        status: string;
+        snapshotId: string;
+      };
+      const duplicateSnapshot = await postJson<{
+        requestId: string;
+        captureId: string;
+        status: string;
+        snapshotId: string;
+      }>(
+        proxy.url.toString(),
+        "/v1/workspace-snapshots",
+        owner.credential,
+        snapshotRequest,
+      );
+      expect(duplicateSnapshot.value).toMatchObject({
+        requestId: acceptedSnapshot.requestId,
+        captureId: acceptedSnapshot.captureId,
+        snapshotId: acceptedSnapshot.snapshotId,
+      });
+      expect(acceptedSnapshot.captureId).toBe(accepted.captureId);
+      expect(acceptedSnapshot.snapshotId).toBeTruthy();
+      const secondSnapshotForCapture = await postJson(
+        proxy.url.toString(),
+        "/v1/workspace-snapshots",
+        owner.credential,
+        {
+          contractVersion: 1,
+          requestId: "snapshot:second-for-same-capture",
+          captureRequestId: accepted.requestId,
+        },
+      );
+      expect(secondSnapshotForCapture.response.status).toBe(409);
+      const snapshotStatusUrl = new URL(
+        `/v1/workspace-snapshots/${acceptedSnapshot.requestId}`,
+        proxy.url,
+      );
+      await waitUntil(async () => {
+        const response = await fetch(snapshotStatusUrl, {
+          headers: { authorization: `Bearer ${owner.credential}` },
+        });
+        if (!response.ok) return false;
+        const value = (await response.json()) as { status: string };
+        return value.status === "workspace-checkpoint-available";
+      });
+      const availableSnapshotResponse = await fetch(snapshotStatusUrl, {
+        headers: { authorization: `Bearer ${owner.credential}` },
+      });
+      const availableSnapshot = (await availableSnapshotResponse.json()) as {
+        status: string;
+        manifestReference: string;
+      };
+      expect(availableSnapshot).toMatchObject({
+        status: "workspace-checkpoint-available",
+      });
+      expect(loseSnapshotAdmissionAcknowledgement).toBe(false);
+      expect(loseSnapshotClaimAcknowledgement).toBe(false);
+      expect(loseSnapshotUploadAcknowledgement).toBe(false);
+      expect(loseSnapshotReportAcknowledgement).toBe(false);
+      expect(snapshotClaimRequestCount).toBeGreaterThan(1);
+      expect(snapshotBlobUploadCount).toBeGreaterThan(1);
+      await waitUntil(
+        () => executionDaemon!.pendingWorkspaceSnapshotReports().length === 0,
+      );
+      expect(executionDaemon.pendingWorkspaceSnapshotReports()).toEqual([]);
+      const download = async (reference: string): Promise<Uint8Array> => {
+        const response = await fetch(
+          new URL(
+            `/v1/workspace-snapshots/${acceptedSnapshot.requestId}/blobs/${reference}`,
+            controllerUrl,
+          ),
+          { headers: { authorization: `Bearer ${owner.credential}` } },
+        );
+        if (!response.ok)
+          throw new Error(
+            `checkpoint blob download failed: ${response.status}`,
+          );
+        return new Uint8Array(await response.arrayBuffer());
+      };
+      const manifestBytes = await download(availableSnapshot.manifestReference);
+      const manifest = JSON.parse(
+        new TextDecoder().decode(manifestBytes),
+      ) as WorkspaceCheckpointManifest;
+      expect(manifest.runtimeArtifact).toBeNull();
+      expect(manifest.attachments).toEqual([]);
+      const restoreTransport: BlobTransport = {
+        async putBlob() {
+          throw new Error("owner download transport is read-only");
+        },
+        getBlob: download,
+      };
+      const preparedDirectory = join(root, "prepared-workspace");
+      mkdirSync(preparedDirectory);
+      await restoreWorkspaceCheckpoint({
+        manifest,
+        transport: restoreTransport,
+        destinationPath: preparedDirectory,
+      });
+      expect(git(preparedDirectory, "show", ":tracked.txt")).toBe(
+        "staged state\n",
+      );
+      expect(readFileSync(join(preparedDirectory, "tracked.txt"), "utf8")).toBe(
+        "working state\n",
+      );
+      expect(readFileSync(join(preparedDirectory, "binary-and-mode"))).toEqual(
+        Buffer.from([0, 255, 4, 128]),
+      );
+      expect(
+        statSync(join(preparedDirectory, "binary-and-mode")).mode & 0o111,
+      ).toBe(0o111);
+      expect(git(preparedDirectory, "status", "--porcelain").trim()).toBe(
+        "MM tracked.txt\n?? binary-and-mode",
+      );
+      const foreignReferenceResponse = await fetch(
+        new URL(
+          `/v1/workspace-snapshots/snapshot:foreign/blobs/${availableSnapshot.manifestReference}`,
+          controllerUrl,
+        ),
+        { headers: { authorization: `Bearer ${owner.credential}` } },
+      );
+      expect(foreignReferenceResponse.status).toBe(404);
+      const wrongNodeUpload = await fetch(
+        new URL(
+          `/v1/nodes/${unavailableNode.value.node.nodeId}/captures/${accepted.captureId}/blobs/${"f".repeat(64)}`,
+          controllerUrl,
+        ),
+        {
+          method: "PUT",
+          headers: {
+            authorization: `Bearer ${unavailableNode.value.credential}`,
+            "content-type": "application/octet-stream",
+          },
+          body: new Uint8Array([1]),
+        },
+      );
+      expect(wrongNodeUpload.status).toBe(404);
       const ownerSession = await localFactory.factory.authenticate(
         owner.credential,
       );
@@ -1162,6 +1605,282 @@ describe("authenticated Factory execution controller protocol", () => {
         reopenedDaemon.executeCaptureControl(claimedControls[0]),
       ).toMatchObject({ status: "source-capture-fenced" });
       await restartedConnector.reportCaptureControl(reportBodies[0]);
+      const snapshotStatusAfterReopen = await fetch(
+        new URL(
+          `/v1/workspace-snapshots/${acceptedSnapshot.requestId}`,
+          restartedControllerUrl,
+        ),
+        { headers: { authorization: `Bearer ${owner.credential}` } },
+      );
+      const durableSnapshot = (await snapshotStatusAfterReopen.json()) as {
+        status: string;
+        snapshotId: string;
+        captureId: string;
+        manifestReference: string;
+      };
+      expect(durableSnapshot).toMatchObject({
+        status: "workspace-checkpoint-available",
+        snapshotId: acceptedSnapshot.snapshotId,
+        captureId: accepted.captureId,
+        manifestReference: availableSnapshot.manifestReference,
+      });
+      const replayedSnapshotReport =
+        await reopenedDaemon.executeWorkspaceSnapshot(
+          {
+            contractVersion: 1,
+            snapshotId: acceptedSnapshot.snapshotId,
+            requestId: acceptedSnapshot.requestId,
+            captureRequestId: accepted.requestId,
+            captureId: accepted.captureId,
+            nodeId,
+            target: { nodeId, workspaceId: selected.value.workspaceId },
+            ownershipGeneration: 0,
+          },
+          async () => {
+            throw new Error(
+              "A persisted snapshot must not re-upload after reopen",
+            );
+          },
+        );
+      expect(replayedSnapshotReport).toMatchObject({
+        snapshotId: acceptedSnapshot.snapshotId,
+        status: "workspace-checkpoint-available",
+        manifestReference: availableSnapshot.manifestReference,
+      });
+      const reopenedManifestBytes = await fetch(
+        new URL(
+          `/v1/workspace-snapshots/${acceptedSnapshot.requestId}/blobs/${availableSnapshot.manifestReference}`,
+          restartedControllerUrl,
+        ),
+        { headers: { authorization: `Bearer ${owner.credential}` } },
+      );
+      expect(reopenedManifestBytes.status).toBe(200);
+      expect(Buffer.from(await reopenedManifestBytes.arrayBuffer())).toEqual(
+        Buffer.from(manifestBytes),
+      );
+
+      const forgedPolicyThread = await postJson<{ threadId: string }>(
+        restartedControllerUrl,
+        "/v1/threads",
+        owner.credential,
+        {
+          threadId: "thread:capture-forged-policy",
+          projectId: project.value.projectId,
+          title: "thread:capture-forged-policy",
+          target: { nodeId, workspaceId: unrelated.value.workspaceId },
+        },
+      );
+      const forgedPolicyControlAdmission = await postJson<{
+        requestId: string;
+        captureId: string;
+      }>(
+        restartedControllerUrl,
+        `/v1/threads/${forgedPolicyThread.value.threadId}/capture-controls`,
+        owner.credential,
+        {
+          contractVersion: 1,
+          requestId: "request:capture-forged-policy",
+        },
+      );
+      expect(forgedPolicyControlAdmission.response.status).toBe(202);
+      const forgedPolicyControl =
+        await restartedConnector.claimCaptureControl();
+      expect(forgedPolicyControl).toMatchObject({
+        requestId: forgedPolicyControlAdmission.value.requestId,
+        captureId: forgedPolicyControlAdmission.value.captureId,
+        target: { workspaceId: unrelated.value.workspaceId },
+      });
+      if (!forgedPolicyControl) {
+        throw new Error(
+          "Expected the authenticated forged-policy source control",
+        );
+      }
+      const forgedPolicyFenceReport =
+        reopenedDaemon.executeCaptureControl(forgedPolicyControl);
+      expect(forgedPolicyFenceReport.status).toBe("source-capture-fenced");
+      await restartedConnector.reportCaptureControl(forgedPolicyFenceReport);
+      reopenedDaemon.markCaptureControlReported(
+        forgedPolicyFenceReport.controlId,
+        forgedPolicyFenceReport,
+      );
+      const forgedPolicySnapshotAdmission = await postJson<{
+        requestId: string;
+        snapshotId: string;
+        captureId: string;
+        status: string;
+      }>(restartedControllerUrl, "/v1/workspace-snapshots", owner.credential, {
+        contractVersion: 1,
+        requestId: "snapshot:forged-private-path-policy",
+        captureRequestId: forgedPolicyControl.requestId,
+      });
+      expect(forgedPolicySnapshotAdmission.response.status).toBe(202);
+      const forgedPolicyClaim =
+        await restartedConnector.claimWorkspaceSnapshot();
+      expect(forgedPolicyClaim).toMatchObject({
+        snapshotId: forgedPolicySnapshotAdmission.value.snapshotId,
+        requestId: forgedPolicySnapshotAdmission.value.requestId,
+        captureId: forgedPolicyControl.captureId,
+        target: { workspaceId: unrelated.value.workspaceId },
+      });
+      if (!forgedPolicyClaim) {
+        throw new Error("Expected the authenticated claimed snapshot");
+      }
+
+      const checkpointBytes = new Map<string, Uint8Array>();
+      const checkpointTransport: BlobTransport = {
+        async putBlob(bytes) {
+          const reference = createHash("sha256").update(bytes).digest("hex");
+          checkpointBytes.set(reference, Uint8Array.from(bytes));
+          return reference;
+        },
+        async getBlob(reference) {
+          const bytes = checkpointBytes.get(reference);
+          if (!bytes) throw new Error("test checkpoint blob was not recorded");
+          return Uint8Array.from(bytes);
+        },
+      };
+      const honestCapture = await captureWorkspaceCheckpoint({
+        workspacePath: unrelatedDirectory,
+        transport: checkpointTransport,
+      });
+      const honestManifestBytes = Buffer.from(
+        JSON.stringify(honestCapture.manifest),
+      );
+      const honestReferences = portableWorkspaceBlobReferences(
+        honestCapture.manifest,
+        honestCapture.manifestReference,
+        honestManifestBytes.byteLength,
+      );
+      expect(honestCapture.manifest.policy.excludeGlobs).toContain("**/.env");
+      expect(honestCapture.manifest.workspace.omissions).toContainEqual({
+        path: ".env",
+        reason: "excluded",
+      });
+      const forgedManifest = structuredClone(honestCapture.manifest);
+      forgedManifest.policy.excludeGlobs = [];
+      forgedManifest.workspace.omissions =
+        forgedManifest.workspace.omissions.filter(
+          (omission) => omission.path !== ".env",
+        );
+      const privateFixtureBytes = Buffer.from("private fixture bytes\n");
+      const privatePathReference =
+        await checkpointTransport.putBlob(privateFixtureBytes);
+      forgedManifest.workspace.entries.push({
+        path: ".env",
+        kind: "file",
+        size: privateFixtureBytes.byteLength,
+        sha256: privatePathReference,
+        executable: false,
+      });
+      forgedManifest.workspace.entries.sort((left, right) =>
+        Buffer.compare(Buffer.from(left.path), Buffer.from(right.path)),
+      );
+      const forgedManifestBytes = Buffer.from(JSON.stringify(forgedManifest));
+      const forgedManifestReference =
+        await checkpointTransport.putBlob(forgedManifestBytes);
+      expect(
+        createHash("sha256").update(forgedManifestBytes).digest("hex"),
+      ).toBe(forgedManifestReference);
+      const uploadReferences = [
+        ...honestReferences.filter(
+          (reference) =>
+            reference.reference !== honestCapture.manifestReference,
+        ),
+        {
+          reference: privatePathReference,
+          size: privateFixtureBytes.byteLength,
+        },
+        {
+          reference: forgedManifestReference,
+          size: forgedManifestBytes.byteLength,
+        },
+      ].sort((left, right) => left.reference.localeCompare(right.reference));
+      expect(new Set(uploadReferences.map((item) => item.reference)).size).toBe(
+        uploadReferences.length,
+      );
+      for (const item of uploadReferences) {
+        const bytes = checkpointBytes.get(item.reference);
+        if (!bytes) throw new Error("scoped upload blob was not recorded");
+        expect(bytes.byteLength).toBe(item.size);
+        await restartedConnector.uploadCaptureBlob(
+          forgedPolicyClaim.captureId,
+          item.reference,
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(bytes);
+              controller.close();
+            },
+          }),
+          bytes.byteLength,
+        );
+      }
+      const forgedPolicyReport = await postJson<{ error: string }>(
+        restartedControllerUrl,
+        `/v1/nodes/${nodeId}/workspace-snapshots/${forgedPolicyClaim.snapshotId}/report`,
+        nodeCredential,
+        {
+          contractVersion: 1,
+          snapshotId: forgedPolicyClaim.snapshotId,
+          requestId: forgedPolicyClaim.requestId,
+          captureRequestId: forgedPolicyClaim.captureRequestId,
+          captureId: forgedPolicyClaim.captureId,
+          nodeId,
+          target: forgedPolicyClaim.target,
+          ownershipGeneration: forgedPolicyClaim.ownershipGeneration,
+          status: "workspace-checkpoint-available",
+          reportedAt: new Date().toISOString(),
+          manifestReference: forgedManifestReference,
+        },
+      );
+      expect(forgedPolicyReport.response.status).toBe(422);
+      expect(forgedPolicyReport.value.error).toBe(
+        "workspace_checkpoint_integrity_failed",
+      );
+      const forgedPolicyStatus = await fetch(
+        new URL(
+          `/v1/workspace-snapshots/${forgedPolicyClaim.requestId}`,
+          restartedControllerUrl,
+        ),
+        { headers: { authorization: `Bearer ${owner.credential}` } },
+      );
+      expect(
+        ((await forgedPolicyStatus.json()) as { status: string }).status,
+      ).toBe("claimed");
+      const forgedPrivateDownload = await fetch(
+        new URL(
+          `/v1/workspace-snapshots/${forgedPolicyClaim.requestId}/blobs/${forgedManifestReference}`,
+          restartedControllerUrl,
+        ),
+        { headers: { authorization: `Bearer ${owner.credential}` } },
+      );
+      expect(forgedPrivateDownload.status).toBe(404);
+      const forgedPrivateBlobDownload = await fetch(
+        new URL(
+          `/v1/workspace-snapshots/${forgedPolicyClaim.requestId}/blobs/${privatePathReference}`,
+          restartedControllerUrl,
+        ),
+        { headers: { authorization: `Bearer ${owner.credential}` } },
+      );
+      expect(forgedPrivateBlobDownload.status).toBe(404);
+      expect(() =>
+        reopenedDaemon.endWorkspaceCapture(forgedPolicyClaim.captureId),
+      ).toThrow("capture_control_fence_held");
+      const reopenedOwnerSession = await localFactory.factory.authenticate(
+        owner.credential,
+      );
+      let forgedCoreFenceError: unknown;
+      try {
+        localFactory.factory.endManagedWorkCapture(
+          reopenedOwnerSession,
+          forgedPolicyClaim.captureId,
+        );
+      } catch (error) {
+        forgedCoreFenceError = error;
+      }
+      expect(forgedCoreFenceError).toMatchObject({
+        code: "capture_control_fence_held",
+        status: 409,
+      });
     } finally {
       blockedDaemon?.close();
       abort.abort();
@@ -1200,6 +1919,9 @@ describe("authenticated Factory execution controller protocol", () => {
         report: async () => undefined,
         claimCaptureControl: async () => null,
         reportCaptureControl: async () => undefined,
+        claimWorkspaceSnapshot: async () => null,
+        reportWorkspaceSnapshot: async () => undefined,
+        uploadCaptureBlob: async () => undefined,
       },
       pollIntervalMs: 10,
       heartbeatIntervalMs: 20,
@@ -1226,6 +1948,9 @@ describe("authenticated Factory execution controller protocol", () => {
           throw new ControllerProtocolError("invalid controller response");
         },
         reportCaptureControl: async () => undefined,
+        claimWorkspaceSnapshot: async () => null,
+        reportWorkspaceSnapshot: async () => undefined,
+        uploadCaptureBlob: async () => undefined,
       },
       pollIntervalMs: 10,
       heartbeatIntervalMs: 20,

@@ -45,6 +45,12 @@ async function startLocalFactory(): Promise<void> {
     models,
     modelProvider: modelConfig.provider,
     modelId: modelConfig.modelId,
+    privateAssistant: {
+      bearer: Bun.env.UZINA_PRIVATE_ASSISTANT_BEARER,
+      credentialId: Bun.env.UZINA_PRIVATE_ASSISTANT_CREDENTIAL_ID,
+      assistantId: Bun.env.UZINA_PRIVATE_ASSISTANT_ASSISTANT_ID,
+      ownerId: Bun.env.UZINA_PRIVATE_ASSISTANT_OWNER_ID,
+    },
     port,
     hostname,
   });

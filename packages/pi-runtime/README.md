@@ -32,11 +32,15 @@ await work.close();
 
 The production composition has no deterministic or dummy model fallback. Tests use deterministic adapters only at the external model-provider seam; all managed task, Factory receipt, Durable Object, and execution behavior remains real. Automated validation does not make paid requests.
 
-## Factory client and 7a/7b boundary
+## Owner-private Factory assistant
 
-Slice 7a provides the authenticated MCP transport and the separately importable `@uzina/client` public Factory HTTP SDK. It does not install or export Pi Durable `factory_*` custom tools. The `@uzina/client` API is available to future consumers, but no ordinary worker thread is configured with a control-plane assistant credential or Factory tool set in this slice.
+`PrivateAssistantRuntime` composes one isolated `ManagedPiWork` root with a host-owned admission store and a named `FactoryClient`. The owner submits `inputId` plus text; the host persists the ID and SHA-256 payload digest before calling `Conversation.submit` with that same ID. An identical retry returns the original Pi submission receipt; changed text for an existing ID conflicts. If the process stops between metadata acceptance and Pi submission, a retry reconciles the same request ID rather than creating another conversation input.
 
-A Pi Durable tool adapter requires a named assistant credential, memoized stable application request IDs before mutations, and bounded secret-safe results. Tool assembly and the private persistent assistant conversation/runtime composition are deferred to slice 7b; 7a does not add a no-op tool consumer or widen ordinary worker authority.
+`createFactoryToolExtension(client, { credentialToRedact })` is installed only in that private root's registry. Its explicit-target tools use the public `FactoryClient` over the authenticated Core HTTP handler; Core checks the assistant credential and current grants on every request. `factory_submit_input` memoizes a deterministic application request ID in the Pi tool task before HTTP mutation and checks the memo against the exact thread and text digest. A lost acknowledgement or Pi recovery therefore reuses the same Core request ID. Tool results/errors are bounded and redact the configured bearer. Stop, native CLI, and transfer remain unsupported. This registry has no native filesystem or argv tools; ordinary managed worker registries never receive these Factory coordination tools.
+
+The host must provide the assistant bearer separately from expected `credentialId`, `assistantId`, and `ownerId` identity. `FactoryClient.me()` verifies the active identity through `GET /v1/me`, and the private store pins those non-secret identity fields. Missing, revoked, mismatched, or temporarily unavailable credentials leave tasks parked; changing to a different assistant identity does not adopt an existing transcript. The bearer is held only in the host closure and is not written to Pi documents, messages, memos, receipts, checkpoints, errors, or logs. Owners use the regular owner credential for private-assistant HTTP ingress and can still inspect existing context/status/receipts while the assistant credential is unavailable.
+
+Bun keeps private-assistant metadata and Pi Durable SQLite files under its dedicated `private-assistant/` directory, separate from per-thread work databases. Cloudflare uses a dedicated SQLite-backed `PrivateAssistantObject` and recovery alarm. Neither runtime is included in managed-work checkpoints. See the daemon and Cloudflare setup guides for explicit grant, host-secret, restart, and revocation requirements.
 
 ## Managed remote-tool bridge
 
