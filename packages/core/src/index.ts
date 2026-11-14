@@ -10,5 +10,6 @@ export type {
   RuntimeDispatchAdapter,
 } from "./factory";
 export { createFactoryHttpHandler } from "./http";
+export { createFactoryMcpHandler } from "./mcp";
 export type { ManagedWorkQueries } from "./http";
 export type { FactoryDatabase, SqlRow, SqlValue } from "./database";

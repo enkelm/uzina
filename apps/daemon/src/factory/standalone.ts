@@ -18,6 +18,7 @@ import { FactoryService } from "@uzina/core";
 import { BunFactoryDatabase } from "./sqlite";
 import type { FactoryQueueJob } from "@uzina/contracts/factory";
 import { openLocalManagedPiWork } from "../runtime/managed-work";
+import { assertLoopbackHostname } from "../loopback";
 
 export interface StandaloneFactoryServer {
   server: ReturnType<typeof Bun.serve>;
@@ -80,6 +81,8 @@ export function localFactoryDefaults() {
 export async function createStandaloneFactoryServer(
   options: StandaloneFactoryOptions,
 ): Promise<StandaloneFactoryServer> {
+  const hostname = options.hostname ?? "127.0.0.1";
+  assertLoopbackHostname(hostname);
   if (!options.bootstrapSecret.trim()) {
     throw new Error("Standalone Factory requires UZINA_BOOTSTRAP_SECRET");
   }
@@ -240,7 +243,7 @@ export async function createStandaloneFactoryServer(
 
   const server = Bun.serve({
     port: options.port ?? 8788,
-    hostname: options.hostname ?? "127.0.0.1",
+    hostname,
     async fetch(request) {
       const response = await handler(request);
       const path = new URL(request.url).pathname;

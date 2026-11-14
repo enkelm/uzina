@@ -21,13 +21,65 @@ export const factoryTargetSchema = z.object({
   workspaceId: identifier,
 });
 
+export const accessGrantSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("project"), resourceId: identifier }).strict(),
+  z.object({ type: z.literal("thread"), resourceId: identifier }).strict(),
+]);
+const distinctGrants = <T extends z.ZodTypeAny>(schema: T) =>
+  z.array(schema).superRefine((grants, context) => {
+    const seen = new Set<string>();
+    grants.forEach((grant, index) => {
+      const value = grant as { type: string; resourceId?: string };
+      const key = `${value.type}:${value.resourceId ?? ""}`;
+      if (seen.has(key)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [index],
+          message: "Grant targets must be unique",
+        });
+      }
+      seen.add(key);
+    });
+  });
+
 export const bootstrapFactoryRequestSchema = z
   .object({ name: displayName })
   .strict();
+export const assistantCredentialGrantSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("factory") }).strict(),
+  z.object({ type: z.literal("project"), resourceId: identifier }).strict(),
+  z.object({ type: z.literal("thread"), resourceId: identifier }).strict(),
+]);
+export const assistantCredentialGrantsSchema = distinctGrants(
+  assistantCredentialGrantSchema,
+).superRefine((grants, context) => {
+  if (grants.some((grant) => grant.type === "factory") && grants.length !== 1) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message:
+        "Factory-wide assistant access cannot be combined with narrower grants",
+    });
+  }
+});
 export const provisionCredentialRequestSchema = z
   .object({
     kind: z.enum(["human", "assistant"]),
     name: displayName,
+    assistantGrants: assistantCredentialGrantsSchema.optional(),
+  })
+  .strict()
+  .superRefine((request, context) => {
+    if (request.kind === "human" && request.assistantGrants !== undefined) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["assistantGrants"],
+        message: "Assistant grants apply only to assistant credentials",
+      });
+    }
+  });
+export const assistantCredentialGrantsRequestSchema = z
+  .object({
+    grants: assistantCredentialGrantsSchema,
   })
   .strict();
 export const provisionNodeRequestSchema = z
@@ -54,26 +106,6 @@ export const createThreadRequestSchema = z
   .strict();
 export const accessRoleSchema = z.enum(["owner", "guest", "viewer"]);
 export const participantRoleSchema = z.enum(["guest", "viewer"]);
-export const accessGrantSchema = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("project"), resourceId: identifier }).strict(),
-  z.object({ type: z.literal("thread"), resourceId: identifier }).strict(),
-]);
-const distinctGrants = <T extends z.ZodTypeAny>(schema: T) =>
-  z.array(schema).superRefine((grants, context) => {
-    const seen = new Set<string>();
-    grants.forEach((grant, index) => {
-      const value = grant as { type: string; resourceId: string };
-      const key = `${value.type}:${value.resourceId}`;
-      if (seen.has(key)) {
-        context.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: [index],
-          message: "Grant targets must be unique",
-        });
-      }
-      seen.add(key);
-    });
-  });
 export const invitationCreateRequestSchema = z
   .object({
     role: participantRoleSchema,
@@ -105,6 +137,7 @@ export const provisionedCredentialSchema = z.object({
   name: displayName,
   actor: factoryActorSchema,
   credential: z.string().min(1),
+  assistantGrants: z.array(assistantCredentialGrantSchema).optional(),
 });
 export const factoryProjectSchema = z.object({
   contractVersion: z.literal(CONTRACT_VERSION),
@@ -225,6 +258,7 @@ export const factoryEventSchema = z.object({
     "dispatch.failed",
     "dispatch.uncertain",
     "credential.revoked",
+    "credential.grants_changed",
     "invitation.created",
     "invitation.revoked",
     "invitation.redeemed",
@@ -258,6 +292,9 @@ export type FactoryNode = z.infer<typeof factoryNodeSchema>;
 export type FactoryWorkspace = z.infer<typeof factoryWorkspaceSchema>;
 export type FactoryThread = z.infer<typeof factoryThreadSchema>;
 export type AccessGrant = z.infer<typeof accessGrantSchema>;
+export type AssistantCredentialGrant = z.infer<
+  typeof assistantCredentialGrantSchema
+>;
 export type ParticipantRole = z.infer<typeof participantRoleSchema>;
 export type FactoryParticipant = z.infer<typeof factoryParticipantSchema>;
 export type FactoryInvitation = z.infer<typeof factoryInvitationSchema>;

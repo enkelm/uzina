@@ -19,9 +19,13 @@ For local workerd development, provide `UZINA_BOOTSTRAP_SECRET` and `UZINA_MODEL
 
 ## Private routes and node setup
 
-The Worker applies Factory human bearer credentials to owner operations/context/events/status. Connected execution daemons use separately provisioned node bearer credentials and initiate outbound registration, heartbeat, claim, and report requests. If Cloudflare Access is fronting the Worker, its policy must allow those node protocol paths without a human Access cookie (for example via a narrowly scoped bypass) while keeping them protected by the route's node credential and rate limits. The node credential is not an owner or model API key. No HTTP path accepts caller-selected execution jobs.
+`workers_dev = false`; this repository defines no Worker route and does not configure Cloudflare Access. An operator must select a protected custom route/gateway before deployment and verify the actual ingress policy. Do not infer that a Worker URL is tailnet-private or claim that Access is configured. The daemon Factory binds only to loopback; Workers use the externally selected protected route.
+
+The Worker applies Factory bearer credentials to owner operations/context/events/status. Connected execution daemons use separately provisioned node bearer credentials and initiate outbound registration, heartbeat, claim, and report requests. If Cloudflare Access is fronting the Worker, its policy must allow those node protocol paths without a human Access cookie (for example via a narrowly scoped bypass) while keeping them protected by the route's node credential and rate limits. The node credential is not an owner or model API key. No HTTP path accepts caller-selected execution jobs.
 
 Owner workflow: bootstrap an owner, provision node identities, provision mapped workspaces, and create threads with an explicit target. Submit input only to the assigned thread. `GET /v1/commands/:requestId`, `/v1/events`, and authorized `/context` and `/status` routes surface receipts and canonical model state.
+
+`POST /v1/mcp` uses the same `FactoryObject` and Core operations as REST. It is the official SDK 1.32.2 Web Standard stateless Streamable HTTP/JSON profile with `Authorization: Bearer <active Factory credential>` on every POST. The stateless server stores no MCP session/auth snapshot; revocation/grant changes apply on subsequent requests. Query-string tokens and cross-origin `Origin` values are rejected; there are no wildcard CORS headers. Tokens are isolated by the single Factory Durable Object credential store and rejected by another Factory. See `packages/core/README.md` for the complete tool list, resource profile, and unsupported lifecycle operations. No execution-node or model-provider request receives this caller credential.
 
 ## Workerd integration evidence
 

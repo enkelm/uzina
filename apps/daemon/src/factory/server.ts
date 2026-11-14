@@ -1,6 +1,7 @@
 import { FactoryService } from "@uzina/core";
 import { createFactoryHttpHandler } from "@uzina/core/http";
 import { BunFactoryDatabase } from "./sqlite";
+import { assertLoopbackHostname } from "../loopback";
 
 export interface LocalFactoryServer {
   server: ReturnType<typeof Bun.serve>;
@@ -15,6 +16,7 @@ export function createLocalFactoryServer(options: {
   port?: number;
   hostname?: string;
 }): LocalFactoryServer {
+  assertLoopbackHostname(options.hostname ?? "127.0.0.1");
   const database = new BunFactoryDatabase(options.databasePath);
   const factory = new FactoryService(database, options.bootstrapSecret);
   const server = Bun.serve({

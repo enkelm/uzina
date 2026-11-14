@@ -14,6 +14,12 @@ afterEach(() => {
 });
 
 describe("Bun daemon HTTP behavior", () => {
+  test("rejects a non-loopback listener", () => {
+    expect(() => createDaemonServer(0, "0.0.0.0")).toThrow(
+      "Uzina daemon must bind to a loopback hostname",
+    );
+  });
+
   test("serves a versioned health response over HTTP", async () => {
     const server = startServer();
     const response = await fetch(new URL("/health", server.url));

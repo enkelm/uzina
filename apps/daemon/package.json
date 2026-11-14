@@ -10,5 +10,9 @@
     "@uzina/contracts": "workspace:*",
     "@uzina/core": "workspace:*",
     "@uzina/pi-runtime": "workspace:*"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "@uzina/client": "workspace:*"
   }
 }

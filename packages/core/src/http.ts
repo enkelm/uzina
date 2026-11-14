@@ -1,5 +1,6 @@
 import { CONTRACT_VERSION } from "@uzina/contracts";
 import {
+  assistantCredentialGrantsRequestSchema,
   bootstrapFactoryRequestSchema,
   createProjectRequestSchema,
   createThreadRequestSchema,
@@ -20,6 +21,7 @@ import {
   executionRegisterRequestSchema,
 } from "@uzina/contracts/execution";
 import { FactoryError, FactoryService } from "./factory";
+import { createFactoryMcpHandler } from "./mcp";
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -80,11 +82,13 @@ export function createFactoryHttpHandler(
   factory: FactoryService,
   managedWork?: ManagedWorkQueries,
 ): (request: Request) => Promise<Response> {
+  const mcp = createFactoryMcpHandler(factory, managedWork);
   return async (request) => {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/health") {
       return json({ contractVersion: CONTRACT_VERSION, status: "ok" });
     }
+    if (url.pathname === "/v1/mcp") return mcp(request);
     if (!url.pathname.startsWith("/v1/"))
       return json({ error: "not_found" }, 404);
 
@@ -134,7 +138,10 @@ export function createFactoryHttpHandler(
       if (request.method === "GET" && path === "/v1/projects")
         return json({
           contractVersion: CONTRACT_VERSION,
-          projects: factory.listProjects(session),
+          projects: factory.listProjects(
+            session,
+            numberParameter(url.searchParams.get("limit"), 100),
+          ),
         });
       if (request.method === "POST" && path === "/v1/projects") {
         const input = await body(request, createProjectRequestSchema);
@@ -146,7 +153,10 @@ export function createFactoryHttpHandler(
       if (request.method === "GET" && path === "/v1/nodes")
         return json({
           contractVersion: CONTRACT_VERSION,
-          nodes: factory.listNodes(session),
+          nodes: factory.listNodes(
+            session,
+            numberParameter(url.searchParams.get("limit"), 100),
+          ),
         });
       if (request.method === "POST" && path === "/v1/nodes") {
         const input = await body(request, provisionNodeRequestSchema);
@@ -170,7 +180,10 @@ export function createFactoryHttpHandler(
       if (request.method === "GET" && path === "/v1/workspaces")
         return json({
           contractVersion: CONTRACT_VERSION,
-          workspaces: factory.listWorkspaces(session),
+          workspaces: factory.listWorkspaces(
+            session,
+            numberParameter(url.searchParams.get("limit"), 100),
+          ),
         });
       if (request.method === "POST" && path === "/v1/workspaces") {
         const input = await body(request, createWorkspaceRequestSchema);
@@ -190,6 +203,7 @@ export function createFactoryHttpHandler(
           threads: factory.listThreads(
             session,
             url.searchParams.get("projectId") ?? undefined,
+            numberParameter(url.searchParams.get("limit"), 100),
           ),
         });
       }
@@ -249,6 +263,29 @@ export function createFactoryHttpHandler(
             input.text,
           ),
           201,
+        );
+      }
+      const runsMatch = path.match(/^\/v1\/threads\/([^/]+)\/runs$/);
+      if (request.method === "GET" && runsMatch) {
+        return json({
+          contractVersion: CONTRACT_VERSION,
+          threadId: decodeURIComponent(runsMatch[1]!),
+          runs: factory.listThreadReceipts(
+            session,
+            decodeURIComponent(runsMatch[1]!),
+            numberParameter(url.searchParams.get("limit"), 100),
+          ),
+        });
+      }
+      const lifecycleMatch = path.match(
+        /^\/v1\/threads\/([^/]+)\/lifecycle-capabilities$/,
+      );
+      if (request.method === "GET" && lifecycleMatch) {
+        return json(
+          factory.getLifecycleCapabilities(
+            session,
+            decodeURIComponent(lifecycleMatch[1]!),
+          ),
         );
       }
       const receiptMatch = path.match(/^\/v1\/commands\/([^/]+)$/);
@@ -326,8 +363,26 @@ export function createFactoryHttpHandler(
           session,
           input.kind,
           input.name,
+          input.assistantGrants,
         );
         return json({ contractVersion: CONTRACT_VERSION, ...result }, 201);
+      }
+      const credentialGrantsMatch = path.match(
+        /^\/v1\/credentials\/([^/]+)\/grants$/,
+      );
+      if (request.method === "PUT" && credentialGrantsMatch) {
+        const input = await body(
+          request,
+          assistantCredentialGrantsRequestSchema,
+        );
+        return json({
+          contractVersion: CONTRACT_VERSION,
+          ...factory.setAssistantCredentialGrants(
+            session,
+            decodeURIComponent(credentialGrantsMatch[1]!),
+            input.grants,
+          ),
+        });
       }
       const revokeMatch = path.match(/^\/v1\/credentials\/([^/]+)\/revoke$/);
       if (request.method === "POST" && revokeMatch) {

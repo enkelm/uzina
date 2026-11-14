@@ -32,6 +32,12 @@ await work.close();
 
 The production composition has no deterministic or dummy model fallback. Tests use deterministic adapters only at the external model-provider seam; all managed task, Factory receipt, Durable Object, and execution behavior remains real. Automated validation does not make paid requests.
 
+## Factory client and 7a/7b boundary
+
+Slice 7a provides the authenticated MCP transport and the separately importable `@uzina/client` public Factory HTTP SDK. It does not install or export Pi Durable `factory_*` custom tools. The `@uzina/client` API is available to future consumers, but no ordinary worker thread is configured with a control-plane assistant credential or Factory tool set in this slice.
+
+A Pi Durable tool adapter requires a named assistant credential, memoized stable application request IDs before mutations, and bounded secret-safe results. Tool assembly and the private persistent assistant conversation/runtime composition are deferred to slice 7b; 7a does not add a no-op tool consumer or widen ordinary worker authority.
+
 ## Managed remote-tool bridge
 
 The remote Pi tools are limited to bounded file read, file write, and argv command operations. `RemoteToolExecutor` receives durable Pi `conversationId`, `taskId`, and tool `callId`; the tool first memoizes this evidence. Core derives the target node/workspace/generation from the accepted persisted Factory input and creates a stable job ID. Model-supplied tool arguments cannot choose a node, workspace, actor, or generation.

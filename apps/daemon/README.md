@@ -1,6 +1,6 @@
 # Uzina daemon modes
 
-The daemon defaults to `UZINA_MODE=local`, which composes the standalone persistent Factory, managed Pi Durable runtime, and loopback HTTP application. The default hostname is `127.0.0.1`; opening a public listener requires an explicit `HOST` override and a private tailnet-facing firewall/gateway. The separate `connected-executor` mode supplies an explicitly provisioned execution node and does not create a competing Factory catalog.
+The daemon defaults to `UZINA_MODE=local`, which composes the standalone persistent Factory, managed Pi Durable runtime, and loopback HTTP application. Factory startup accepts only `127.0.0.1`, `::1`, or `localhost` and fails closed for non-loopback `HOST` values; there is no public-listener override. A separately operated private gateway/tailnet route is outside this host and must not turn an anonymous Factory/MCP endpoint into a public service. The separate `connected-executor` mode supplies an explicitly provisioned execution node and does not create a competing Factory catalog.
 
 ## Standalone local Factory
 
@@ -19,7 +19,7 @@ bun run dev:daemon
 
 Model provider, model ID, and API key are required. Startup validates them against the actual Pi AI provider/model catalog and credential resolver. Missing or unsupported configuration fails closed; production does not install a dummy response model. Secret values are not printed or placed in Factory events. The deterministic model adapters are test-only.
 
-A thread is created with an owner-selected node/workspace placement. Inputs do not repeat the placement. Core persists each accepted input, then dispatches it to one stable per-thread managed Pi store. Pi Durable makes submissions idempotent by accepted request ID. `GET /v1/threads/:threadId/context` returns canonical model context and `GET /v1/threads/:threadId/status` returns runtime inspection/status; both require an authenticated Factory credential. `GET /v1/commands/:requestId` returns the managed completion/failure/uncertainty receipt and remote execution receipts. `GET /v1/events` exposes committed receipt transitions.
+A thread is created with an owner-selected node/workspace placement. Inputs do not repeat the placement. Core persists each accepted input, then dispatches it to one stable per-thread managed Pi store. Pi Durable makes submissions idempotent by accepted request ID. `GET /v1/threads/:threadId/context` returns canonical model context and `GET /v1/threads/:threadId/status` returns runtime inspection/status; both require an authenticated Factory credential. `GET /v1/commands/:requestId` returns the managed completion/failure/uncertainty receipt and remote execution receipts. `GET /v1/events` exposes committed receipt transitions. The loopback-only Factory also exposes authenticated stateless MCP at `POST /v1/mcp`; see `packages/core/README.md` for tool names and bearer/Origin/resource behavior.
 
 ## Managed-work checkpoint capture and inactive restore
 
@@ -43,7 +43,7 @@ UZINA_EXECUTION_WORKSPACES='[{"workspaceId":"workspace:repo","directory":"/absol
 bun run dev:daemon
 ```
 
-The node credential is separate from human/bootstrap/model credentials. The node initiates authenticated outbound HTTP requests and must not use a human token. Owner provisioning through `POST /v1/nodes` and `POST /v1/workspaces` binds the node and workspace IDs. The controller payload does not select an arbitrary host directory. The default host remains loopback; connected mode is not a human Factory UI/gateway.
+The node credential is separate from human/bootstrap/model credentials. The node initiates authenticated outbound HTTP requests and must not use a human token. Owner provisioning through `POST /v1/nodes` and `POST /v1/workspaces` binds the node and workspace IDs. The controller payload does not select an arbitrary host directory. Connected mode is not a human Factory UI/gateway and its execution-daemon listener remains loopback.
 
 - `src/execution/daemon.ts` persists job receipts and reports interrupted effects as uncertain rather than replaying them.
 - `src/execution/connector.ts` is an outbound Bearer-authenticated client for the schemas in `@uzina/contracts/execution`.

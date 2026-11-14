@@ -9,6 +9,8 @@ export type StoredAccessPrincipal = {
   userId: string | null;
   role: "owner" | ParticipantRole | null;
   grants: readonly AccessGrant[];
+  factoryWide?: boolean;
+  assistantCredentialId?: string;
   accessGeneration: number;
   active: boolean;
 };
@@ -23,10 +25,8 @@ export class FactoryAccessPolicy {
   get isOwner(): boolean {
     if (!this.principal.active) return false;
     return (
-      (this.principal.actor.kind === "human" &&
-        this.principal.actor.userId === this.ownerId) ||
-      (this.principal.actor.kind === "assistant" &&
-        this.principal.actor.ownerId === this.ownerId)
+      this.principal.actor.kind === "human" &&
+      this.principal.actor.userId === this.ownerId
     );
   }
 
@@ -46,9 +46,11 @@ export class FactoryAccessPolicy {
     return (
       this.isOwner ||
       (this.principal.active &&
-        this.principal.grants.some(
-          (grant) => grant.type === "project" && grant.resourceId === projectId,
-        ))
+        (this.principal.factoryWide === true ||
+          this.principal.grants.some(
+            (grant) =>
+              grant.type === "project" && grant.resourceId === projectId,
+          )))
     );
   }
 
@@ -58,7 +60,7 @@ export class FactoryAccessPolicy {
     ownerPrivate = false,
   ): boolean {
     if (!this.principal.active) return false;
-    if (this.isOwner) return true;
+    if (this.isOwner || this.principal.factoryWide === true) return true;
     if (ownerPrivate) return false;
     return this.principal.grants.some(
       (grant) =>
@@ -79,6 +81,7 @@ export class FactoryAccessPolicy {
     if (!this.canReadThread(projectId, threadId, ownerPrivate)) return false;
     return (
       this.isOwner ||
+      (this.principal.actor.kind === "assistant" && this.principal.active) ||
       (this.principal.actor.kind === "human" && this.principal.role === "guest")
     );
   }

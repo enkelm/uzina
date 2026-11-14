@@ -1,4 +1,8 @@
-import { CONTRACT_VERSION, actorIdentitySchema } from "@uzina/contracts";
+import {
+  CONTRACT_VERSION,
+  actorIdentitySchema,
+  capabilitySetSchema,
+} from "@uzina/contracts";
 import {
   factoryCommandReceiptSchema,
   accessGrantSchema,
@@ -17,6 +21,9 @@ import {
   invitationRedeemRequestSchema,
   participantAccessRequestSchema,
   provisionCredentialRequestSchema,
+  assistantCredentialGrantsRequestSchema,
+  assistantCredentialGrantSchema,
+  type AssistantCredentialGrant,
   type AccessGrant,
   type FactoryActor,
   type FactoryInvitation,
@@ -69,6 +76,7 @@ export interface BootstrapResult {
   name: string;
   credential: string;
   actor: FactoryActor;
+  assistantGrants?: AssistantCredentialGrant[];
 }
 
 export type DispatchIntent = FactoryQueueJob;
@@ -364,8 +372,13 @@ export class FactoryService {
     session: FactorySession,
     kind: "human" | "assistant",
     name: string,
+    assistantGrants?: AssistantCredentialGrant[],
   ): Promise<BootstrapResult> {
-    const input = provisionCredentialRequestSchema.parse({ kind, name });
+    const input = provisionCredentialRequestSchema.parse({
+      kind,
+      name,
+      ...(assistantGrants === undefined ? {} : { assistantGrants }),
+    });
     kind = input.kind;
     name = input.name;
     const ownerId = this.#requireOwner(session);
@@ -379,7 +392,12 @@ export class FactoryService {
             ownerId,
           },
     );
-    return this.#insertCredential(session, actor, name);
+    const grants =
+      kind === "assistant"
+        ? (input.assistantGrants ?? [{ type: "factory" as const }])
+        : undefined;
+    if (grants) this.#validateAssistantGrantTargets(grants);
+    return this.#insertCredential(session, actor, name, grants);
   }
 
   async provisionNode(
@@ -453,13 +471,74 @@ export class FactoryService {
       }>(
         "SELECT credential_id, actor_json, name, revoked_at, created_at FROM credentials ORDER BY created_at, credential_id",
       )
-      .map((row) => ({
-        credentialId: row.credential_id,
-        actor: parseActor(row.actor_json),
-        name: row.name,
-        revokedAt: row.revoked_at,
-        createdAt: row.created_at,
-      }));
+      .map((row) => {
+        const actor = parseActor(row.actor_json);
+        return {
+          credentialId: row.credential_id,
+          actor,
+          name: row.name,
+          revokedAt: row.revoked_at,
+          createdAt: row.created_at,
+          ...(actor.kind === "assistant"
+            ? { assistantGrants: this.#assistantGrants(row.credential_id) }
+            : {}),
+        };
+      });
+  }
+
+  setAssistantCredentialGrants(
+    session: FactorySession,
+    credentialId: string,
+    grants: AssistantCredentialGrant[],
+  ) {
+    this.#requireOwner(session);
+    grants = assistantCredentialGrantsRequestSchema.parse({ grants }).grants;
+    this.#validateAssistantGrantTargets(grants);
+    const target = this.database.all<{
+      actor_json: string;
+      revoked_at: string | null;
+    }>(
+      "SELECT actor_json, revoked_at FROM credentials WHERE credential_id = ?",
+      [credentialId],
+    )[0];
+    if (!target || target.revoked_at !== null) throw notFound("Credential");
+    if (parseActor(target.actor_json).kind !== "assistant") {
+      throw new FactoryError(
+        400,
+        "not_assistant_credential",
+        "Grant authority can be changed only for assistant credentials",
+      );
+    }
+    const timestamp = now();
+    this.database.transaction(() => {
+      this.#requireOwner(session);
+      const current = this.database.all<{
+        actor_json: string;
+        revoked_at: string | null;
+      }>(
+        "SELECT actor_json, revoked_at FROM credentials WHERE credential_id = ?",
+        [credentialId],
+      )[0];
+      if (!current || current.revoked_at !== null) throw notFound("Credential");
+      if (parseActor(current.actor_json).kind !== "assistant") {
+        throw new FactoryError(400, "not_assistant_credential");
+      }
+      this.#replaceAssistantGrants(credentialId, grants, timestamp);
+      this.database.exec(
+        "UPDATE credentials SET access_generation = access_generation + 1 WHERE credential_id = ?",
+        [credentialId],
+      );
+      this.#event(
+        "credential.grants_changed",
+        session.actor,
+        null,
+        null,
+        null,
+        { credentialId, grants },
+        timestamp,
+      );
+    });
+    return { credentialId, assistantGrants: grants };
   }
 
   async revokeCredential(
@@ -824,30 +903,63 @@ export class FactoryService {
     });
   }
 
-  listProjects(session: FactorySession) {
+  listProjects(session: FactorySession, limit = 100) {
     const policy = this.#policy(session);
-    return this.database
-      .all<ProjectRow>(
-        "SELECT project_id, name, created_at FROM projects ORDER BY created_at, project_id",
-      )
-      .filter((row) => policy.canReadProject(row.project_id))
-      .map((row) =>
-        factoryProjectSchema.parse({
-          contractVersion: CONTRACT_VERSION,
-          projectId: row.project_id,
-          name: row.name,
-          createdAt: row.created_at,
-        }),
+    this.#validateQueryLimit(limit);
+    let rows: ProjectRow[];
+    if (policy.isOwner || policy.principal.factoryWide) {
+      rows = this.database.all<ProjectRow>(
+        "SELECT project_id, name, created_at FROM projects ORDER BY created_at, project_id LIMIT ?",
+        [limit],
       );
+    } else {
+      const projectIds = policy.principal.grants
+        .filter((grant) => grant.type === "project")
+        .map((grant) => grant.resourceId);
+      const threadIds = policy.principal.grants
+        .filter((grant) => grant.type === "thread")
+        .map((grant) => grant.resourceId);
+      if (projectIds.length === 0 && threadIds.length === 0) return [];
+      const visibleProject = [
+        ...(projectIds.length
+          ? [`p.project_id IN (${projectIds.map(() => "?").join(",")})`]
+          : []),
+        ...(threadIds.length
+          ? [
+              `EXISTS (SELECT 1 FROM threads t WHERE t.project_id = p.project_id AND t.owner_private = 0 AND t.thread_id IN (${threadIds.map(() => "?").join(",")}))`,
+            ]
+          : []),
+      ].join(" OR ");
+      rows = this.database.all<ProjectRow>(
+        `SELECT p.project_id, p.name, p.created_at FROM projects p WHERE (${visibleProject}) ORDER BY p.created_at, p.project_id LIMIT ?`,
+        [...projectIds, ...threadIds, limit],
+      );
+    }
+    return rows.map((row) =>
+      factoryProjectSchema.parse({
+        contractVersion: CONTRACT_VERSION,
+        projectId: row.project_id,
+        name: row.name,
+        createdAt: row.created_at,
+      }),
+    );
   }
 
-  listNodes(session: FactorySession) {
+  listNodes(session: FactorySession, limit = 100) {
+    const policy = this.#policy(session);
     this.#requireOwnerOrAssistant(session);
-    return this.database
-      .all<NodeRow>(
-        "SELECT node_id, name, availability, last_seen_at FROM nodes ORDER BY node_id",
-      )
-      .map((row) => this.#node(row));
+    this.#validateQueryLimit(limit);
+    const rows =
+      policy.isOwner || policy.principal.factoryWide
+        ? this.database.all<NodeRow>(
+            "SELECT node_id, name, availability, last_seen_at FROM nodes ORDER BY node_id LIMIT ?",
+            [limit],
+          )
+        : this.database.all<NodeRow>(
+            `SELECT DISTINCT n.node_id, n.name, n.availability, n.last_seen_at FROM nodes n JOIN threads t ON t.node_id = n.node_id WHERE t.owner_private = 0 AND ${this.#threadGrantPredicate(policy, "t")} ORDER BY n.node_id LIMIT ?`,
+            [...this.#threadGrantParameters(policy), limit],
+          );
+    return rows.map((row) => this.#node(row));
   }
 
   createWorkspace(
@@ -897,20 +1009,28 @@ export class FactoryService {
     });
   }
 
-  listWorkspaces(session: FactorySession) {
+  listWorkspaces(session: FactorySession, limit = 100) {
+    const policy = this.#policy(session);
     this.#requireOwnerOrAssistant(session);
-    return this.database
-      .all<WorkspaceRow>(
-        "SELECT workspace_id, node_id, name FROM workspaces ORDER BY node_id, workspace_id",
-      )
-      .map((row) =>
-        factoryWorkspaceSchema.parse({
-          contractVersion: CONTRACT_VERSION,
-          workspaceId: row.workspace_id,
-          nodeId: row.node_id,
-          name: row.name,
-        }),
-      );
+    this.#validateQueryLimit(limit);
+    const rows =
+      policy.isOwner || policy.principal.factoryWide
+        ? this.database.all<WorkspaceRow>(
+            "SELECT workspace_id, node_id, name FROM workspaces ORDER BY node_id, workspace_id LIMIT ?",
+            [limit],
+          )
+        : this.database.all<WorkspaceRow>(
+            `SELECT DISTINCT w.workspace_id, w.node_id, w.name FROM workspaces w JOIN threads t ON t.workspace_id = w.workspace_id WHERE t.owner_private = 0 AND ${this.#threadGrantPredicate(policy, "t")} ORDER BY w.node_id, w.workspace_id LIMIT ?`,
+            [...this.#threadGrantParameters(policy), limit],
+          );
+    return rows.map((row) =>
+      factoryWorkspaceSchema.parse({
+        contractVersion: CONTRACT_VERSION,
+        workspaceId: row.workspace_id,
+        nodeId: row.node_id,
+        name: row.name,
+      }),
+    );
   }
 
   createThread(
@@ -994,25 +1114,26 @@ export class FactoryService {
     });
   }
 
-  listThreads(session: FactorySession, projectId?: string) {
+  listThreads(session: FactorySession, projectId?: string, limit = 100) {
     const policy = this.#policy(session);
-    const rows = projectId
-      ? this.database.all<ThreadRow>(
-          "SELECT thread_id, project_id, title, node_id, workspace_id, ownership_generation, owner_private, created_at FROM threads WHERE project_id = ? ORDER BY created_at, thread_id",
-          [projectId],
-        )
-      : this.database.all<ThreadRow>(
-          "SELECT thread_id, project_id, title, node_id, workspace_id, ownership_generation, owner_private, created_at FROM threads ORDER BY created_at, thread_id",
-        );
-    return rows
-      .filter((row) =>
-        policy.canReadThread(
-          row.project_id,
-          row.thread_id,
-          row.owner_private === 1,
-        ),
-      )
-      .map((row) => this.#thread(row));
+    this.#validateQueryLimit(limit);
+    const projectFilter = projectId ? " AND t.project_id = ?" : "";
+    const projectParameters = projectId ? [projectId] : [];
+    const rows =
+      policy.isOwner || policy.principal.factoryWide
+        ? this.database.all<ThreadRow>(
+            `SELECT t.thread_id, t.project_id, t.title, t.node_id, t.workspace_id, t.ownership_generation, t.owner_private, t.created_at FROM threads t WHERE 1 = 1${projectFilter} ORDER BY t.created_at, t.thread_id LIMIT ?`,
+            [...projectParameters, limit],
+          )
+        : this.database.all<ThreadRow>(
+            `SELECT t.thread_id, t.project_id, t.title, t.node_id, t.workspace_id, t.ownership_generation, t.owner_private, t.created_at FROM threads t WHERE t.owner_private = 0 AND (${this.#threadGrantPredicate(policy, "t")})${projectFilter} ORDER BY t.created_at, t.thread_id LIMIT ?`,
+            [
+              ...this.#threadGrantParameters(policy),
+              ...projectParameters,
+              limit,
+            ],
+          );
+    return rows.map((row) => this.#thread(row));
   }
 
   listDiscussion(session: FactorySession, threadId: string) {
@@ -1257,6 +1378,39 @@ export class FactoryService {
     return this.#receiptByJob(receipt.job_id);
   }
 
+  listThreadReceipts(
+    session: FactorySession,
+    threadId: string,
+    limit = 100,
+  ): FactoryCommandReceipt[] {
+    this.#requireReadableThread(session, threadId);
+    this.#validateQueryLimit(limit);
+    const rows = this.database.all<{ job_id: string }>(
+      "SELECT job_id FROM command_receipts WHERE thread_id = ? ORDER BY accepted_at, request_id LIMIT ?",
+      [threadId, limit],
+    );
+    return rows.map((row) => this.#receiptByJob(row.job_id));
+  }
+
+  getLifecycleCapabilities(session: FactorySession, threadId: string) {
+    const thread = this.#requireReadableThread(session, threadId);
+    const canSteer = this.#policy(session).canSteer(
+      thread.project_id,
+      thread.thread_id,
+      thread.owner_private === 1,
+    );
+    return capabilitySetSchema.parse({
+      contractVersion: CONTRACT_VERSION,
+      capabilities: [
+        { operation: "reattach", supported: false },
+        { operation: "native-resume", supported: false },
+        { operation: "managed-checkpoint-recovery", supported: false },
+        { operation: "steer", supported: canSteer },
+        { operation: "stop", supported: false },
+      ],
+    });
+  }
+
   /** Authorized runtime query target; placement always comes from the stored thread. */
   getAuthorizedThread(session: FactorySession, threadId: string) {
     const row = this.#requireReadableThread(session, threadId);
@@ -1481,9 +1635,37 @@ export class FactoryService {
         offset = after - cursorBase;
       }
     }
-    const query = policy.isOwner
-      ? "SELECT cursor, type, actor_json, project_id, thread_id, request_id, payload_json, created_at FROM factory_events WHERE cursor > ? ORDER BY cursor LIMIT ?"
-      : `SELECT e.cursor, e.type, e.actor_json, e.project_id, e.thread_id, e.request_id, e.payload_json, e.created_at
+    const fullyVisible =
+      policy.isOwner || policy.principal.factoryWide === true;
+    let query: string;
+    let parameters: (string | number)[];
+    if (policy.isOwner) {
+      query =
+        "SELECT cursor, type, actor_json, project_id, thread_id, request_id, payload_json, created_at FROM factory_events WHERE cursor > ? ORDER BY cursor LIMIT ?";
+      parameters = [after, limit];
+    } else if (fullyVisible) {
+      query =
+        "SELECT cursor, type, actor_json, project_id, thread_id, request_id, payload_json, created_at FROM factory_events ORDER BY cursor LIMIT ? OFFSET ?";
+      parameters = [limit, offset];
+    } else if (session.actor.kind === "assistant") {
+      query = `SELECT e.cursor, e.type, e.actor_json, e.project_id, e.thread_id, e.request_id, e.payload_json, e.created_at
+         FROM factory_events e
+         WHERE (
+           (e.thread_id IS NULL AND e.project_id IS NOT NULL AND EXISTS (
+             SELECT 1 FROM assistant_credential_grants g WHERE g.credential_id = ? AND g.resource_type = 'project' AND g.resource_id = e.project_id
+           )) OR EXISTS (
+             SELECT 1 FROM threads t
+             WHERE t.thread_id = e.thread_id AND t.owner_private = 0 AND EXISTS (
+               SELECT 1 FROM assistant_credential_grants g WHERE g.credential_id = ? AND (
+                 (g.resource_type = 'thread' AND g.resource_id = e.thread_id) OR
+                 (g.resource_type = 'project' AND g.resource_id = t.project_id)
+               )
+             )
+           )
+         ) ORDER BY e.cursor LIMIT ? OFFSET ?`;
+      parameters = [session.credentialId, session.credentialId, limit, offset];
+    } else {
+      query = `SELECT e.cursor, e.type, e.actor_json, e.project_id, e.thread_id, e.request_id, e.payload_json, e.created_at
          FROM factory_events e
          WHERE (
            (e.thread_id IS NULL AND e.project_id IS NOT NULL AND EXISTS (
@@ -1498,9 +1680,13 @@ export class FactoryService {
              )
            )
          ) ORDER BY e.cursor LIMIT ? OFFSET ?`;
-    const parameters = policy.isOwner
-      ? [after, limit]
-      : [policy.principal.userId!, policy.principal.userId!, limit, offset];
+      parameters = [
+        policy.principal.userId!,
+        policy.principal.userId!,
+        limit,
+        offset,
+      ];
+    }
     const rows = this.database.all<EventRow>(query, parameters);
     const parsed = rows.map((row, index) =>
       factoryEventSchema.parse({
@@ -2548,7 +2734,9 @@ export class FactoryService {
   }
 
   #requireOwnerOrAssistant(session: FactorySession): void {
-    if (!this.#policy(session).isOwner) throw forbidden();
+    const policy = this.#policy(session);
+    if (!policy.isOwner && session.actor.kind !== "assistant")
+      throw forbidden();
   }
 
   #policy(session: FactorySession): FactoryAccessPolicy {
@@ -2587,18 +2775,45 @@ export class FactoryService {
               active: true,
             };
           })()
-        : {
-            actor: session.actor,
-            userId: null,
-            role: null,
-            grants: [],
-            accessGeneration: 0,
-            active: true,
-          };
-    const policy = new FactoryAccessPolicy(owner.owner_id, principal);
-    if (session.actor.kind === "assistant" && !policy.isOwner)
-      throw forbidden();
-    return policy;
+        : (() => {
+            if (session.actor.kind !== "assistant") throw forbidden();
+            if (session.actor.ownerId !== owner.owner_id) throw authError();
+            const credential = this.database.all<{
+              access_generation: number;
+            }>(
+              "SELECT access_generation FROM credentials WHERE credential_id = ?",
+              [session.credentialId],
+            )[0];
+            if (!credential) throw authError();
+            const rows = this.database.all<{
+              resource_type: string;
+              resource_id: string;
+            }>(
+              "SELECT resource_type, resource_id FROM assistant_credential_grants WHERE credential_id = ? ORDER BY resource_type, resource_id",
+              [session.credentialId],
+            );
+            const factoryWide = rows.some(
+              (grant) => grant.resource_type === "factory",
+            );
+            return {
+              actor: session.actor,
+              userId: null,
+              assistantCredentialId: session.credentialId,
+              role: null,
+              grants: rows
+                .filter((grant) => grant.resource_type !== "factory")
+                .map((grant) =>
+                  accessGrantSchema.parse({
+                    type: grant.resource_type,
+                    resourceId: grant.resource_id,
+                  }),
+                ),
+              factoryWide,
+              accessGeneration: Number(credential.access_generation),
+              active: true,
+            };
+          })();
+    return new FactoryAccessPolicy(owner.owner_id, principal);
   }
 
   #requireReadableThread(session: FactorySession, threadId: string): ThreadRow {
@@ -2638,8 +2853,11 @@ export class FactoryService {
       "SELECT owner_id FROM factory_meta WHERE singleton = 1",
     )[0];
     if (!owner) return false;
-    const activeCredential = this.database.all<{ credential_id: string }>(
-      "SELECT credential_id FROM credentials WHERE actor_json = ? AND revoked_at IS NULL LIMIT 1",
+    const activeCredential = this.database.all<{
+      credential_id: string;
+      access_generation: number;
+    }>(
+      "SELECT credential_id, access_generation FROM credentials WHERE actor_json = ? AND revoked_at IS NULL LIMIT 1",
       [encode(actor)],
     )[0];
     if (!activeCredential) return false;
@@ -2677,12 +2895,28 @@ export class FactoryService {
       };
     } else {
       if (actor.ownerId !== owner.owner_id) return false;
+      const rows = this.database.all<{
+        resource_type: string;
+        resource_id: string;
+      }>(
+        "SELECT resource_type, resource_id FROM assistant_credential_grants WHERE credential_id = ?",
+        [activeCredential.credential_id],
+      );
       principal = {
         actor,
         userId: null,
+        assistantCredentialId: activeCredential.credential_id,
         role: null,
-        accessGeneration: 0,
-        grants: [],
+        accessGeneration: Number(activeCredential.access_generation),
+        grants: rows
+          .filter((grant) => grant.resource_type !== "factory")
+          .map((grant) =>
+            accessGrantSchema.parse({
+              type: grant.resource_type,
+              resourceId: grant.resource_id,
+            }),
+          ),
+        factoryWide: rows.some((grant) => grant.resource_type === "factory"),
         active: true,
       };
     }
@@ -2691,6 +2925,91 @@ export class FactoryService {
       thread.thread_id,
       thread.owner_private === 1,
     );
+  }
+
+  #validateQueryLimit(limit: number): void {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new FactoryError(
+        400,
+        "invalid_limit",
+        "Query limits must be between 1 and 100",
+      );
+    }
+  }
+
+  #threadGrantPredicate(policy: FactoryAccessPolicy, alias: string): string {
+    const projectIds = policy.principal.grants.filter(
+      (grant) => grant.type === "project",
+    );
+    const threadIds = policy.principal.grants.filter(
+      (grant) => grant.type === "thread",
+    );
+    const clauses = [
+      ...(projectIds.length
+        ? [`${alias}.project_id IN (${projectIds.map(() => "?").join(",")})`]
+        : []),
+      ...(threadIds.length
+        ? [`${alias}.thread_id IN (${threadIds.map(() => "?").join(",")})`]
+        : []),
+    ];
+    return clauses.length ? `(${clauses.join(" OR ")})` : "0 = 1";
+  }
+
+  #threadGrantParameters(policy: FactoryAccessPolicy): string[] {
+    return [
+      ...policy.principal.grants
+        .filter((grant) => grant.type === "project")
+        .map((grant) => grant.resourceId),
+      ...policy.principal.grants
+        .filter((grant) => grant.type === "thread")
+        .map((grant) => grant.resourceId),
+    ];
+  }
+
+  #validateAssistantGrantTargets(
+    grants: readonly AssistantCredentialGrant[],
+  ): void {
+    const narrowed = grants.filter(
+      (grant): grant is AccessGrant => grant.type !== "factory",
+    );
+    this.#validateGrantTargets(narrowed);
+  }
+
+  #assistantGrants(credentialId: string): AssistantCredentialGrant[] {
+    return this.database
+      .all<{ resource_type: string; resource_id: string }>(
+        "SELECT resource_type, resource_id FROM assistant_credential_grants WHERE credential_id = ? ORDER BY resource_type, resource_id",
+        [credentialId],
+      )
+      .map((grant) =>
+        assistantCredentialGrantSchema.parse(
+          grant.resource_type === "factory"
+            ? { type: "factory" }
+            : { type: grant.resource_type, resourceId: grant.resource_id },
+        ),
+      );
+  }
+
+  #replaceAssistantGrants(
+    credentialId: string,
+    grants: readonly AssistantCredentialGrant[],
+    createdAt: string,
+  ): void {
+    this.database.exec(
+      "DELETE FROM assistant_credential_grants WHERE credential_id = ?",
+      [credentialId],
+    );
+    for (const grant of grants) {
+      this.database.exec(
+        "INSERT INTO assistant_credential_grants (credential_id, resource_type, resource_id, created_at) VALUES (?, ?, ?, ?)",
+        [
+          credentialId,
+          grant.type,
+          grant.type === "factory" ? "factory" : grant.resourceId,
+          createdAt,
+        ],
+      );
+    }
   }
 
   #validateGrantTargets(grants: readonly AccessGrant[]): void {
@@ -2870,12 +3189,20 @@ export class FactoryService {
     session: FactorySession,
     actor: FactoryActor,
     name: string,
+    assistantGrants?: AssistantCredentialGrant[],
   ): Promise<BootstrapResult> {
     const result = await this.#newCredential(actor, name);
     const createdAt = now();
     this.database.transaction(() => {
       this.#requireOwner(session);
       this.#insertCredentialRows(result, createdAt);
+      if (assistantGrants) {
+        this.#replaceAssistantGrants(
+          result.credentialId,
+          assistantGrants,
+          createdAt,
+        );
+      }
       this.#event(
         "credential.provisioned",
         session.actor,
@@ -2891,18 +3218,20 @@ export class FactoryService {
       name: result.name,
       credential: result.credential,
       actor: result.actor,
+      ...(assistantGrants ? { assistantGrants } : {}),
     };
   }
 
   #insertCredentialRows(credential: StoredCredential, createdAt: string): void {
     // A token is random bearer material; only its one-way digest reaches persistent storage.
     this.database.exec(
-      "INSERT INTO credentials (credential_id, token_hash, actor_json, name, created_at) VALUES (?, ?, ?, ?, ?)",
+      "INSERT INTO credentials (credential_id, token_hash, actor_json, name, assistant_scope_initialized, created_at) VALUES (?, ?, ?, ?, ?, ?)",
       [
         credential.credentialId,
         credential.tokenHash,
         encode(credential.actor),
         credential.name,
+        credential.actor.kind === "assistant" ? 1 : 0,
         createdAt,
       ],
     );

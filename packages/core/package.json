@@ -7,9 +7,11 @@
     ".": "./src/index.ts",
     "./http": "./src/http.ts",
     "./database": "./src/database.ts",
-    "./access": "./src/access.ts"
+    "./access": "./src/access.ts",
+    "./mcp": "./src/mcp.ts"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
     "@uzina/contracts": "workspace:*",
     "zod": "^3.25.76"
   }

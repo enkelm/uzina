@@ -23,6 +23,8 @@ const schema = [
     actor_json TEXT NOT NULL,
     name TEXT NOT NULL,
     revoked_at TEXT,
+    access_generation INTEGER NOT NULL DEFAULT 0 CHECK (access_generation >= 0),
+    assistant_scope_initialized INTEGER NOT NULL DEFAULT 0 CHECK (assistant_scope_initialized IN (0, 1)),
     created_at TEXT NOT NULL
   )`,
   `CREATE TABLE IF NOT EXISTS factory_users (
@@ -32,6 +34,13 @@ const schema = [
     access_generation INTEGER NOT NULL DEFAULT 0 CHECK (access_generation >= 0),
     revoked_at TEXT,
     created_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS assistant_credential_grants (
+    credential_id TEXT NOT NULL REFERENCES credentials(credential_id),
+    resource_type TEXT NOT NULL CHECK (resource_type IN ('factory', 'project', 'thread')),
+    resource_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (credential_id, resource_type, resource_id)
   )`,
   `CREATE TABLE IF NOT EXISTS access_grants (
     user_id TEXT NOT NULL REFERENCES factory_users(user_id),
@@ -183,6 +192,21 @@ export function initializeFactoryDatabase(database: FactoryDatabase): void {
       database.exec(`ALTER TABLE execution_jobs ADD COLUMN ${column} TEXT`);
     }
   }
+  const credentialColumns = new Set(
+    database
+      .all<{ name: string }>("PRAGMA table_info(credentials)")
+      .map((column) => column.name),
+  );
+  if (!credentialColumns.has("access_generation")) {
+    database.exec(
+      "ALTER TABLE credentials ADD COLUMN access_generation INTEGER NOT NULL DEFAULT 0 CHECK (access_generation >= 0)",
+    );
+  }
+  if (!credentialColumns.has("assistant_scope_initialized")) {
+    database.exec(
+      "ALTER TABLE credentials ADD COLUMN assistant_scope_initialized INTEGER NOT NULL DEFAULT 0 CHECK (assistant_scope_initialized IN (0, 1))",
+    );
+  }
   const userColumns = new Set(
     database
       .all<{ name: string }>("PRAGMA table_info(factory_users)")
@@ -206,6 +230,43 @@ export function initializeFactoryDatabase(database: FactoryDatabase): void {
   const owner = database.all<{ owner_id: string }>(
     "SELECT owner_id FROM factory_meta WHERE singleton = 1",
   )[0];
+  const assistantCredentials = database.all<{
+    credential_id: string;
+    actor_json: string;
+    created_at: string;
+    assistant_scope_initialized: number;
+  }>(
+    "SELECT credential_id, actor_json, created_at, assistant_scope_initialized FROM credentials ORDER BY created_at, credential_id",
+  );
+  for (const credential of assistantCredentials) {
+    let actor: { kind?: string };
+    try {
+      actor = JSON.parse(credential.actor_json) as { kind?: string };
+    } catch {
+      continue;
+    }
+    if (
+      actor.kind === "assistant" &&
+      credential.assistant_scope_initialized === 0
+    ) {
+      const hasStoredScope =
+        database.all(
+          "SELECT credential_id FROM assistant_credential_grants WHERE credential_id = ? LIMIT 1",
+          [credential.credential_id],
+        ).length > 0;
+      if (!hasStoredScope) {
+        // Existing assistant credentials retain their prior breadth as an explicit stored grant.
+        database.exec(
+          "INSERT INTO assistant_credential_grants (credential_id, resource_type, resource_id, created_at) VALUES (?, 'factory', 'factory', ?)",
+          [credential.credential_id, credential.created_at],
+        );
+      }
+      database.exec(
+        "UPDATE credentials SET assistant_scope_initialized = 1 WHERE credential_id = ?",
+        [credential.credential_id],
+      );
+    }
+  }
   if (owner) {
     const legacyOwnerCredentials = database.all<{
       actor_json: string;

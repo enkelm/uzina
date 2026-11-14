@@ -1,3 +1,4 @@
+import { assertLoopbackHostname } from "./loopback";
 import {
   CONTRACT_VERSION,
   actorIdentitySchema,
@@ -50,5 +51,6 @@ export function createDaemonServer(
   port = 8788,
   hostname = "127.0.0.1",
 ): ReturnType<typeof Bun.serve> {
+  assertLoopbackHostname(hostname);
   return Bun.serve({ port, hostname, fetch: handleDaemonRequest });
 }
