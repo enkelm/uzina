@@ -57,6 +57,7 @@ import {
   executionRegisterResponseSchema,
   executionReportResponseSchema,
   type ExecutionCaptureControl,
+  type ExecutionCaptureControlReport,
   type ExecutionHeartbeatRequest,
   type ExecutionJob,
   type ExecutionJobReport,
@@ -267,6 +268,44 @@ export type ManagedExecutionEvidence = {
   taskId: string;
   callId: string;
 };
+
+type ManagedWorkSourceFence = NonNullable<
+  ExecutionCaptureControlReport["sourceFence"]
+>;
+
+type ImmutableManagedWorkSourceFence = Readonly<
+  Omit<ManagedWorkSourceFence, "target"> & {
+    target: Readonly<ManagedWorkSourceFence["target"]>;
+  }
+>;
+
+export type ManagedWorkCaptureBinding = Readonly<{
+  captureId: string;
+  captureRequestId: string;
+  controlId: string;
+  threadId: string;
+  projectId: string;
+  target: Readonly<{ nodeId: string; workspaceId: string }>;
+  ownershipGeneration: number;
+  sourceFence: ImmutableManagedWorkSourceFence;
+  reportSha256: string;
+}>;
+
+export type ManagedWorkCaptureState =
+  | Readonly<{ state: "unlocked" }>
+  | Readonly<{ state: "held"; captureId?: string }>
+  | Readonly<{
+      state: "source-capture-fenced";
+      binding: ManagedWorkCaptureBinding;
+    }>;
+
+export type ManagedWorkRuntimeAdmission =
+  | Readonly<{
+      state: "permitted";
+      permitId: string;
+      ownershipGeneration: number;
+    }>
+  | Readonly<{ state: "held"; captureId?: string }>;
 
 const NODE_HEARTBEAT_TTL_MS = 90_000;
 // Participant cursors occupy a generation-specific range independent of hidden global events.
@@ -2091,6 +2130,239 @@ export class FactoryService {
     });
   }
 
+  /**
+   * Atomically admit one named runtime lifecycle while no source-capture lock exists.
+   * An active permit is returned unchanged after retries or Core/DO restart; it has no timeout.
+   */
+  async acquireManagedWorkRuntimePermit(
+    threadId: string,
+  ): Promise<ManagedWorkRuntimeAdmission> {
+    return this.database.transaction(() => {
+      const thread = this.#captureThread(threadId);
+      const captures = this.database.all<{ capture_id: string }>(
+        "SELECT capture_id FROM managed_work_captures WHERE thread_id = ?",
+        [threadId],
+      );
+      if (captures.length === 1) {
+        return { state: "held", captureId: captures[0]!.capture_id };
+      }
+      if (captures.length > 1) return { state: "held" };
+
+      const existing = this.database.all<{
+        permit_id: string;
+        ownership_generation: number;
+        released_at: string | null;
+      }>(
+        "SELECT permit_id, ownership_generation, released_at FROM managed_work_runtime_permits WHERE thread_id = ?",
+        [threadId],
+      )[0];
+      if (existing?.released_at === null) {
+        if (existing.ownership_generation !== thread.ownership_generation) {
+          return { state: "held" };
+        }
+        return {
+          state: "permitted",
+          permitId: existing.permit_id,
+          ownershipGeneration: existing.ownership_generation,
+        };
+      }
+
+      const permitId = makeId("managed-runtime-permit");
+      this.database.exec(
+        `INSERT INTO managed_work_runtime_permits(
+          thread_id, permit_id, ownership_generation, acquired_at, released_at
+        ) VALUES (?, ?, ?, ?, NULL)
+        ON CONFLICT(thread_id) DO UPDATE SET
+          permit_id = excluded.permit_id,
+          ownership_generation = excluded.ownership_generation,
+          acquired_at = excluded.acquired_at,
+          released_at = NULL`,
+        [threadId, permitId, thread.ownership_generation, now()],
+      );
+      return {
+        state: "permitted",
+        permitId,
+        ownershipGeneration: thread.ownership_generation,
+      };
+    });
+  }
+
+  /** Release only this exact runtime token after ManagedWork has closed its Harness. */
+  releaseManagedWorkRuntimePermit(threadId: string, permitId: string): void {
+    this.database.transaction(() => {
+      this.#captureThread(threadId);
+      this.database.exec(
+        `UPDATE managed_work_runtime_permits SET released_at = ?
+         WHERE thread_id = ? AND permit_id = ? AND released_at IS NULL`,
+        [now(), threadId, permitId],
+      );
+    });
+  }
+
+  /** Trusted managed-work RPC state; any persisted lock remains blocking after restart. */
+  async getManagedWorkCaptureState(
+    threadId: string,
+  ): Promise<ManagedWorkCaptureState> {
+    const locks = this.database.all<{
+      capture_id: string;
+      workspace_id: string;
+      owner_id: string;
+    }>(
+      "SELECT capture_id, workspace_id, owner_id FROM managed_work_captures WHERE thread_id = ?",
+      [threadId],
+    );
+    if (locks.length === 0) return { state: "unlocked" };
+    if (locks.length !== 1) return { state: "held" };
+    const lock = locks[0]!;
+    const activeRuntime = this.database.all<{ permit_id: string }>(
+      "SELECT permit_id FROM managed_work_runtime_permits WHERE thread_id = ? AND released_at IS NULL LIMIT 1",
+      [threadId],
+    );
+    if (activeRuntime.length) {
+      return { state: "held", captureId: lock.capture_id };
+    }
+    const controls = this.database.all<CaptureControlRow>(
+      "SELECT * FROM capture_control_requests WHERE capture_id = ?",
+      [lock.capture_id],
+    );
+    if (controls.length !== 1) {
+      return { state: "held", captureId: lock.capture_id };
+    }
+    const controlRow = controls[0]!;
+    if (
+      controlRow.status !== "source-capture-fenced" ||
+      !controlRow.report_json ||
+      !controlRow.report_sha256
+    ) {
+      return { state: "held", captureId: lock.capture_id };
+    }
+
+    const control = executionCaptureControlSchema.parse(
+      JSON.parse(controlRow.payload_json),
+    );
+    const report = executionCaptureControlReportSchema.parse(
+      JSON.parse(controlRow.report_json),
+    );
+    const controlBinding = {
+      contractVersion: EXECUTION_CONTRACT_VERSION,
+      controlId: controlRow.control_id,
+      captureId: controlRow.capture_id,
+      requestId: controlRow.request_id,
+      nodeId: controlRow.node_id,
+      target: {
+        nodeId: controlRow.node_id,
+        workspaceId: controlRow.workspace_id,
+      },
+      ownershipGeneration: controlRow.ownership_generation,
+    };
+    const sourceFence = report.sourceFence;
+    if (!sourceFence) return { state: "held", captureId: lock.capture_id };
+    const sourceFenceBinding = {
+      controlId: sourceFence.controlId,
+      captureId: sourceFence.captureId,
+      requestId: sourceFence.requestId,
+      nodeId: sourceFence.nodeId,
+      target: sourceFence.target,
+      ownershipGeneration: sourceFence.ownershipGeneration,
+      fencedAt: sourceFence.fencedAt,
+    };
+    const [controlPayloadSha256, persistedReportSha256, sourceFenceSha256] =
+      await Promise.all([
+        sha256(stableJson(controlBinding)),
+        sha256(stableJson(report)),
+        sha256(stableJson(sourceFenceBinding)),
+      ]);
+    if (
+      controlRow.thread_id !== threadId ||
+      controlRow.capture_id !== lock.capture_id ||
+      controlRow.workspace_id !== lock.workspace_id ||
+      controlRow.actor_json !==
+        encode({
+          contractVersion: CONTRACT_VERSION,
+          kind: "human",
+          userId: lock.owner_id,
+        }) ||
+      control.controlId !== controlRow.control_id ||
+      control.captureId !== controlRow.capture_id ||
+      control.requestId !== controlRow.request_id ||
+      control.nodeId !== controlRow.node_id ||
+      control.target.nodeId !== controlRow.node_id ||
+      control.target.workspaceId !== controlRow.workspace_id ||
+      control.ownershipGeneration !== controlRow.ownership_generation ||
+      control.payloadSha256 !== controlPayloadSha256 ||
+      report.controlId !== control.controlId ||
+      report.captureId !== control.captureId ||
+      report.requestId !== control.requestId ||
+      report.nodeId !== control.nodeId ||
+      report.target.nodeId !== control.target.nodeId ||
+      report.target.workspaceId !== control.target.workspaceId ||
+      report.ownershipGeneration !== control.ownershipGeneration ||
+      report.payloadSha256 !== control.payloadSha256 ||
+      report.status !== "source-capture-fenced" ||
+      sourceFence.controlId !== control.controlId ||
+      sourceFence.captureId !== control.captureId ||
+      sourceFence.requestId !== control.requestId ||
+      sourceFence.nodeId !== control.nodeId ||
+      sourceFence.target.nodeId !== control.target.nodeId ||
+      sourceFence.target.workspaceId !== control.target.workspaceId ||
+      sourceFence.ownershipGeneration !== control.ownershipGeneration ||
+      sourceFence.receiptSha256 !== sourceFenceSha256 ||
+      controlRow.report_sha256 !== persistedReportSha256
+    ) {
+      return { state: "held", captureId: lock.capture_id };
+    }
+
+    const thread = this.database.all<ThreadRow>(
+      "SELECT thread_id, project_id, title, node_id, workspace_id, ownership_generation, owner_private, created_at FROM threads WHERE thread_id = ?",
+      [threadId],
+    )[0];
+    const sharedWorkspace = this.database.all<{ count: number }>(
+      "SELECT COUNT(*) AS count FROM threads WHERE workspace_id = ?",
+      [lock.workspace_id],
+    )[0]?.count;
+    const unsettledInput = this.database.all<{ status: string }>(
+      "SELECT status FROM dispatch_intents WHERE thread_id = ? AND status IN ('queued', 'unavailable', 'running', 'dispatched', 'uncertain') LIMIT 1",
+      [threadId],
+    )[0];
+    const unsettledEffect = this.database.all<{ status: string }>(
+      "SELECT status FROM execution_jobs WHERE workspace_id = ? AND status IN ('queued', 'claimed', 'uncertain') LIMIT 1",
+      [lock.workspace_id],
+    )[0];
+    if (
+      !thread ||
+      thread.project_id !== controlRow.project_id ||
+      thread.node_id !== controlRow.node_id ||
+      thread.workspace_id !== controlRow.workspace_id ||
+      thread.ownership_generation !== controlRow.ownership_generation ||
+      this.#ownershipGeneration() !== controlRow.ownership_generation ||
+      sharedWorkspace !== 1 ||
+      unsettledInput ||
+      unsettledEffect
+    ) {
+      return { state: "held", captureId: lock.capture_id };
+    }
+
+    const immutableSourceFence = Object.freeze({
+      ...sourceFence,
+      target: Object.freeze({ ...sourceFence.target }),
+    });
+    const binding: ManagedWorkCaptureBinding = Object.freeze({
+      captureId: controlRow.capture_id,
+      captureRequestId: controlRow.request_id,
+      controlId: controlRow.control_id,
+      threadId,
+      projectId: controlRow.project_id,
+      target: Object.freeze({
+        nodeId: controlRow.node_id,
+        workspaceId: controlRow.workspace_id,
+      }),
+      ownershipGeneration: controlRow.ownership_generation,
+      sourceFence: immutableSourceFence,
+      reportSha256: controlRow.report_sha256,
+    });
+    return Object.freeze({ state: "source-capture-fenced", binding });
+  }
+
   /** Recovery/status seam: a persisted lock remains blocking after host restart. */
   isManagedWorkCapturing(threadId: string): boolean {
     return (
@@ -3264,6 +3536,16 @@ export class FactoryService {
       throw conflict(
         "capture_workspace_shared",
         "Managed-work capture requires an exclusive workspace; this workspace is assigned to multiple threads",
+      );
+    }
+    const activeRuntime = this.database.all<{ permit_id: string }>(
+      "SELECT permit_id FROM managed_work_runtime_permits WHERE thread_id = ? AND released_at IS NULL LIMIT 1",
+      [threadId],
+    );
+    if (activeRuntime.length) {
+      throw conflict(
+        "managed_work_runtime_active",
+        "Managed-work capture cannot begin while runtime lifecycle permission is active",
       );
     }
     const activeInputs = this.database.all<{ status: string }>(

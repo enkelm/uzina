@@ -167,6 +167,13 @@ const schema = [
     owner_id TEXT NOT NULL,
     started_at TEXT NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS managed_work_runtime_permits (
+    thread_id TEXT PRIMARY KEY REFERENCES threads(thread_id),
+    permit_id TEXT NOT NULL UNIQUE,
+    ownership_generation INTEGER NOT NULL CHECK (ownership_generation >= 0),
+    acquired_at TEXT NOT NULL,
+    released_at TEXT
+  )`,
   `CREATE TABLE IF NOT EXISTS capture_control_requests (
     request_id TEXT PRIMARY KEY,
     control_id TEXT NOT NULL UNIQUE,

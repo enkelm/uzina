@@ -200,6 +200,15 @@ export class ManagedPiWork {
     return this.harness.wake();
   }
 
+  /** True only when no live task or scheduled wake can advance before Harness.close seals the Session. */
+  async isQuiescent(context: Context = BACKGROUND_CONTEXT): Promise<boolean> {
+    const inspection = await this.harness.inspect(context);
+    const wake = this.harness.wake();
+    return (
+      inspection.tasks.length === 0 && !wake.active && wake.at === undefined
+    );
+  }
+
   async close(context: Context = BACKGROUND_CONTEXT): Promise<void> {
     await this.harness.close(context);
   }

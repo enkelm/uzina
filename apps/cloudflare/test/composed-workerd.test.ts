@@ -109,7 +109,11 @@ describe("production-shaped Cloudflare composition in Miniflare workerd", () => 
       script: artifact.script,
       modules: true,
       compatibilityDate: "2026-05-01",
+      host: "127.0.0.1",
+      port: 0,
+      unsafeInspectDurableObjects: true,
       bindings: {
+        UZINA_BOOTSTRAP_SECRET: "missing-provider-bootstrap",
         UZINA_MODEL_PROVIDER: "openai",
         UZINA_MODEL_ID: "gpt-4o-mini",
       },
@@ -119,22 +123,90 @@ describe("production-shaped Cloudflare composition in Miniflare workerd", () => 
       },
     });
     try {
-      const namespace = (await miniflare.getDurableObjectNamespace(
+      const baseUrl = (await miniflare.ready).toString();
+      const bootstrapped = await call<{ credential: string }>(
+        baseUrl,
+        "/v1/bootstrap",
+        {
+          credential: "missing-provider-bootstrap",
+          bootstrap: true,
+          body: { name: "Missing provider owner" },
+        },
+      );
+      expect(bootstrapped.status).toBe(201);
+      const owner = bootstrapped.value.credential;
+      const project = await call<{ projectId: string }>(
+        baseUrl,
+        "/v1/projects",
+        {
+          credential: owner,
+          body: {
+            projectId: "project:missing-provider",
+            name: "Missing provider proof",
+          },
+        },
+      );
+      const node = await call<{ node: { nodeId: string } }>(
+        baseUrl,
+        "/v1/nodes",
+        {
+          credential: owner,
+          body: {
+            nodeId: "node:missing-provider",
+            name: "Missing provider node",
+          },
+        },
+      );
+      const workspace = await call<{ workspaceId: string }>(
+        baseUrl,
+        "/v1/workspaces",
+        {
+          credential: owner,
+          body: {
+            workspaceId: "workspace:missing-provider",
+            nodeId: node.value.node.nodeId,
+            name: "Missing provider workspace",
+          },
+        },
+      );
+      const thread = await call<{ threadId: string }>(baseUrl, "/v1/threads", {
+        credential: owner,
+        body: {
+          threadId: "thread:missing-provider",
+          projectId: project.value.projectId,
+          title: "Missing provider work",
+          target: {
+            nodeId: node.value.node.nodeId,
+            workspaceId: workspace.value.workspaceId,
+          },
+        },
+      });
+      const refusedRuntime = await call<{ error: string }>(
+        baseUrl,
+        `/v1/threads/${thread.value.threadId}/status`,
+        { credential: owner },
+      );
+      expect(refusedRuntime).toMatchObject({
+        status: 500,
+        value: { error: "internal_error" },
+      });
+      const managedWorkNamespace = (await miniflare.getDurableObjectNamespace(
         "MANAGED_WORK",
       )) as unknown as {
-        idFromName(name: string): unknown;
-        get(id: unknown): { status(): Promise<unknown> };
+        idFromName(name: string): { toString(): string };
       };
-      const work = namespace.get(
-        namespace.idFromName("missing-provider-secret"),
+      const workNamespace = await miniflare.unsafeGetDurableObjectStorage(
+        "worker",
+        "ManagedWorkObject",
+        {
+          id: managedWorkNamespace.idFromName(thread.value.threadId).toString(),
+        },
       );
-      let error: unknown;
-      try {
-        await work.status();
-      } catch (caught) {
-        error = caught;
-      }
-      expect(String(error)).toContain("UZINA_MODEL_API_KEY");
+      expect(
+        await workNamespace.exec<{ next_id: string; next_seq: number }>(
+          "SELECT next_id, next_seq FROM durable_metadata WHERE singleton = 1",
+        ),
+      ).toEqual([{ next_id: "2", next_seq: 1 }]);
     } finally {
       await miniflare.dispose();
     }

@@ -36,27 +36,34 @@ describe("Cloudflare ManagedWork in Miniflare workerd", () => {
       );
     }
 
+    const bootstrapSecret = "workerd-bootstrap-secret";
     const miniflare = new Miniflare({
       name: "worker",
       script: await build.outputs[0]!.text(),
       modules: true,
       compatibilityDate: "2026-05-01",
+      bindings: { UZINA_BOOTSTRAP_SECRET: bootstrapSecret },
       durableObjects: {
         FACTORY: { className: "TestFactory", useSQLite: true },
         MANAGED_WORK: { className: "TestManagedWork", useSQLite: true },
       },
     });
-    const call = async <T>(path: string, body?: unknown): Promise<T> => {
+    const call = async <T>(
+      path: string,
+      body?: unknown,
+      authorization?: string,
+    ): Promise<T> => {
       const response = await miniflare.dispatchFetch(
         `http://uzina.test/${path}`,
         {
           method: body === undefined ? "GET" : "POST",
-          ...(body === undefined
-            ? {}
-            : {
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify(body),
-              }),
+          headers: {
+            ...(authorization ? { authorization } : {}),
+            ...(body === undefined
+              ? {}
+              : { "content-type": "application/json" }),
+          },
+          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
         },
       );
       if (!response.ok) {
@@ -69,6 +76,43 @@ describe("Cloudflare ManagedWork in Miniflare workerd", () => {
         "MANAGED_WORK",
       )) as unknown as WorkerdNamespace;
       const id = namespace.idFromName("actual-workerd-managed-work");
+      const owner = await call<{ credential: string }>(
+        "v1/bootstrap",
+        { name: "Workerd owner" },
+        `Bootstrap ${bootstrapSecret}`,
+      );
+      const project = await call<{ projectId: string }>(
+        "v1/projects",
+        { projectId: "project:workerd-runtime", name: "Runtime test" },
+        `Bearer ${owner.credential}`,
+      );
+      const node = await call<{ node: { nodeId: string } }>(
+        "v1/nodes",
+        { nodeId: "node:workerd-runtime", name: "Runtime test node" },
+        `Bearer ${owner.credential}`,
+      );
+      const workspace = await call<{ workspaceId: string }>(
+        "v1/workspaces",
+        {
+          workspaceId: "workspace:workerd-runtime",
+          nodeId: node.node.nodeId,
+          name: "Runtime test workspace",
+        },
+        `Bearer ${owner.credential}`,
+      );
+      await call(
+        "v1/threads",
+        {
+          threadId: "actual-workerd-managed-work",
+          projectId: project.projectId,
+          title: "Runtime test thread",
+          target: {
+            nodeId: node.node.nodeId,
+            workspaceId: workspace.workspaceId,
+          },
+        },
+        `Bearer ${owner.credential}`,
+      );
       await call<number>("create");
       await call("reset");
 
@@ -92,6 +136,9 @@ describe("Cloudflare ManagedWork in Miniflare workerd", () => {
       await miniflare.unsafeEvictDurableObject("worker", "TestManagedWork", {
         id: id.toString(),
       });
+      // This read-only RPC constructs the cold DO; production construction arms
+      // the one-shot bootstrap alarm without opening or resuming Pi.
+      expect((await observations()).modelCalls).toBe(1);
       await waitUntil(async () => (await observations()).modelCalls > 1);
       await waitUntil(
         async () => (await observations()).recoveryModelAlarmArmed,

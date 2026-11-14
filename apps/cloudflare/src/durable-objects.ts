@@ -12,6 +12,8 @@ import {
   type ManagedInputSettlement,
   type ManagedWorkEnvironment,
   type ManagedWorkState,
+  type ManagedWorkCheckpointExport,
+  type ManagedWorkCheckpointExportRequest,
 } from "./work-object";
 
 export class FactoryObject
@@ -47,6 +49,18 @@ export class FactoryObject
 
   alarm(): Promise<void> {
     return this.#controller.alarm();
+  }
+
+  getManagedWorkCaptureState(threadId: string) {
+    return this.#controller.getManagedWorkCaptureState(threadId);
+  }
+
+  acquireManagedWorkRuntimePermit(threadId: string) {
+    return this.#controller.acquireManagedWorkRuntimePermit(threadId);
+  }
+
+  releaseManagedWorkRuntimePermit(threadId: string, permitId: string) {
+    return this.#controller.releaseManagedWorkRuntimePermit(threadId, permitId);
   }
 
   getActiveManagedInput(threadId: string): FactoryQueueJob | undefined {
@@ -101,6 +115,12 @@ export class ManagedWorkRpcObject extends DurableObject<unknown> {
 
   acceptManagedInput(input: FactoryQueueJob): Promise<ManagedInputSettlement> {
     return this.#work.acceptManagedInput(input);
+  }
+
+  exportManagedWorkCheckpoint(
+    request: ManagedWorkCheckpointExportRequest,
+  ): Promise<ManagedWorkCheckpointExport> {
+    return this.#work.exportManagedWorkCheckpoint(request);
   }
 
   context() {

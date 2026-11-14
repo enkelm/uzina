@@ -1338,10 +1338,20 @@ describe("standalone local Factory managed Pi composition", () => {
     const ownerSession = await exclusive.host.factory.authenticate(
       exclusive.owner,
     );
+    expect(
+      await exclusive.host.factory.getManagedWorkCaptureState(
+        exclusive.threadId,
+      ),
+    ).toEqual({ state: "unlocked" });
     const capture = exclusive.host.factory.beginManagedWorkCapture(
       ownerSession,
       exclusive.threadId,
     );
+    expect(
+      await exclusive.host.factory.getManagedWorkCaptureState(
+        exclusive.threadId,
+      ),
+    ).toEqual({ state: "held", captureId: capture.captureId });
     await exclusive.reopenFactory();
     const reopenedSession = await exclusive.host.factory.authenticate(
       exclusive.owner,
@@ -1355,6 +1365,11 @@ describe("standalone local Factory managed Pi composition", () => {
         workspace_id: exclusive.workspaceId,
       }),
     ]);
+    expect(
+      await exclusive.host.factory.getManagedWorkCaptureState(
+        exclusive.threadId,
+      ),
+    ).toEqual({ state: "held", captureId: capture.captureId });
     await expect(
       exclusive.host.factory.submitInput(
         reopenedSession,
@@ -1370,6 +1385,113 @@ describe("standalone local Factory managed Pi composition", () => {
     expect(
       exclusive.host.factory.listManagedWorkCaptures(reopenedSession),
     ).toHaveLength(0);
+    expect(
+      await exclusive.host.factory.getManagedWorkCaptureState(
+        exclusive.threadId,
+      ),
+    ).toEqual({ state: "unlocked" });
+  });
+
+  test("runtime permits survive lost acknowledgements and cannot release capture fences", async () => {
+    const local = await scenario({
+      models: deterministicFailingModels(),
+      modelProvider: "uzina-test-failure",
+      modelId: "fixed-model",
+      directoryPrefix: "uzina-runtime-permit-restart-",
+      deferExecutor: true,
+    });
+    await expect(
+      (async () => {
+        await local.host.factory.acquireManagedWorkRuntimePermit(
+          local.threadId,
+        );
+        throw new Error("simulated lost acquisition acknowledgement");
+      })(),
+    ).rejects.toThrow("simulated lost acquisition acknowledgement");
+    const persistedPermit = local.host.database.all<{
+      permit_id: string;
+      ownership_generation: number;
+      released_at: string | null;
+    }>(
+      "SELECT permit_id, ownership_generation, released_at FROM managed_work_runtime_permits WHERE thread_id = ?",
+      [local.threadId],
+    );
+    expect(persistedPermit).toHaveLength(1);
+    expect(persistedPermit[0]).toMatchObject({ released_at: null });
+    const lostAcquirePermitId = persistedPermit[0]!.permit_id;
+
+    await local.reopenFactory();
+    const ownerSession = await local.host.factory.authenticate(local.owner);
+    const recoveredAcquireReply =
+      await local.host.factory.acquireManagedWorkRuntimePermit(local.threadId);
+    expect(recoveredAcquireReply).toEqual({
+      state: "permitted",
+      permitId: lostAcquirePermitId,
+      ownershipGeneration: local.host.factory.getAuthorizedThread(
+        ownerSession,
+        local.threadId,
+      ).ownershipGeneration,
+    });
+    expect(() =>
+      local.host.factory.beginManagedWorkCapture(ownerSession, local.threadId),
+    ).toThrow("runtime lifecycle permission is active");
+
+    await expect(
+      (async () => {
+        await local.host.factory.releaseManagedWorkRuntimePermit(
+          local.threadId,
+          lostAcquirePermitId,
+        );
+        throw new Error("simulated lost release acknowledgement");
+      })(),
+    ).rejects.toThrow("simulated lost release acknowledgement");
+    await local.reopenFactory();
+    const reopenedSession = await local.host.factory.authenticate(local.owner);
+    await local.host.factory.releaseManagedWorkRuntimePermit(
+      local.threadId,
+      lostAcquirePermitId,
+    );
+    const nextPermit = await local.host.factory.acquireManagedWorkRuntimePermit(
+      local.threadId,
+    );
+    expect(nextPermit.state).toBe("permitted");
+    if (nextPermit.state !== "permitted") {
+      throw new Error("Expected the next runtime permit to be admitted");
+    }
+    expect(nextPermit.permitId).not.toBe(lostAcquirePermitId);
+    await local.host.factory.releaseManagedWorkRuntimePermit(
+      local.threadId,
+      lostAcquirePermitId,
+    );
+    expect(() =>
+      local.host.factory.beginManagedWorkCapture(
+        reopenedSession,
+        local.threadId,
+      ),
+    ).toThrow("runtime lifecycle permission is active");
+
+    await local.host.factory.releaseManagedWorkRuntimePermit(
+      local.threadId,
+      nextPermit.permitId,
+    );
+    await local.reopenFactory();
+    const captureSession = await local.host.factory.authenticate(local.owner);
+    await local.host.factory.releaseManagedWorkRuntimePermit(
+      local.threadId,
+      nextPermit.permitId,
+    );
+    const capture = local.host.factory.beginManagedWorkCapture(
+      captureSession,
+      local.threadId,
+    );
+    await local.host.factory.releaseManagedWorkRuntimePermit(
+      local.threadId,
+      nextPermit.permitId,
+    );
+    expect(
+      await local.host.factory.getManagedWorkCaptureState(local.threadId),
+    ).toEqual({ state: "held", captureId: capture.captureId });
+    local.host.factory.endManagedWorkCapture(captureSession, capture.captureId);
   });
 
   test("rejects model-selected node, workspace and generation instead of changing accepted placement", async () => {

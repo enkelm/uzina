@@ -14,6 +14,12 @@ describe("managed provider configuration", () => {
     expect(() =>
       readManagedModelConfig({ UZINA_MODEL_PROVIDER: "openai" }),
     ).toThrow("UZINA_MODEL_PROVIDER, UZINA_MODEL_ID, and UZINA_MODEL_API_KEY");
+    expect(() =>
+      readManagedModelConfig({
+        UZINA_MODEL_PROVIDER: "openai",
+        UZINA_MODEL_ID: "gpt-4o-mini",
+      }),
+    ).toThrow("UZINA_MODEL_API_KEY");
     await expect(
       createConfiguredModels({
         provider: "",

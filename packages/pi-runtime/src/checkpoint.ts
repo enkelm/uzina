@@ -21,7 +21,23 @@ import {
 
 const CHECKPOINT_FORMAT = "uzina.pi-managed-work";
 const CHECKPOINT_VERSION = 1;
-const PAGE_SIZE = 500;
+const PAGE_SIZE = 128;
+export const MANAGED_WORK_CHECKPOINT_MAX_BYTES = 32 * 1024 * 1024;
+export const MANAGED_WORK_CHECKPOINT_MAX_RECORDS = 100_000;
+
+export type ManagedWorkCheckpointExportLimits = {
+  /** Lower test/operator quota; the hard profile limit remains 100,000 records. */
+  maxRecords?: number;
+  /** Lower test/operator quota; the hard runtime artifact limit remains 32 MiB. */
+  maxBytes?: number;
+};
+
+type ExportBudget = {
+  maxRecords: number;
+  maxBytes: number;
+  records: number;
+  bytes: number;
+};
 
 export type CheckpointDocument = {
   record: DocumentRecord;
@@ -53,14 +69,69 @@ export class UnsupportedCheckpointState extends Error {
   }
 }
 
+function exportBudget(
+  limits: ManagedWorkCheckpointExportLimits = {},
+): ExportBudget {
+  const maxRecords = limits.maxRecords ?? MANAGED_WORK_CHECKPOINT_MAX_RECORDS;
+  const maxBytes = limits.maxBytes ?? MANAGED_WORK_CHECKPOINT_MAX_BYTES;
+  if (
+    !Number.isSafeInteger(maxRecords) ||
+    maxRecords < 1 ||
+    maxRecords > MANAGED_WORK_CHECKPOINT_MAX_RECORDS ||
+    !Number.isSafeInteger(maxBytes) ||
+    maxBytes < 1 ||
+    maxBytes > MANAGED_WORK_CHECKPOINT_MAX_BYTES
+  ) {
+    throw new Error("Managed-work export limits exceed the bounded profile");
+  }
+  return { maxRecords, maxBytes, records: 0, bytes: 0 };
+}
+
+function accountExportRecord(budget: ExportBudget, value: unknown): void {
+  if (budget.records >= budget.maxRecords) {
+    throw new UnsupportedCheckpointState(
+      "Managed-work storage scan exceeds its record limit",
+    );
+  }
+  accountExportValue(budget, value);
+  budget.records += 1;
+}
+
+function accountExportValue(budget: ExportBudget, value: unknown): void {
+  if (budget.bytes >= budget.maxBytes) {
+    throw new UnsupportedCheckpointState(
+      "Managed-work storage scan exceeds its byte limit",
+    );
+  }
+  let encoded: Uint8Array;
+  try {
+    encoded = boundedCanonicalJsonBytes(value, budget.maxBytes - budget.bytes);
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message === "Managed-work runtime artifact exceeds its size limit"
+    ) {
+      throw new UnsupportedCheckpointState(
+        "Managed-work storage scan exceeds its byte limit",
+      );
+    }
+    throw error;
+  }
+  budget.bytes += encoded.byteLength;
+}
+
 async function scanPages<T>(
   scan: (limit: number, cursor?: Cursor) => Promise<Page<T, Cursor>>,
+  budget: ExportBudget,
 ): Promise<T[]> {
   const items: T[] = [];
   let cursor: Cursor | undefined;
   do {
     const page = await scan(PAGE_SIZE, cursor);
-    items.push(...page.items);
+    for (const item of page.items) {
+      accountExportRecord(budget, item);
+      items.push(item);
+    }
     cursor = page.next;
   } while (cursor !== undefined);
   return items;
@@ -81,11 +152,6 @@ function canonicalJson(value: unknown): string {
     .sort()
     .map((key) => `${JSON.stringify(key)}:${canonicalJson(object[key])}`)
     .join(",")}}`;
-}
-
-async function checksum(value: unknown): Promise<string> {
-  const bytes = new TextEncoder().encode(canonicalJson(value));
-  return checksumBytes(bytes);
 }
 
 async function checksumBytes(bytes: Uint8Array): Promise<string> {
@@ -245,21 +311,37 @@ function boundedCanonicalJsonBytes(
   return new TextEncoder().encode(parts.join(""));
 }
 
-async function scanAllConversations(storage: Storage, context: Context) {
-  return scanPages((limit, cursor) =>
-    storage.scanConversations({ order: "ascending" }, limit, cursor, context),
+async function scanAllConversations(
+  storage: Storage,
+  context: Context,
+  budget: ExportBudget,
+) {
+  return scanPages(
+    (limit, cursor) =>
+      storage.scanConversations({ order: "ascending" }, limit, cursor, context),
+    budget,
   );
 }
 
-async function scanAllTasks(storage: Storage, context: Context) {
-  return scanPages((limit, cursor) =>
-    storage.scanTasks({}, limit, cursor, context),
+async function scanAllTasks(
+  storage: Storage,
+  context: Context,
+  budget: ExportBudget,
+) {
+  return scanPages(
+    (limit, cursor) => storage.scanTasks({}, limit, cursor, context),
+    budget,
   );
 }
 
-async function scanAllSubmissions(storage: Storage, context: Context) {
-  return scanPages((limit, cursor) =>
-    storage.scanSubmissions({}, limit, cursor, context),
+async function scanAllSubmissions(
+  storage: Storage,
+  context: Context,
+  budget: ExportBudget,
+) {
+  return scanPages(
+    (limit, cursor) => storage.scanSubmissions({}, limit, cursor, context),
+    budget,
   );
 }
 
@@ -297,21 +379,22 @@ export async function exportManagedWorkCheckpoint(
   storage: Storage,
   rootConversationId: ConversationId,
   context: Context = BACKGROUND_CONTEXT,
+  limits: ManagedWorkCheckpointExportLimits = {},
 ): Promise<ManagedWorkCheckpoint> {
-  const [allConversations, allTasks, allSubmissions, sessionDocuments] =
-    await Promise.all([
-      scanAllConversations(storage, context),
-      scanAllTasks(storage, context),
-      scanAllSubmissions(storage, context),
-      scanPages((limit, cursor) =>
-        storage.scanDocuments(
-          { scope: { kind: "session" }, at: "current" },
-          limit,
-          cursor,
-          context,
-        ),
+  const budget = exportBudget(limits);
+  const allConversations = await scanAllConversations(storage, context, budget);
+  const allTasks = await scanAllTasks(storage, context, budget);
+  const allSubmissions = await scanAllSubmissions(storage, context, budget);
+  const sessionDocuments = await scanPages(
+    (limit, cursor) =>
+      storage.scanDocuments(
+        { scope: { kind: "session" }, at: "current" },
+        limit,
+        cursor,
+        context,
       ),
-    ]);
+    budget,
+  );
   if (sessionDocuments.length > 0) {
     throw new UnsupportedCheckpointState(
       "Session-scoped documents cannot be assigned to one work-item checkpoint",
@@ -333,30 +416,40 @@ export async function exportManagedWorkCheckpoint(
 
   const conversations = new Map<number, ConversationRecord>([[root.id, root]]);
   const tasks = new Map<number, TaskRecord<JsonValue, JsonValue, JsonValue>>();
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const task of allTasks) {
-      if (conversations.has(task.conversationId) && !tasks.has(task.id)) {
-        assertSettledTask(task);
-        tasks.set(task.id, task);
-        changed = true;
-      }
-    }
-    for (const conversation of allConversations) {
-      if (
-        !conversations.has(conversation.id) &&
-        conversation.owner &&
-        conversations.has(conversation.owner.conversationId) &&
-        tasks.has(conversation.owner.taskId)
-      ) {
+  const tasksByConversation = new Map<
+    number,
+    TaskRecord<JsonValue, JsonValue, JsonValue>[]
+  >();
+  for (const task of allTasks) {
+    const rows = tasksByConversation.get(task.conversationId) ?? [];
+    rows.push(task);
+    tasksByConversation.set(task.conversationId, rows);
+  }
+  const conversationsByOwnerTask = new Map<number, ConversationRecord[]>();
+  for (const conversation of allConversations) {
+    if (!conversation.owner) continue;
+    const rows = conversationsByOwnerTask.get(conversation.owner.taskId) ?? [];
+    rows.push(conversation);
+    conversationsByOwnerTask.set(conversation.owner.taskId, rows);
+  }
+  const pendingConversations = [root.id];
+  for (let index = 0; index < pendingConversations.length; index += 1) {
+    const conversationId = pendingConversations[index]!;
+    for (const task of tasksByConversation.get(conversationId) ?? []) {
+      if (tasks.has(task.id)) continue;
+      assertSettledTask(task);
+      tasks.set(task.id, task);
+      for (const conversation of conversationsByOwnerTask.get(task.id) ?? []) {
+        if (conversation.owner?.conversationId !== conversationId) continue;
         if (conversation.parent) {
           throw new UnsupportedCheckpointState(
             "Owned fork conversations are not supported by checkpoint profile v1",
           );
         }
-        conversations.set(conversation.id, conversation);
-        changed = true;
+        if (!conversations.has(conversation.id)) {
+          conversations.set(conversation.id, conversation);
+          pendingConversations.push(conversation.id);
+        }
       }
     }
   }
@@ -378,58 +471,77 @@ export async function exportManagedWorkCheckpoint(
   }
 
   const conversationIds = new Set(conversationRecords.map((item) => item.id));
+  if (
+    conversations.size !== allConversations.length ||
+    tasks.size !== allTasks.length ||
+    allSubmissions.some((item) => !conversationIds.has(item.conversationId))
+  ) {
+    throw new UnsupportedCheckpointState(
+      "Managed-work storage contains records outside the supported root and owned closure",
+    );
+  }
   const taskIds = new Set(taskRecords.map((item) => Number(item.id)));
   const entries: EntryRecord[] = [];
   const documents: CheckpointDocument[] = [];
   for (const conversation of conversationRecords) {
     entries.push(
-      ...(await scanPages((limit, cursor) =>
-        storage.scanEntries(
-          { conversationId: conversation.id, order: "ascending" },
+      ...(await scanPages(
+        (limit, cursor) =>
+          storage.scanEntries(
+            { conversationId: conversation.id, order: "ascending" },
+            limit,
+            cursor,
+            context,
+          ),
+        budget,
+      )),
+    );
+    for (const record of await scanPages(
+      (limit, cursor) =>
+        storage.scanDocuments(
+          {
+            scope: { kind: "conversation", conversationId: conversation.id },
+            at: "current",
+          },
           limit,
           cursor,
           context,
         ),
-      )),
-    );
-    for (const record of await scanPages((limit, cursor) =>
-      storage.scanDocuments(
-        {
-          scope: { kind: "conversation", conversationId: conversation.id },
-          at: "current",
-        },
-        limit,
-        cursor,
-        context,
-      ),
+      budget,
     )) {
       const stored = await storage.document(record.id, "current", context);
       if (!stored)
         throw new Error(`Document ${record.id} disappeared during capture`);
-      documents.push({
+      const document = {
         record: stored.record,
         version: stored.version,
         value: stored.value,
-      });
+      };
+      accountExportValue(budget, document);
+      documents.push(document);
     }
   }
   for (const task of taskRecords) {
-    for (const record of await scanPages((limit, cursor) =>
-      storage.scanDocuments(
-        { scope: { kind: "task", taskId: task.id }, at: "current" },
-        limit,
-        cursor,
-        context,
-      ),
+    for (const record of await scanPages(
+      (limit, cursor) =>
+        storage.scanDocuments(
+          { scope: { kind: "task", taskId: task.id }, at: "current" },
+          limit,
+          cursor,
+          context,
+        ),
+      budget,
     )) {
       const stored = await storage.document(record.id, "current", context);
       if (!stored)
         throw new Error(`Document ${record.id} disappeared during capture`);
-      documents.push({
+      const document = {
         record: stored.record,
         version: stored.version,
         value: stored.value,
-      });
+      };
+      accountExportValue(budget, document);
+      documents.push(document);
     }
   }
   const selectedSubmissions = allSubmissions.filter((item) =>
@@ -466,7 +578,13 @@ export async function exportManagedWorkCheckpoint(
       "Imported records are not activated automatically; a host must explicitly open and resume the destination runtime.",
     ],
   };
-  return { ...body, sha256: await checksum(body) };
+  const bodyBytes = boundedCanonicalJsonBytes(body, budget.maxBytes);
+  const checkpoint = {
+    ...body,
+    sha256: await checksumBytes(bodyBytes),
+  };
+  boundedCanonicalJsonBytes(checkpoint, budget.maxBytes);
+  return checkpoint;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -7,6 +7,9 @@ export type {
   FactorySession,
   ManagedExecutionEvidence,
   ManagedRemoteOperation,
+  ManagedWorkCaptureBinding,
+  ManagedWorkCaptureState,
+  ManagedWorkRuntimeAdmission,
   RuntimeDispatchAdapter,
 } from "./factory";
 export { createFactoryHttpHandler } from "./http";

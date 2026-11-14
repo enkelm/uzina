@@ -2,7 +2,11 @@ import { FactoryError, FactoryService } from "@uzina/core";
 import { createFactoryHttpHandler } from "@uzina/core/http";
 import type { FactoryDatabase, SqlRow, SqlValue } from "@uzina/core/database";
 import type { FactoryQueueJob } from "@uzina/contracts/factory";
-import type { ManagedInputSettlement } from "./work-object";
+import type {
+  ManagedInputSettlement,
+  ManagedWorkCheckpointExport,
+  ManagedWorkCheckpointExportRequest,
+} from "./work-object";
 import {
   R2WorkspaceSnapshotStorage,
   type R2WorkspaceBucket,
@@ -44,10 +48,23 @@ export type ManagedWorkNamespace = {
     acceptManagedInput(input: FactoryQueueJob): Promise<ManagedInputSettlement>;
     context(): Promise<unknown>;
     status(): Promise<unknown>;
+    exportManagedWorkCheckpoint(
+      request: ManagedWorkCheckpointExportRequest,
+    ): Promise<ManagedWorkCheckpointExport>;
   };
 };
 
 export interface FactoryRpc {
+  getManagedWorkCaptureState(
+    threadId: string,
+  ): ReturnType<FactoryController["getManagedWorkCaptureState"]>;
+  acquireManagedWorkRuntimePermit(
+    threadId: string,
+  ): ReturnType<FactoryController["acquireManagedWorkRuntimePermit"]>;
+  releaseManagedWorkRuntimePermit(
+    threadId: string,
+    permitId: string,
+  ): ReturnType<FactoryController["releaseManagedWorkRuntimePermit"]>;
   getActiveManagedInput(threadId: string): FactoryQueueJob | undefined;
   enqueueManagedRemoteExecution(
     threadId: string,
@@ -266,6 +283,18 @@ export class FactoryController {
   }
 
   /** Trusted Durable Object RPC used only by the sibling managed-work binding. */
+  getManagedWorkCaptureState(threadId: string) {
+    return this.#factory.getManagedWorkCaptureState(threadId);
+  }
+
+  acquireManagedWorkRuntimePermit(threadId: string) {
+    return this.#factory.acquireManagedWorkRuntimePermit(threadId);
+  }
+
+  releaseManagedWorkRuntimePermit(threadId: string, permitId: string) {
+    return this.#factory.releaseManagedWorkRuntimePermit(threadId, permitId);
+  }
+
   getActiveManagedInput(threadId: string) {
     return this.#factory.getActiveManagedInput(threadId);
   }

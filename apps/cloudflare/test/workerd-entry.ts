@@ -83,6 +83,7 @@ export class TestFactory extends FactoryObject {
 }
 
 type TestEnvironment = {
+  UZINA_BOOTSTRAP_SECRET: string;
   FACTORY: {
     idFromName(name: string): unknown;
     get(id: unknown): FactoryRpc & ManagedWorkFactoryBridge;
@@ -149,6 +150,10 @@ export class TestManagedWork extends ManagedWorkRpcObject {
 
 export default {
   async fetch(request: Request, env: TestEnvironment): Promise<Response> {
+    if (new URL(request.url).pathname.startsWith("/v1/")) {
+      const factoryId = env.FACTORY.idFromName("uzina-single-factory");
+      return env.FACTORY.get(factoryId).fetch(request);
+    }
     const id = env.MANAGED_WORK.idFromName("actual-workerd-managed-work");
     return env.MANAGED_WORK.get(id).fetch(request);
   },
