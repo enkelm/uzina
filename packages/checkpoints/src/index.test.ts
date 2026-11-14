@@ -4,6 +4,7 @@ import {
   chmod,
   mkdir,
   mkdtemp,
+  open,
   readFile,
   rm,
   symlink,
@@ -18,6 +19,7 @@ import {
   previewWorkspaceCheckpoint,
   restoreWorkspaceCheckpoint,
   validateWorkspaceCheckpoint,
+  verifyRestoredWorkspaceCheckpoint,
   type BlobTransport,
 } from "./index";
 
@@ -172,6 +174,28 @@ describe("workspace checkpoints", () => {
       expect(
         git(destination, "show-ref", "--verify", "refs/tags/checkpoint-test"),
       ).toContain("checkpoint-test");
+      await verifyRestoredWorkspaceCheckpoint(
+        captured.manifest,
+        transport,
+        destination,
+      );
+      const oversizedPath = join(destination, "unexpected-oversized.bin");
+      const oversized = await open(oversizedPath, "w");
+      try {
+        await oversized.truncate(64 * 1024 * 1024 + 1);
+      } finally {
+        await oversized.close();
+      }
+      await expect(
+        verifyRestoredWorkspaceCheckpoint(
+          captured.manifest,
+          transport,
+          destination,
+        ),
+      ).rejects.toThrow("Prepared workspace contains omitted entries");
+      expect((await Bun.file(oversizedPath).stat()).size).toBe(
+        64 * 1024 * 1024 + 1,
+      );
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -182,6 +206,89 @@ describe("workspace checkpoints", () => {
     try {
       const { transport, captured } = await capture(root);
       const base = captured.manifest;
+      const unknownFieldMutations: Array<
+        [string, (manifest: typeof base) => void]
+      > = [
+        [
+          "requirements",
+          (manifest) => {
+            Object.assign(manifest.requirements, { futureField: true });
+          },
+        ],
+        [
+          "source",
+          (manifest) => {
+            Object.assign(manifest.source, { futureField: true });
+          },
+        ],
+        [
+          "policy",
+          (manifest) => {
+            Object.assign(manifest.policy, { futureField: true });
+          },
+        ],
+        [
+          "workspace",
+          (manifest) => {
+            Object.assign(manifest.workspace, { futureField: true });
+          },
+        ],
+        [
+          "workspace entry",
+          (manifest) => {
+            Object.assign(manifest.workspace.entries[0]!, {
+              futureField: true,
+            });
+          },
+        ],
+        [
+          "omission",
+          (manifest) => {
+            Object.assign(manifest.workspace.omissions[0]!, {
+              futureField: true,
+            });
+          },
+        ],
+        [
+          "Git metadata",
+          (manifest) => {
+            Object.assign(manifest.git, { futureField: true });
+          },
+        ],
+        [
+          "Git blob",
+          (manifest) => {
+            Object.assign(manifest.git.bundle, { futureField: true });
+          },
+        ],
+        [
+          "attachment",
+          (manifest) => {
+            Object.assign(manifest.attachments[0]!, { futureField: true });
+          },
+        ],
+        [
+          "runtime artifact",
+          (manifest) => {
+            Object.assign(manifest.runtimeArtifact!, { futureField: true });
+          },
+        ],
+      ];
+      for (const [recordName, mutate] of unknownFieldMutations) {
+        const unsupported = structuredClone(base);
+        mutate(unsupported);
+        const validation = await validateWorkspaceCheckpoint(
+          unsupported,
+          transport,
+          {
+            supportedRuntimeFormats: [7],
+            supportedRuntimeRequirements: ["pi-durable:1.x"],
+          },
+        );
+        expect(validation.valid, recordName).toBe(false);
+        expect(validation.issues.length, recordName).toBeGreaterThan(0);
+      }
+
       const unsafe = structuredClone(base);
       unsafe.workspace.entries[0]!.path = "../outside";
       expect(
@@ -314,6 +421,82 @@ describe("workspace checkpoints", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  test.skipIf(process.platform === "win32")(
+    "restores and verifies an omitted large HEAD blob without extracting it",
+    async () => {
+      const root = await temporaryDirectory();
+      const originalPath = process.env.PATH;
+      try {
+        const source = join(root, "repo");
+        await mkdir(source);
+        git(source, "init", "--initial-branch=main", "--quiet");
+        git(source, "config", "user.name", "Checkpoint Test");
+        git(source, "config", "user.email", "checkpoint@example.invalid");
+        await writeFile(join(source, "small.txt"), "selected content");
+        const omittedSource = await open(
+          join(source, "omitted-zeroes.bin"),
+          "w",
+        );
+        try {
+          await omittedSource.truncate(64 * 1024 * 1024 + 1);
+        } finally {
+          await omittedSource.close();
+        }
+        git(source, "add", "--all");
+        git(source, "commit", "-m", "large compressed HEAD object");
+        const transport = new FileBlobTransport(join(root, "blobs"));
+        const captured = await captureWorkspaceCheckpoint({
+          workspacePath: source,
+          transport,
+        });
+        expect(captured.manifest.workspace.omissions).toContainEqual({
+          path: "omitted-zeroes.bin",
+          reason: "size-limit",
+        });
+        expect(captured.manifest.git.bundle.size).toBeLessThan(1024 * 1024);
+
+        const realGit = execFileSync("which", ["git"], {
+          encoding: "utf8",
+        }).trim();
+        const limitedGit = join(root, "limited-git");
+        await mkdir(limitedGit);
+        const wrapper = join(limitedGit, "git");
+        await writeFile(
+          wrapper,
+          `#!/bin/sh\nulimit -c 0\nulimit -f 65536\nexec ${JSON.stringify(realGit)} "$@"\n`,
+        );
+        await chmod(wrapper, 0o700);
+        if (!originalPath)
+          throw new Error("PATH is unavailable for Git wrapper");
+        process.env.PATH = `${limitedGit}${process.platform === "win32" ? ";" : ":"}${originalPath}`;
+        try {
+          const destination = join(root, "restored");
+          await restoreWorkspaceCheckpoint({
+            manifest: captured.manifest,
+            transport,
+            destinationPath: destination,
+          });
+          await verifyRestoredWorkspaceCheckpoint(
+            captured.manifest,
+            transport,
+            destination,
+          );
+          expect(
+            await Bun.file(join(destination, "omitted-zeroes.bin")).exists(),
+          ).toBe(false);
+          expect(await readFile(join(destination, "small.txt"), "utf8")).toBe(
+            "selected content",
+          );
+        } finally {
+          process.env.PATH = originalPath;
+        }
+      } finally {
+        process.env.PATH = originalPath;
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   test("bounds Git bundle generation to the configured checkpoint size", async () => {
     const root = await temporaryDirectory();

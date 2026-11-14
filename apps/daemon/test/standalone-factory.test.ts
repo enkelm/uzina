@@ -5,6 +5,7 @@ import {
   chmod,
   mkdtemp,
   mkdir,
+  open,
   readFile,
   readdir,
   rm,
@@ -906,6 +907,39 @@ describe("standalone local Factory managed Pi composition", () => {
     expect(provider.requests()).toBe(providerCallsAfterRestore);
     expect(toolCalls).toBe(0);
 
+    const unexpectedLargePath = join(
+      restoredWorkspace,
+      "unexpected-oversized.bin",
+    );
+    const originalNotesBytes = await readFile(
+      join(restoredWorkspace, "notes.txt"),
+    );
+    const receiptPath = join(destination, ".uzina", "prepared-restore.json");
+    const originalReceiptBytes = await readFile(receiptPath);
+    const unexpectedLargeFile = await open(unexpectedLargePath, "w");
+    try {
+      await unexpectedLargeFile.truncate(64 * 1024 * 1024 + 1);
+    } finally {
+      await unexpectedLargeFile.close();
+    }
+    await expect(
+      restoreManagedWorkBundle({
+        manifestReference: captured.manifestReference,
+        transport: blobs,
+        destinationPath: destination,
+        supportedRuntimeRequirements: destinationRequirements,
+        openStorage: openPreparedStorage,
+      }),
+    ).rejects.toThrow("Prepared workspace contains omitted entries");
+    expect((await stat(unexpectedLargePath)).size).toBe(64 * 1024 * 1024 + 1);
+    expect(await readFile(join(restoredWorkspace, "notes.txt"))).toEqual(
+      originalNotesBytes,
+    );
+    expect(await readFile(receiptPath)).toEqual(originalReceiptBytes);
+    expect(provider.requests()).toBe(providerCallsAfterRestore);
+    expect(toolCalls).toBe(0);
+    await rm(unexpectedLargePath, { force: true });
+
     const originalWorkspaceBytes = await readFile(
       join(destination, "workspace", "notes.txt"),
     );
@@ -1043,20 +1077,59 @@ describe("standalone local Factory managed Pi composition", () => {
       "attachments",
       "factory-provenance.json",
     );
-    const changedAttachmentBytes = "tampered provenance\n";
-    await writeFile(attachmentPath, changedAttachmentBytes);
-    await expect(
-      restoreManagedWorkBundle({
-        manifestReference: captured.manifestReference,
-        transport: blobs,
-        destinationPath: attachmentDestination,
-        supportedRuntimeRequirements: destinationRequirements,
-        openStorage: openPreparedStorage,
-      }),
-    ).rejects.toThrow(
-      "Prepared attachment integrity mismatch: factory-provenance.json",
+    const preparedReceiptPath = join(
+      attachmentDestination,
+      ".uzina",
+      "prepared-restore.json",
     );
-    expect(await readFile(attachmentPath, "utf8")).toBe(changedAttachmentBytes);
+    const preparedReceiptBytes = await readFile(preparedReceiptPath);
+    if (process.platform !== "win32" && process.getuid?.() !== 0) {
+      const oversizedAttachmentBytes = 32 * 1024 * 1024 + 1;
+      const attachmentHandle = await open(attachmentPath, "w");
+      try {
+        await attachmentHandle.truncate(oversizedAttachmentBytes);
+      } finally {
+        await attachmentHandle.close();
+      }
+      await chmod(attachmentPath, 0);
+      try {
+        await expect(
+          restoreManagedWorkBundle({
+            manifestReference: captured.manifestReference,
+            transport: blobs,
+            destinationPath: attachmentDestination,
+            supportedRuntimeRequirements: destinationRequirements,
+            openStorage: openPreparedStorage,
+          }),
+        ).rejects.toThrow(
+          "Prepared attachment size mismatch: factory-provenance.json",
+        );
+        expect((await stat(attachmentPath)).size).toBe(
+          oversizedAttachmentBytes,
+        );
+      } finally {
+        await chmod(attachmentPath, 0o600);
+      }
+    } else {
+      // Root bypasses POSIX mode bits; keep only the ordinary content-corruption control here.
+      const changedAttachmentBytes = "tampered provenance\n";
+      await writeFile(attachmentPath, changedAttachmentBytes);
+      await expect(
+        restoreManagedWorkBundle({
+          manifestReference: captured.manifestReference,
+          transport: blobs,
+          destinationPath: attachmentDestination,
+          supportedRuntimeRequirements: destinationRequirements,
+          openStorage: openPreparedStorage,
+        }),
+      ).rejects.toThrow(
+        "Prepared attachment integrity mismatch: factory-provenance.json",
+      );
+      expect(await readFile(attachmentPath, "utf8")).toBe(
+        changedAttachmentBytes,
+      );
+    }
+    expect(await readFile(preparedReceiptPath)).toEqual(preparedReceiptBytes);
     expect(provider.requests()).toBe(providerCallsAfterRestore);
     expect(toolCalls).toBe(0);
   });

@@ -63,6 +63,8 @@ const HARD_LIMITS = {
 const MINIMUM_GIT_VERSION = "2.20.0";
 export const WORKSPACE_CHECKPOINT_MANIFEST_MAX_BYTES =
   HARD_LIMITS.manifestBytes;
+export const WORKSPACE_CHECKPOINT_ATTACHMENT_MAX_BYTES =
+  HARD_LIMITS.attachmentBytes;
 const FORMAT_CAPABILITIES = new Set<string>(REQUIRED_CAPABILITIES);
 const globCache = new Map<string, RegExp>();
 
@@ -607,6 +609,9 @@ export async function verifyRestoredWorkspaceCheckpoint(
   rejectUnsupportedIndex(root);
 
   const actual = await collectWorkspaceFiles(root, null, [], resolveLimits());
+  if (actual.omissions.length > 0) {
+    throw new Error("Prepared workspace contains omitted entries");
+  }
   const expectedEntries = new Map(
     manifest.workspace.entries.map((entry) => [entry.path, entry]),
   );
@@ -714,19 +719,11 @@ async function expectedGitCheckpointState(
       bundlePath,
       "+refs/*:refs/*",
     ]);
-    restoreGitText(checkout, [
-      "checkout",
-      "--quiet",
-      "--detach",
+    restoreGitSetHeadAndIndex(
+      checkout,
       manifest.source.head,
-    ]);
-    if (manifest.source.branch) {
-      restoreGitText(checkout, [
-        "symbolic-ref",
-        "HEAD",
-        `refs/heads/${manifest.source.branch}`,
-      ]);
-    }
+      manifest.source.branch,
+    );
     if (stagedPatchBytes.byteLength > 0) {
       execFileSync(
         "git",
@@ -1000,18 +997,11 @@ async function verifyGitPayload(
           "Git bundle branch does not point at the declared HEAD",
         );
     }
-    restoreGitText(checkout, [
-      "checkout",
-      "--quiet",
-      "--detach",
+    restoreGitSetHeadAndIndex(
+      checkout,
       manifest.source.head,
-    ]);
-    if (manifest.source.branch)
-      restoreGitText(checkout, [
-        "symbolic-ref",
-        "HEAD",
-        `refs/heads/${manifest.source.branch}`,
-      ]);
+      manifest.source.branch,
+    );
     if (stagedPatchBytes.byteLength > 0) {
       execFileSync(
         "git",
@@ -1083,19 +1073,11 @@ async function restoreIntoStaging(
           "Git bundle branch does not point at the declared HEAD",
         );
     }
-    restoreGitText(staging, [
-      "checkout",
-      "--quiet",
-      "--detach",
+    restoreGitSetHeadAndIndex(
+      staging,
       manifest.source.head,
-    ]);
-    if (manifest.source.branch) {
-      restoreGitText(staging, [
-        "symbolic-ref",
-        "HEAD",
-        `refs/heads/${manifest.source.branch}`,
-      ]);
-    }
+      manifest.source.branch,
+    );
     if (loaded.stagedPatchBytes.byteLength > 0) {
       execFileSync(
         "git",
@@ -1124,10 +1106,6 @@ async function restoreIntoStaging(
       JSON.stringify([...manifest.git.stagedPaths].sort())
     ) {
       throw new Error("Staged patch paths do not match the manifest");
-    }
-    for (const name of await readdir(staging)) {
-      if (name !== ".git")
-        await rm(join(staging, name), { recursive: true, force: true });
     }
     for (const [path, bytes] of loaded.workspaceContents) {
       const absolutePath = safeDestinationPath(staging, path);
@@ -1287,21 +1265,18 @@ function validateManifestShape(
   if (!manifest || typeof manifest !== "object" || Array.isArray(manifest))
     return "checkpoint manifest must be an object";
   if (
-    Object.keys(manifest).some(
-      (key) =>
-        ![
-          "format",
-          "version",
-          "createdAt",
-          "requirements",
-          "source",
-          "policy",
-          "workspace",
-          "git",
-          "runtimeArtifact",
-          "attachments",
-        ].includes(key),
-    )
+    !hasOnlyKeys(manifest, [
+      "format",
+      "version",
+      "createdAt",
+      "requirements",
+      "source",
+      "policy",
+      "workspace",
+      "git",
+      "runtimeArtifact",
+      "attachments",
+    ])
   )
     return "checkpoint manifest contains unrecognized fields";
   let serializedSize: number;
@@ -1322,14 +1297,21 @@ function validateManifestShape(
   )
     return "invalid checkpoint creation time";
   if (
-    !manifest.requirements ||
+    !hasOnlyKeys(manifest.requirements, [
+      "minimumGitVersion",
+      "capabilities",
+    ]) ||
     !Array.isArray(manifest.requirements.capabilities) ||
     typeof manifest.requirements.minimumGitVersion !== "string"
   )
     return "invalid checkpoint requirements";
   if (
-    !manifest.source ||
-    typeof manifest.source !== "object" ||
+    !hasOnlyKeys(manifest.source, [
+      "head",
+      "branch",
+      "gitVersion",
+      "linkedWorktree",
+    ]) ||
     typeof manifest.source.head !== "string" ||
     !/^[0-9a-f]{40,64}$/i.test(manifest.source.head)
   )
@@ -1345,8 +1327,7 @@ function validateManifestShape(
   )
     return "invalid Git branch";
   if (
-    !manifest.policy ||
-    typeof manifest.policy !== "object" ||
+    !hasOnlyKeys(manifest.policy, ["includeGlobs", "excludeGlobs"]) ||
     !Array.isArray(manifest.policy.excludeGlobs)
   )
     return "invalid inclusion policy";
@@ -1358,8 +1339,7 @@ function validateManifestShape(
     return error instanceof Error ? error.message : "invalid inclusion policy";
   }
   if (
-    !manifest.workspace ||
-    typeof manifest.workspace !== "object" ||
+    !hasOnlyKeys(manifest.workspace, ["entries", "omissions"]) ||
     !Array.isArray(manifest.workspace.entries) ||
     !Array.isArray(manifest.workspace.omissions)
   )
@@ -1386,6 +1366,14 @@ function validateManifestShape(
   let total = 0;
   for (const entry of manifest.workspace.entries) {
     if (!entry || typeof entry !== "object") return "invalid workspace entry";
+    const allowedEntryKeys =
+      entry.kind === "file"
+        ? ["path", "kind", "size", "sha256", "executable"]
+        : entry.kind === "symlink"
+          ? ["path", "kind", "size", "sha256", "linkTarget"]
+          : [];
+    if (!hasOnlyKeys(entry, allowedEntryKeys))
+      return `unrecognized workspace entry fields: ${String(entry.path)}`;
     const pathError = validateRelativePath(entry.path);
     if (pathError) return pathError;
     if (seen.has(entry.path)) return `duplicate workspace entry: ${entry.path}`;
@@ -1451,8 +1439,7 @@ function validateManifestShape(
   const omissionPaths = new Set<string>();
   for (const omission of manifest.workspace.omissions) {
     if (
-      !omission ||
-      typeof omission !== "object" ||
+      !hasOnlyKeys(omission, ["path", "reason"]) ||
       validateRelativePath(omission.path) ||
       !["excluded", "outside-inclusion", "size-limit"].includes(omission.reason)
     )
@@ -1462,8 +1449,7 @@ function validateManifestShape(
     omissionPaths.add(omission.path);
   }
   if (
-    !manifest.git ||
-    typeof manifest.git !== "object" ||
+    !hasOnlyKeys(manifest.git, ["bundle", "stagedPatch", "stagedPaths"]) ||
     !Array.isArray(manifest.git.stagedPaths)
   )
     return "invalid Git checkpoint metadata";
@@ -1486,8 +1472,8 @@ function validateManifestShape(
     return "invalid attachments";
   const attachmentNames = new Set<string>();
   for (const attachment of manifest.attachments) {
-    if (!attachment || typeof attachment !== "object")
-      return "invalid checkpoint attachment";
+    if (!hasOnlyKeys(attachment, ["name", "mediaType", "blob"]))
+      return "invalid or unrecognized checkpoint attachment";
     try {
       validateAttachmentName(attachment.name);
       validateMediaType(attachment.mediaType);
@@ -1506,8 +1492,12 @@ function validateManifestShape(
   if (manifest.runtimeArtifact !== null) {
     const slot = manifest.runtimeArtifact;
     if (
-      !slot ||
-      typeof slot !== "object" ||
+      !hasOnlyKeys(slot, [
+        "formatVersion",
+        "mediaType",
+        "artifact",
+        "compatibilityRequirements",
+      ]) ||
       !Number.isSafeInteger(slot.formatVersion) ||
       slot.formatVersion < 1 ||
       !isBlobMetadata(slot.artifact) ||
@@ -1910,6 +1900,19 @@ function restoreGitText(cwd: string, args: string[]): string {
   }).trim();
 }
 
+function restoreGitSetHeadAndIndex(
+  cwd: string,
+  head: string,
+  branch: string | null,
+): void {
+  if (branch) {
+    restoreGitText(cwd, ["symbolic-ref", "HEAD", `refs/heads/${branch}`]);
+  } else {
+    restoreGitText(cwd, ["update-ref", "--no-deref", "HEAD", head]);
+  }
+  restoreGitText(cwd, ["read-tree", head]);
+}
+
 function restoreGitTryText(cwd: string, args: string[]): string | null {
   try {
     return restoreGitText(cwd, args);
@@ -2090,8 +2093,17 @@ function isSha256(value: unknown): value is string {
   return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 }
 
+function hasOnlyKeys(value: unknown, allowedKeys: readonly string[]): boolean {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Object.keys(value).every((key) => allowedKeys.includes(key))
+  );
+}
+
 function isBlobMetadata(blob: unknown): blob is CheckpointBlob {
-  if (!blob || typeof blob !== "object") return false;
+  if (!hasOnlyKeys(blob, ["reference", "size", "sha256"])) return false;
   const candidate = blob as CheckpointBlob;
   return (
     isSha256(candidate.reference) &&

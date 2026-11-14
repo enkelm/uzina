@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
+import { constants } from "node:fs";
 import {
   lstat,
   mkdir,
+  open,
   mkdtemp,
   readFile,
   readdir,
@@ -22,6 +24,7 @@ import {
   restoreWorkspaceCheckpoint,
   validateWorkspaceCheckpoint,
   verifyRestoredWorkspaceCheckpoint,
+  WORKSPACE_CHECKPOINT_ATTACHMENT_MAX_BYTES,
   WORKSPACE_CHECKPOINT_MANIFEST_MAX_BYTES,
   type BlobTransport,
   type CheckpointAttachment,
@@ -242,18 +245,10 @@ async function validateBundleResources(
   transport: BlobTransport,
   supportedRuntimeRequirements: readonly string[] = RUNTIME_REQUIREMENTS,
 ): Promise<ManagedWorkCheckpoint> {
-  const supported = new Set([
-    ...RUNTIME_REQUIREMENTS,
-    ...supportedRuntimeRequirements,
-  ]);
-  const unsupported = manifest.runtime.requirements.filter(
-    (requirement) => !supported.has(requirement),
+  const supported = assertSupportedBundleRequirements(
+    manifest,
+    supportedRuntimeRequirements,
   );
-  if (unsupported.length) {
-    throw new Error(
-      `Unsupported runtime requirements: ${unsupported.join(", ")}`,
-    );
-  }
   const validation = await validateWorkspaceCheckpoint(
     manifest.workspace,
     transport,
@@ -267,6 +262,38 @@ async function validateBundleResources(
       `Managed-work bundle validation failed: ${validation.issues.join("; ")}`,
     );
   }
+  return validateBundleRuntime(
+    manifest,
+    transport,
+    supportedRuntimeRequirements,
+  );
+}
+
+function assertSupportedBundleRequirements(
+  manifest: ManagedWorkBundleManifest,
+  supportedRuntimeRequirements: readonly string[],
+): Set<string> {
+  const supported = new Set([
+    ...RUNTIME_REQUIREMENTS,
+    ...supportedRuntimeRequirements,
+  ]);
+  const unsupported = manifest.runtime.requirements.filter(
+    (requirement) => !supported.has(requirement),
+  );
+  if (unsupported.length) {
+    throw new Error(
+      `Unsupported runtime requirements: ${unsupported.join(", ")}`,
+    );
+  }
+  return supported;
+}
+
+async function validateBundleRuntime(
+  manifest: ManagedWorkBundleManifest,
+  transport: BlobTransport,
+  supportedRuntimeRequirements: readonly string[] = RUNTIME_REQUIREMENTS,
+): Promise<ManagedWorkCheckpoint> {
+  assertSupportedBundleRequirements(manifest, supportedRuntimeRequirements);
   const artifact = manifest.workspace.runtimeArtifact;
   if (
     !artifact ||
@@ -471,6 +498,58 @@ async function preparedReceipt(
   }
 }
 
+async function hashPreparedAttachment(
+  path: string,
+  expectedSize: number,
+  name: string,
+): Promise<string> {
+  const file = await open(
+    path,
+    constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+  );
+  try {
+    const opened = await file.stat();
+    if (
+      !opened.isFile() ||
+      opened.size !== expectedSize ||
+      opened.size > WORKSPACE_CHECKPOINT_ATTACHMENT_MAX_BYTES
+    ) {
+      throw new Error(`Prepared attachment size mismatch: ${name}`);
+    }
+    const digest = createHash("sha256");
+    const buffer = Buffer.alloc(64 * 1024);
+    let totalBytes = 0;
+    while (totalBytes < expectedSize) {
+      const { bytesRead } = await file.read(
+        buffer,
+        0,
+        Math.min(buffer.byteLength, expectedSize - totalBytes),
+        totalBytes,
+      );
+      if (bytesRead === 0) break;
+      digest.update(buffer.subarray(0, bytesRead));
+      totalBytes += bytesRead;
+    }
+    const extraByte = Buffer.alloc(1);
+    const extra = await file.read(extraByte, 0, 1, expectedSize);
+    const finalStat = await file.stat();
+    const pathStat = await lstat(path);
+    if (
+      totalBytes !== expectedSize ||
+      extra.bytesRead > 0 ||
+      finalStat.size !== expectedSize ||
+      pathStat.size !== expectedSize ||
+      pathStat.dev !== opened.dev ||
+      pathStat.ino !== opened.ino
+    ) {
+      throw new Error(`Prepared attachment size mismatch: ${name}`);
+    }
+    return digest.digest("hex");
+  } finally {
+    await file.close();
+  }
+}
+
 async function verifyPreparedDestination(
   destinationPath: string,
   receipt: PreparedManagedWorkRestoreReceipt,
@@ -532,14 +611,18 @@ async function verifyPreparedDestination(
         `Prepared attachment is not a regular file: ${attachment.name}`,
       );
     }
-    const expected = await transport.getBlob(attachment.blob.reference);
-    const actual = await readFile(path);
     if (
-      expected.byteLength !== attachment.blob.size ||
-      sha256(expected) !== attachment.blob.sha256 ||
-      actual.byteLength !== expected.byteLength ||
-      sha256(actual) !== attachment.blob.sha256
+      attachment.blob.size > WORKSPACE_CHECKPOINT_ATTACHMENT_MAX_BYTES ||
+      details.size !== attachment.blob.size
     ) {
+      throw new Error(`Prepared attachment size mismatch: ${attachment.name}`);
+    }
+    const actualDigest = await hashPreparedAttachment(
+      path,
+      attachment.blob.size,
+      attachment.name,
+    );
+    if (actualDigest !== attachment.blob.sha256) {
       throw new Error(
         `Prepared attachment integrity mismatch: ${attachment.name}`,
       );
@@ -587,15 +670,21 @@ export async function restoreManagedWorkBundle(
     options.manifestReference,
     options.transport,
   );
-  const managedWork = await validateBundleResources(
-    manifest,
-    options.transport,
-    options.supportedRuntimeRequirements,
-  );
   const existingReceipt = await preparedReceipt(
     destinationPath,
     options.manifestReference,
   );
+  const managedWork = existingReceipt
+    ? await validateBundleRuntime(
+        manifest,
+        options.transport,
+        options.supportedRuntimeRequirements,
+      )
+    : await validateBundleResources(
+        manifest,
+        options.transport,
+        options.supportedRuntimeRequirements,
+      );
   if (existingReceipt) {
     await verifyPreparedDestination(
       destinationPath,
