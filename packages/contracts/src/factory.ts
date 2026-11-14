@@ -1,6 +1,11 @@
 import { z } from "zod";
 import { CONTRACT_VERSION, actorIdentitySchema } from "./index";
-import { executionReceiptSchema } from "./execution";
+import {
+  executionCaptureControlIdSchema,
+  executionCaptureIdSchema,
+  executionCaptureFenceReceiptSchema,
+  executionReceiptSchema,
+} from "./execution";
 
 const identifier = z
   .string()
@@ -203,6 +208,26 @@ export const discussionEntrySchema = z.object({
   createdAt: z.string().datetime(),
 });
 
+export const captureControlAdmissionRequestSchema = z
+  .object({ ...versioned, requestId: identifier })
+  .strict();
+export const captureControlStatusSchema = z
+  .object({
+    ...versioned,
+    requestId: identifier,
+    controlId: executionCaptureControlIdSchema,
+    captureId: executionCaptureIdSchema,
+    threadId: identifier,
+    target: factoryTargetSchema,
+    ownershipGeneration: z.number().int().nonnegative().safe(),
+    status: z.enum(["queued", "claimed", "source-capture-fenced", "blocked"]),
+    acceptedAt: z.string().datetime(),
+    updatedAt: z.string().datetime(),
+    sourceFence: executionCaptureFenceReceiptSchema.optional(),
+    errorCode: z.string().min(1).max(128).optional(),
+  })
+  .strict();
+
 export const factoryDispatchStatusSchema = z.enum([
   "queued",
   "unavailable",
@@ -298,6 +323,10 @@ export type AssistantCredentialGrant = z.infer<
 export type ParticipantRole = z.infer<typeof participantRoleSchema>;
 export type FactoryParticipant = z.infer<typeof factoryParticipantSchema>;
 export type FactoryInvitation = z.infer<typeof factoryInvitationSchema>;
+export type CaptureControlAdmissionRequest = z.infer<
+  typeof captureControlAdmissionRequestSchema
+>;
+export type CaptureControlStatus = z.infer<typeof captureControlStatusSchema>;
 export type DiscussionEntry = z.infer<typeof discussionEntrySchema>;
 export type FactoryDispatchStatus = z.infer<typeof factoryDispatchStatusSchema>;
 export type FactoryCommandReceipt = z.infer<typeof factoryCommandReceiptSchema>;

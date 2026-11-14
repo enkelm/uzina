@@ -2,6 +2,7 @@ import { CONTRACT_VERSION } from "@uzina/contracts";
 import {
   assistantCredentialGrantsRequestSchema,
   bootstrapFactoryRequestSchema,
+  captureControlAdmissionRequestSchema,
   createProjectRequestSchema,
   createThreadRequestSchema,
   createWorkspaceRequestSchema,
@@ -14,6 +15,9 @@ import {
   submitInputRequestSchema,
 } from "@uzina/contracts/factory";
 import {
+  executionCaptureControlClaimRequestSchema,
+  executionCaptureControlClaimResponseSchema,
+  executionCaptureControlReportSchema,
   executionClaimRequestSchema,
   executionClaimResponseSchema,
   executionHeartbeatRequestSchema,
@@ -231,6 +235,32 @@ export function createFactoryHttpHandler(
           runtime,
         });
       }
+      const captureAdmissionMatch = path.match(
+        /^\/v1\/threads\/([^/]+)\/capture-controls$/,
+      );
+      if (request.method === "POST" && captureAdmissionMatch) {
+        const input = await body(request, captureControlAdmissionRequestSchema);
+        return json(
+          await factory.requestCaptureControl(
+            session,
+            decodeURIComponent(captureAdmissionMatch[1]!),
+            input,
+          ),
+          202,
+        );
+      }
+      const captureStatusMatch = path.match(
+        /^\/v1\/capture-controls\/([^/]+)$/,
+      );
+      if (request.method === "GET" && captureStatusMatch) {
+        return json(
+          factory.getCaptureControlStatus(
+            session,
+            decodeURIComponent(captureStatusMatch[1]!),
+          ),
+        );
+      }
+
       const inputMatch = path.match(/^\/v1\/threads\/([^/]+)\/inputs$/);
       if (request.method === "POST" && inputMatch) {
         const input = await body(request, submitInputRequestSchema);
@@ -408,6 +438,38 @@ export function createFactoryHttpHandler(
           throw new FactoryError(403, "node_identity_mismatch");
         }
         return json(factory.heartbeatExecutionNode(session, input));
+      }
+      const captureControlClaimMatch = path.match(
+        /^\/v1\/nodes\/([^/]+)\/capture-controls\/claim$/,
+      );
+      if (request.method === "POST" && captureControlClaimMatch) {
+        const input = await body(
+          request,
+          executionCaptureControlClaimRequestSchema,
+        );
+        if (input.nodeId !== decodeURIComponent(captureControlClaimMatch[1]!)) {
+          throw new FactoryError(403, "node_identity_mismatch");
+        }
+        return json(
+          executionCaptureControlClaimResponseSchema.parse({
+            contractVersion: CONTRACT_VERSION,
+            control: factory.claimCaptureControl(session, input),
+          }),
+        );
+      }
+      const captureControlReportMatch = path.match(
+        /^\/v1\/nodes\/([^/]+)\/capture-controls\/([^/]+)\/report$/,
+      );
+      if (request.method === "POST" && captureControlReportMatch) {
+        const input = await body(request, executionCaptureControlReportSchema);
+        return json(
+          await factory.reportCaptureControl(
+            session,
+            decodeURIComponent(captureControlReportMatch[1]!),
+            decodeURIComponent(captureControlReportMatch[2]!),
+            input,
+          ),
+        );
       }
       const claimMatch = path.match(/^\/v1\/nodes\/([^/]+)\/jobs\/claim$/);
       if (request.method === "POST" && claimMatch) {

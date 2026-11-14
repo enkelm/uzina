@@ -13,6 +13,8 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ExecutionDaemon } from "../src/execution/daemon";
+import { executionCaptureControlSchema } from "@uzina/contracts/execution";
+import { executionPayloadSha256 } from "../src/execution/payload";
 
 const fixtures: Array<{ root: string; daemon?: ExecutionDaemon }> = [];
 
@@ -29,6 +31,30 @@ function fixture(options: { rexExecutable?: string } = {}) {
   });
   fixtures.push({ root, daemon });
   return { root, workspace, daemon };
+}
+
+function captureControl(
+  overrides: {
+    controlId?: string;
+    captureId?: string;
+    requestId?: string;
+    ownershipGeneration?: number;
+  } = {},
+) {
+  const binding = {
+    contractVersion: 1 as const,
+    controlId: "capture-control:test",
+    captureId: "capture:test",
+    requestId: "request:capture-control-test",
+    nodeId: "node:test",
+    target: { nodeId: "node:test", workspaceId: "workspace:test" },
+    ownershipGeneration: 0,
+    ...overrides,
+  };
+  return executionCaptureControlSchema.parse({
+    ...binding,
+    payloadSha256: executionPayloadSha256(binding),
+  });
 }
 
 function job(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -104,6 +130,40 @@ describe("persistent execution daemon", () => {
       contentBase64: Buffer.from("sample bytes").toString("base64"),
       bytes: 12,
     });
+  });
+
+  test("migrates pre-control local capture fences without changing their cleanup behavior", async () => {
+    const root = mkdtempSync(join(tmpdir(), "uzina-legacy-capture-fence-"));
+    const workspace = join(root, "workspace");
+    mkdirSync(workspace);
+    const databasePath = join(root, "node.sqlite");
+    const legacyDatabase = new Database(databasePath);
+    legacyDatabase.exec(`
+      CREATE TABLE execution_workspace_captures (
+        workspace_id TEXT PRIMARY KEY,
+        capture_id TEXT NOT NULL UNIQUE,
+        started_at TEXT NOT NULL
+      );
+    `);
+    legacyDatabase
+      .query(
+        "INSERT INTO execution_workspace_captures(workspace_id, capture_id, started_at) VALUES (?, ?, ?)",
+      )
+      .run("workspace:test", "capture:legacy-local", new Date().toISOString());
+    legacyDatabase.close();
+
+    const daemon = new ExecutionDaemon({
+      databasePath,
+      nodeId: "node:test",
+      nodeCredential: "node-secret-fixture",
+      workspaces: [{ workspaceId: "workspace:test", directory: workspace }],
+    });
+    fixtures.push({ root, daemon });
+    await expect(daemon.executeJob(job())).rejects.toThrow(
+      "workspace_capture_active",
+    );
+    daemon.endWorkspaceCapture("capture:legacy-local");
+    expect((await daemon.executeJob(job())).status).toBe("completed");
   });
 
   test("executes argv directly with bounded output and stops timed-out jobs", async () => {
@@ -422,6 +482,15 @@ describe("persistent execution daemon", () => {
     expect(() =>
       reopened.beginWorkspaceCapture("workspace:test", "capture:uncertain-job"),
     ).toThrow("workspace_has_unsettled_effects");
+    const uncertainControl = captureControl({
+      controlId: "capture-control:uncertain-job",
+      captureId: "capture:uncertain-job-control",
+      requestId: "request:uncertain-job-control",
+    });
+    expect(reopened.executeCaptureControl(uncertainControl)).toMatchObject({
+      status: "blocked",
+      errorCode: "workspace_has_unsettled_effects",
+    });
 
     const resolved = reopened.reconcileUncertainJob(
       "job:uncertain-command",
@@ -451,7 +520,22 @@ describe("persistent execution daemon", () => {
     expect(() =>
       daemon.beginWorkspaceCapture("workspace:test", "capture:running-job"),
     ).toThrow("workspace_has_unsettled_effects");
+    const control = captureControl();
+    const blockedControl = daemon.executeCaptureControl(control);
+    expect(blockedControl).toMatchObject({
+      controlId: control.controlId,
+      status: "blocked",
+      errorCode: "workspace_has_unsettled_effects",
+    });
+    expect(daemon.executeCaptureControl(control)).toEqual(blockedControl);
+    expect(daemon.pendingCaptureControlReports()).toEqual([blockedControl]);
     expect((await running).status).toBe("completed");
+    expect(daemon.executeCaptureControl(control)).toEqual(blockedControl);
+    daemon.beginWorkspaceCapture(
+      "workspace:test",
+      "capture:local-after-blocked-control",
+    );
+    daemon.endWorkspaceCapture("capture:local-after-blocked-control");
     daemon.fenceWorkspace("workspace:test", 0, 1);
     await expect(
       daemon.executeJob(job({ jobId: "job:stale", ownershipGeneration: 0 })),
@@ -661,11 +745,23 @@ describe("persistent execution daemon", () => {
     expect(() =>
       daemon.beginWorkspaceCapture("workspace:test", "capture:rex-active"),
     ).toThrow("workspace_has_running_rex_processes");
+    const rexControl = captureControl({
+      controlId: "capture-control:rex-active",
+      captureId: "capture:rex-active-control",
+      requestId: "request:rex-active-control",
+    });
+    const blockedRexControl = daemon.executeCaptureControl(rexControl);
+    expect(blockedRexControl).toMatchObject({
+      status: "blocked",
+      errorCode: "workspace_has_running_rex_processes",
+    });
+    expect(daemon.executeCaptureControl(rexControl)).toEqual(blockedRexControl);
     expect(() => daemon.fenceWorkspace("workspace:test", 0, 1)).toThrow(
       "workspace_has_running_rex_processes",
     );
     const stopped = await daemon.rex.stop("process:isolated");
     expect(stopped.status).toBe("exited");
+    expect(daemon.executeCaptureControl(rexControl)).toEqual(blockedRexControl);
     expect(JSON.parse(readFileSync(statePath, "utf8"))).toEqual({
       "session-uzina-process:isolated": {
         block_id: "block-uzina-process:isolated",
@@ -695,5 +791,25 @@ describe("persistent execution daemon", () => {
       daemon.beginWorkspaceCapture("workspace:test", captureId),
     ).not.toThrow();
     daemon.endWorkspaceCapture(captureId);
+
+    const stateDatabase = new Database(join(root, "node.sqlite"));
+    stateDatabase
+      .query(
+        "UPDATE execution_rex_processes SET status = 'unknown' WHERE process_id = ?",
+      )
+      .run("process:isolated");
+    stateDatabase.close();
+    const unknownRexControl = captureControl({
+      controlId: "capture-control:unknown-rex",
+      captureId: "capture:unknown-rex",
+      requestId: "request:unknown-rex",
+      ownershipGeneration: 1,
+    });
+    const blockedUnknownRex = daemon.executeCaptureControl(unknownRexControl);
+    expect(blockedUnknownRex).toMatchObject({
+      status: "blocked",
+      errorCode: "workspace_has_running_rex_processes",
+    });
+    expect(blockedUnknownRex.sourceFence).toBeUndefined();
   });
 });

@@ -283,7 +283,7 @@ export class RexProcessManager {
       this.#db
         .query<{ process_id: string }, [string]>(
           `SELECT process_id FROM execution_rex_processes WHERE workspace_id = ?
-            AND status IN ('starting', 'running', 'stopping', 'uncertain') LIMIT 1`,
+            AND status <> 'exited' LIMIT 1`,
         )
         .get(workspaceId),
     );

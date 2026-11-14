@@ -1,4 +1,8 @@
 import {
+  executionCaptureControlClaimRequestSchema,
+  executionCaptureControlClaimResponseSchema,
+  executionCaptureControlReportResponseSchema,
+  executionCaptureControlReportSchema,
   executionClaimRequestSchema,
   executionClaimResponseSchema,
   executionHeartbeatRequestSchema,
@@ -7,6 +11,7 @@ import {
   executionRegisterRequestSchema,
   executionRegisterResponseSchema,
   executionReportResponseSchema,
+  type ExecutionCaptureControl,
   type ExecutionJob,
 } from "@uzina/contracts/execution";
 
@@ -58,6 +63,8 @@ export interface ExecutionControllerConnector {
   heartbeat(request: unknown): Promise<void>;
   claim(): Promise<ExecutionJob | null>;
   report(report: unknown): Promise<void>;
+  claimCaptureControl(): Promise<ExecutionCaptureControl | null>;
+  reportCaptureControl(report: unknown): Promise<void>;
 }
 
 export interface HttpExecutionControllerConnectorOptions {
@@ -145,6 +152,44 @@ export class HttpExecutionControllerConnector implements ExecutionControllerConn
     ) {
       throw new ControllerProtocolError(
         "Controller report acknowledgement mismatch",
+      );
+    }
+  }
+
+  async claimCaptureControl(): Promise<ExecutionCaptureControl | null> {
+    const body = executionCaptureControlClaimRequestSchema.parse({
+      contractVersion: 1,
+      nodeId: this.#nodeId,
+    });
+    const response = await this.#post(
+      `/v1/nodes/${this.#nodeId}/capture-controls/claim`,
+      body,
+      executionCaptureControlClaimResponseSchema,
+    );
+    if (response.control) {
+      this.#assertNode(response.control.nodeId);
+      this.#assertNode(response.control.target.nodeId);
+    }
+    return response.control;
+  }
+
+  async reportCaptureControl(report: unknown): Promise<void> {
+    const body = executionCaptureControlReportSchema.parse(report);
+    this.#assertNode(body.nodeId);
+    this.#assertNode(body.target.nodeId);
+    const response = await this.#post(
+      `/v1/nodes/${this.#nodeId}/capture-controls/${body.controlId}/report`,
+      body,
+      executionCaptureControlReportResponseSchema,
+    );
+    if (
+      response.nodeId !== this.#nodeId ||
+      response.controlId !== body.controlId ||
+      response.captureId !== body.captureId ||
+      response.status !== body.status
+    ) {
+      throw new ControllerProtocolError(
+        "Controller capture-control acknowledgement mismatch",
       );
     }
   }

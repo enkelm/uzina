@@ -18,6 +18,10 @@ export const executionNodeIdSchema = identifier.brand<"ExecutionNodeId">();
 export const executionWorkspaceIdSchema =
   identifier.brand<"ExecutionWorkspaceId">();
 export const executionJobIdSchema = identifier.brand<"ExecutionJobId">();
+export const executionCaptureControlIdSchema =
+  identifier.brand<"ExecutionCaptureControlId">();
+export const executionCaptureIdSchema =
+  identifier.brand<"ExecutionCaptureId">();
 export const executionProcessIdSchema =
   identifier.brand<"ExecutionProcessId">();
 export const ownershipGenerationSchema = z.number().int().nonnegative().safe();
@@ -96,6 +100,101 @@ const jobCommon = {
   target: executionTargetSchema,
   ownershipGeneration: ownershipGenerationSchema,
 };
+
+export const executionCaptureControlSchema = z
+  .object({
+    ...versioned,
+    controlId: executionCaptureControlIdSchema,
+    captureId: executionCaptureIdSchema,
+    requestId: identifier,
+    nodeId: executionNodeIdSchema,
+    target: executionTargetSchema,
+    ownershipGeneration: ownershipGenerationSchema,
+    payloadSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  })
+  .strict();
+
+export const executionCaptureControlClaimRequestSchema = z
+  .object({ ...versioned, nodeId: executionNodeIdSchema })
+  .strict();
+
+export const executionCaptureFenceReceiptSchema = z
+  .object({
+    controlId: executionCaptureControlIdSchema,
+    captureId: executionCaptureIdSchema,
+    requestId: identifier,
+    nodeId: executionNodeIdSchema,
+    target: executionTargetSchema,
+    ownershipGeneration: ownershipGenerationSchema,
+    fencedAt: z.string().datetime(),
+    receiptSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  })
+  .strict();
+
+export const executionCaptureControlReportSchema = z
+  .object({
+    ...versioned,
+    controlId: executionCaptureControlIdSchema,
+    captureId: executionCaptureIdSchema,
+    requestId: identifier,
+    nodeId: executionNodeIdSchema,
+    target: executionTargetSchema,
+    ownershipGeneration: ownershipGenerationSchema,
+    payloadSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    status: z.enum(["source-capture-fenced", "blocked"]),
+    reportedAt: z.string().datetime(),
+    sourceFence: executionCaptureFenceReceiptSchema.optional(),
+    errorCode: z.string().min(1).max(128).optional(),
+  })
+  .strict()
+  .superRefine((report, context) => {
+    if (report.status === "source-capture-fenced" && !report.sourceFence) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["sourceFence"],
+        message: "A source-fenced report requires its durable fence receipt",
+      });
+    }
+    if (report.status === "blocked" && !report.errorCode) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["errorCode"],
+        message: "A blocked report requires a known refusal code",
+      });
+    }
+    if (report.status === "source-capture-fenced" && report.errorCode) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["errorCode"],
+        message: "A source-fenced report cannot include a refusal code",
+      });
+    }
+    if (report.status === "blocked" && report.sourceFence) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["sourceFence"],
+        message: "A blocked report cannot claim a source fence",
+      });
+    }
+  });
+
+export const executionCaptureControlClaimResponseSchema = z
+  .object({
+    ...versioned,
+    control: executionCaptureControlSchema.nullable(),
+  })
+  .strict();
+
+export const executionCaptureControlReportResponseSchema = z
+  .object({
+    ...versioned,
+    nodeId: executionNodeIdSchema,
+    controlId: executionCaptureControlIdSchema,
+    captureId: executionCaptureIdSchema,
+    accepted: z.literal(true),
+    status: z.enum(["source-capture-fenced", "blocked"]),
+  })
+  .strict();
 
 export const executionJobSchema = z.discriminatedUnion("operation", [
   z
@@ -262,6 +361,12 @@ export const executionRexInspectionSchema = z
   .strict();
 
 export type ExecutionCapabilities = z.infer<typeof executionCapabilitiesSchema>;
+export type ExecutionCaptureControl = z.infer<
+  typeof executionCaptureControlSchema
+>;
+export type ExecutionCaptureControlReport = z.infer<
+  typeof executionCaptureControlReportSchema
+>;
 export type ExecutionClaimRequest = z.infer<typeof executionClaimRequestSchema>;
 export type ExecutionHeartbeatRequest = z.infer<
   typeof executionHeartbeatRequestSchema

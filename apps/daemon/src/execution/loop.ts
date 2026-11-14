@@ -114,18 +114,34 @@ export class ExecutionLoop {
             this.#daemon.markReported(report.jobId, report.status);
           }
 
+          for (const report of this.#daemon.pendingCaptureControlReports()) {
+            if (shutdown.signal.aborted) break;
+            await this.#controller.reportCaptureControl(report);
+            this.#daemon.markCaptureControlReported(report.controlId, report);
+          }
+
           if (shutdown.signal.aborted) break;
-          const job = await this.#controller.claim();
+          const captureControl = await this.#controller.claimCaptureControl();
           if (shutdown.signal.aborted) break;
-          if (job) {
-            const receipt = await this.#daemon.executeJob(job);
-            if (
-              !credentialRejected &&
-              ["completed", "failed", "uncertain"].includes(receipt.status)
-            ) {
-              const report = this.#daemon.reportFor(job.jobId);
-              await this.#controller.report(report);
-              this.#daemon.markReported(job.jobId, report.status);
+          if (captureControl) {
+            const report = this.#daemon.executeCaptureControl(captureControl);
+            if (!credentialRejected) {
+              await this.#controller.reportCaptureControl(report);
+              this.#daemon.markCaptureControlReported(report.controlId, report);
+            }
+          } else {
+            const job = await this.#controller.claim();
+            if (shutdown.signal.aborted) break;
+            if (job) {
+              const receipt = await this.#daemon.executeJob(job);
+              if (
+                !credentialRejected &&
+                ["completed", "failed", "uncertain"].includes(receipt.status)
+              ) {
+                const report = this.#daemon.reportFor(job.jobId);
+                await this.#controller.report(report);
+                this.#daemon.markReported(job.jobId, report.status);
+              }
             }
           }
         } catch (error) {

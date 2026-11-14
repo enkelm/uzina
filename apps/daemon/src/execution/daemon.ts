@@ -22,6 +22,8 @@ import {
   MAX_EXECUTION_COMMAND_TIMEOUT_MS,
   MAX_EXECUTION_FILE_BYTES,
   executionCapabilitiesSchema,
+  executionCaptureControlSchema,
+  executionCaptureControlReportSchema,
   executionHeartbeatRequestSchema,
   executionJobReportSchema,
   executionJobSchema,
@@ -31,6 +33,8 @@ import {
   executionWorkspaceIdSchema,
   executionWorkspaceReportSchema,
   type ExecutionCapabilities,
+  type ExecutionCaptureControl,
+  type ExecutionCaptureControlReport,
   type ExecutionHeartbeatRequest,
   type ExecutionJob,
   type ExecutionJobReport,
@@ -64,6 +68,22 @@ interface WorkspaceRow {
   directory: string;
   ownership_generation: number;
   active: number;
+}
+
+interface CaptureControlRow {
+  control_id: string;
+  capture_id: string;
+  request_id: string;
+  payload_sha256: string;
+  node_id: string;
+  workspace_id: string;
+  ownership_generation: number;
+  status: "source-capture-fenced" | "blocked";
+  accepted_at: string;
+  report_json: string;
+  report_sha256: string;
+  reported_at: string | null;
+  error_code: string | null;
 }
 
 interface JobRow {
@@ -289,7 +309,23 @@ export class ExecutionDaemon {
       CREATE TABLE IF NOT EXISTS execution_workspace_captures (
         workspace_id TEXT PRIMARY KEY,
         capture_id TEXT NOT NULL UNIQUE,
-        started_at TEXT NOT NULL
+        started_at TEXT NOT NULL,
+        control_id TEXT
+      );
+      CREATE TABLE IF NOT EXISTS execution_capture_controls (
+        control_id TEXT PRIMARY KEY,
+        capture_id TEXT NOT NULL UNIQUE,
+        request_id TEXT NOT NULL UNIQUE,
+        payload_sha256 TEXT NOT NULL,
+        node_id TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        ownership_generation INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('source-capture-fenced', 'blocked')),
+        accepted_at TEXT NOT NULL,
+        report_json TEXT NOT NULL,
+        report_sha256 TEXT NOT NULL,
+        reported_at TEXT,
+        error_code TEXT
       );
       CREATE TABLE IF NOT EXISTS execution_rex_processes (
         process_id TEXT PRIMARY KEY,
@@ -309,6 +345,16 @@ export class ExecutionDaemon {
       CREATE INDEX IF NOT EXISTS execution_rex_workspace_status
         ON execution_rex_processes(workspace_id, status);
     `);
+      const captureColumns = this.#db
+        .query<{ name: string }, []>(
+          "PRAGMA table_info(execution_workspace_captures)",
+        )
+        .all();
+      if (!captureColumns.some((column) => column.name === "control_id")) {
+        this.#db.exec(
+          "ALTER TABLE execution_workspace_captures ADD COLUMN control_id TEXT",
+        );
+      }
       const jobColumns = this.#db
         .query<{ name: string }, []>("PRAGMA table_info(execution_jobs)")
         .all();
@@ -647,69 +693,216 @@ export class ExecutionDaemon {
     return this.#workspaceRoot(workspaceId);
   }
 
-  /** Durable local-node half of capture quiescence; Core admission is fenced separately. */
+  /** Local snapshot-capture fence; unlike remote control fences it is releasable by its host. */
   beginWorkspaceCapture(workspaceId: string, captureId: string): void {
     this.#assertOpen();
     if (!captureId.trim() || captureId.length > 256) {
       throw new ExecutionError("invalid_workspace_capture_id");
     }
     this.#transaction(() => {
-      const workspace = this.#workspaceRow(workspaceId);
-      if (!workspace) throw new ExecutionError("workspace_not_found");
-      this.#assertActiveRow(workspace, workspace.ownership_generation);
-      const physicalRoots = this.#db
-        .query<Pick<WorkspaceRow, "workspace_id" | "directory">, []>(
-          "SELECT workspace_id, directory FROM execution_workspaces",
-        )
-        .all()
-        .map((mapping) => {
-          try {
-            return {
-              workspaceId: mapping.workspace_id,
-              root: realpathSync(resolve(mapping.directory)),
-            };
-          } catch {
-            throw new ExecutionError("workspace_mapping_unavailable");
-          }
-        });
-      const selectedRoot = physicalRoots.find(
-        (mapping) => mapping.workspaceId === workspaceId,
-      );
-      if (!selectedRoot) throw new ExecutionError("workspace_not_found");
-      if (
-        physicalRoots.some(
-          (mapping) =>
-            mapping.workspaceId !== workspaceId &&
-            (within(selectedRoot.root, mapping.root) ||
-              within(mapping.root, selectedRoot.root)),
-        )
-      ) {
-        throw new ExecutionError("workspace_mappings_overlap");
-      }
-      if (
-        this.#db
-          .query<{ status: string }, [string]>(
-            "SELECT status FROM execution_jobs WHERE workspace_id = ? AND status IN ('queued', 'running', 'uncertain') LIMIT 1",
-          )
-          .get(workspaceId)
-      ) {
-        throw new ExecutionError("workspace_has_unsettled_effects");
-      }
-      if (this.rex.hasBlockingProcesses(workspaceId)) {
-        throw new ExecutionError("workspace_has_running_rex_processes");
-      }
-      this.#assertWorkspaceAdmission(workspaceId);
+      this.#assertWorkspaceCapturePreflight(workspaceId);
       this.#db
         .query(
-          "INSERT INTO execution_workspace_captures(workspace_id, capture_id, started_at) VALUES (?, ?, ?)",
+          "INSERT INTO execution_workspace_captures(workspace_id, capture_id, started_at, control_id) VALUES (?, ?, ?, NULL)",
         )
         .run(workspaceId, captureId, new Date().toISOString());
     });
   }
 
-  /** Owner-host adapter releases the local writer fence after capture settles. */
+  /**
+   * Applies the idempotent remote CONTROL operation. Its node receipt and local
+   * admission fence commit atomically; blocked receipts never claim quiescence.
+   */
+  executeCaptureControl(input: unknown): ExecutionCaptureControlReport {
+    this.#assertOpen();
+    const parsed = executionCaptureControlSchema.safeParse(input);
+    if (!parsed.success) throw new ExecutionError("invalid_capture_control");
+    const control = parsed.data;
+    this.#assertCaptureControlIdentity(control);
+    const { payloadSha256, ...payload } = control;
+    if (executionPayloadSha256(payload) !== payloadSha256) {
+      throw new ExecutionError("capture_control_payload_mismatch");
+    }
+
+    return this.#transaction(() => {
+      const existing = this.#captureControlRow(control.controlId);
+      if (existing) {
+        if (
+          existing.payload_sha256 !== payloadSha256 ||
+          existing.capture_id !== control.captureId ||
+          existing.request_id !== control.requestId ||
+          existing.node_id !== control.nodeId ||
+          existing.workspace_id !== control.target.workspaceId ||
+          existing.ownership_generation !== control.ownershipGeneration
+        ) {
+          throw new ExecutionError("capture_control_id_conflict");
+        }
+        if (existing.status === "source-capture-fenced") {
+          const fence = this.#db
+            .query<{ capture_id: string; control_id: string | null }, [string]>(
+              "SELECT capture_id, control_id FROM execution_workspace_captures WHERE workspace_id = ?",
+            )
+            .get(control.target.workspaceId);
+          if (
+            !fence ||
+            fence.capture_id !== control.captureId ||
+            fence.control_id !== control.controlId
+          ) {
+            throw new ExecutionError("capture_control_fence_missing");
+          }
+        }
+        return executionCaptureControlReportSchema.parse(
+          JSON.parse(existing.report_json),
+        );
+      }
+      const collision = this.#db
+        .query<{ control_id: string }, [string, string]>(
+          "SELECT control_id FROM execution_capture_controls WHERE capture_id = ? OR request_id = ? LIMIT 1",
+        )
+        .get(control.captureId, control.requestId);
+      if (collision) throw new ExecutionError("capture_control_id_conflict");
+
+      let refusal: ExecutionError | undefined;
+      try {
+        this.#assertWorkspaceCapturePreflight(control.target.workspaceId);
+      } catch (error) {
+        if (
+          error instanceof ExecutionError &&
+          [
+            "workspace_has_unsettled_effects",
+            "workspace_has_running_rex_processes",
+            "workspace_mappings_overlap",
+            "workspace_mapping_unavailable",
+            "workspace_capture_active",
+            "workspace_fenced",
+          ].includes(error.code)
+        ) {
+          refusal = error;
+        } else {
+          throw error;
+        }
+      }
+
+      const acceptedAt = new Date().toISOString();
+      let report: ExecutionCaptureControlReport;
+      if (refusal) {
+        report = executionCaptureControlReportSchema.parse({
+          contractVersion: EXECUTION_CONTRACT_VERSION,
+          controlId: control.controlId,
+          captureId: control.captureId,
+          requestId: control.requestId,
+          nodeId: this.#nodeId,
+          target: control.target,
+          ownershipGeneration: control.ownershipGeneration,
+          payloadSha256,
+          status: "blocked",
+          reportedAt: acceptedAt,
+          errorCode: refusal.code,
+        });
+      } else {
+        this.#db
+          .query(
+            "INSERT INTO execution_workspace_captures(workspace_id, capture_id, started_at, control_id) VALUES (?, ?, ?, ?)",
+          )
+          .run(
+            control.target.workspaceId,
+            control.captureId,
+            acceptedAt,
+            control.controlId,
+          );
+        const proofBinding = {
+          controlId: control.controlId,
+          captureId: control.captureId,
+          requestId: control.requestId,
+          nodeId: this.#nodeId,
+          target: control.target,
+          ownershipGeneration: control.ownershipGeneration,
+          fencedAt: acceptedAt,
+        };
+        report = executionCaptureControlReportSchema.parse({
+          contractVersion: EXECUTION_CONTRACT_VERSION,
+          controlId: control.controlId,
+          captureId: control.captureId,
+          requestId: control.requestId,
+          nodeId: this.#nodeId,
+          target: control.target,
+          ownershipGeneration: control.ownershipGeneration,
+          payloadSha256,
+          status: "source-capture-fenced",
+          reportedAt: acceptedAt,
+          sourceFence: {
+            ...proofBinding,
+            receiptSha256: executionPayloadSha256(proofBinding),
+          },
+        });
+      }
+      const reportJson = JSON.stringify(report);
+      this.#db
+        .query(
+          `INSERT INTO execution_capture_controls(
+            control_id, capture_id, request_id, payload_sha256, node_id,
+            workspace_id, ownership_generation, status, accepted_at, report_json,
+            report_sha256, error_code
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          control.controlId,
+          control.captureId,
+          control.requestId,
+          payloadSha256,
+          this.#nodeId,
+          control.target.workspaceId,
+          control.ownershipGeneration,
+          report.status,
+          acceptedAt,
+          reportJson,
+          executionPayloadSha256(report),
+          report.errorCode ?? null,
+        );
+      return report;
+    });
+  }
+
+  pendingCaptureControlReports(): ExecutionCaptureControlReport[] {
+    this.#assertOpen();
+    return this.#db
+      .query<{ report_json: string }, []>(
+        "SELECT report_json FROM execution_capture_controls WHERE reported_at IS NULL ORDER BY accepted_at, control_id",
+      )
+      .all()
+      .map((row) =>
+        executionCaptureControlReportSchema.parse(JSON.parse(row.report_json)),
+      );
+  }
+
+  markCaptureControlReported(
+    controlId: string,
+    report: ExecutionCaptureControlReport,
+  ): void {
+    this.#assertOpen();
+    const row = this.#captureControlRow(controlId);
+    if (!row) throw new ExecutionError("capture_control_receipt_not_found");
+    if (row.report_sha256 !== executionPayloadSha256(report)) {
+      throw new ExecutionError("capture_control_report_ack_mismatch");
+    }
+    this.#db
+      .query(
+        "UPDATE execution_capture_controls SET reported_at = ? WHERE control_id = ? AND reported_at IS NULL",
+      )
+      .run(new Date().toISOString(), controlId);
+  }
+
+  /** Ordinary local capture cleanup cannot clear a fence owned by remote CONTROL. */
   endWorkspaceCapture(captureId: string): void {
     this.#assertOpen();
+    const existing = this.#db
+      .query<{ control_id: string | null }, [string]>(
+        "SELECT control_id FROM execution_workspace_captures WHERE capture_id = ?",
+      )
+      .get(captureId);
+    if (existing?.control_id) {
+      throw new ExecutionError("capture_control_fence_held");
+    }
     this.#db
       .query("DELETE FROM execution_workspace_captures WHERE capture_id = ?")
       .run(captureId);
@@ -1137,6 +1330,78 @@ export class ExecutionDaemon {
       throw new ExecutionError("workspace_path_not_directory");
     }
     return canonical;
+  }
+
+  #assertCaptureControlIdentity(control: ExecutionCaptureControl): void {
+    if (
+      control.nodeId !== this.#nodeId ||
+      control.target.nodeId !== this.#nodeId
+    ) {
+      throw new ExecutionError("target_node_mismatch");
+    }
+    const workspace = this.#workspaceRow(control.target.workspaceId);
+    if (!workspace) throw new ExecutionError("workspace_not_found");
+    if (workspace.ownership_generation !== control.ownershipGeneration) {
+      throw new ExecutionError("stale_ownership_generation");
+    }
+  }
+
+  #assertWorkspaceCapturePreflight(workspaceId: string): void {
+    const workspace = this.#workspaceRow(workspaceId);
+    if (!workspace) throw new ExecutionError("workspace_not_found");
+    this.#assertActiveRow(workspace, workspace.ownership_generation);
+    const physicalRoots = this.#db
+      .query<Pick<WorkspaceRow, "workspace_id" | "directory">, []>(
+        "SELECT workspace_id, directory FROM execution_workspaces",
+      )
+      .all()
+      .map((mapping) => {
+        try {
+          return {
+            workspaceId: mapping.workspace_id,
+            root: realpathSync(resolve(mapping.directory)),
+          };
+        } catch {
+          throw new ExecutionError("workspace_mapping_unavailable");
+        }
+      });
+    const selectedRoot = physicalRoots.find(
+      (mapping) => mapping.workspaceId === workspaceId,
+    );
+    if (!selectedRoot) throw new ExecutionError("workspace_not_found");
+    if (
+      physicalRoots.some(
+        (mapping) =>
+          mapping.workspaceId !== workspaceId &&
+          (within(selectedRoot.root, mapping.root) ||
+            within(mapping.root, selectedRoot.root)),
+      )
+    ) {
+      throw new ExecutionError("workspace_mappings_overlap");
+    }
+    if (
+      this.#db
+        .query<{ status: string }, [string]>(
+          "SELECT status FROM execution_jobs WHERE workspace_id = ? AND status IN ('queued', 'running', 'uncertain') LIMIT 1",
+        )
+        .get(workspaceId)
+    ) {
+      throw new ExecutionError("workspace_has_unsettled_effects");
+    }
+    if (this.rex.hasBlockingProcesses(workspaceId)) {
+      throw new ExecutionError("workspace_has_running_rex_processes");
+    }
+    this.#assertWorkspaceAdmission(workspaceId);
+  }
+
+  #captureControlRow(controlId: string): CaptureControlRow | undefined {
+    return (
+      this.#db
+        .query<CaptureControlRow, [string]>(
+          "SELECT * FROM execution_capture_controls WHERE control_id = ?",
+        )
+        .get(controlId) ?? undefined
+    );
   }
 
   #workspaceRoot(workspaceId: string): string {

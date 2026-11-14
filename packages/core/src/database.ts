@@ -167,6 +167,27 @@ const schema = [
     owner_id TEXT NOT NULL,
     started_at TEXT NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS capture_control_requests (
+    request_id TEXT PRIMARY KEY,
+    control_id TEXT NOT NULL UNIQUE,
+    capture_id TEXT NOT NULL UNIQUE,
+    actor_json TEXT NOT NULL,
+    project_id TEXT NOT NULL REFERENCES projects(project_id),
+    thread_id TEXT NOT NULL REFERENCES threads(thread_id),
+    node_id TEXT NOT NULL REFERENCES nodes(node_id),
+    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id),
+    ownership_generation INTEGER NOT NULL CHECK (ownership_generation >= 0),
+    payload_json TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('queued', 'claimed', 'source-capture-fenced', 'blocked')),
+    accepted_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    claimed_at TEXT,
+    report_json TEXT,
+    report_sha256 TEXT,
+    error_code TEXT,
+    claim_count INTEGER NOT NULL DEFAULT 0 CHECK (claim_count >= 0)
+  )`,
   `CREATE TABLE IF NOT EXISTS execution_job_claims (
     job_id TEXT NOT NULL REFERENCES execution_jobs(job_id),
     claim_number INTEGER NOT NULL CHECK (claim_number > 0),
@@ -177,6 +198,7 @@ const schema = [
   )`,
   `CREATE INDEX IF NOT EXISTS dispatch_queue_by_node ON dispatch_intents(status, node_id, created_at)`,
   `CREATE INDEX IF NOT EXISTS execution_queue_by_node ON execution_jobs(status, node_id, accepted_at)`,
+  `CREATE INDEX IF NOT EXISTS capture_control_queue_by_node ON capture_control_requests(status, node_id, accepted_at)`,
   `CREATE INDEX IF NOT EXISTS factory_events_by_cursor ON factory_events(cursor)`,
 ];
 

@@ -15,6 +15,8 @@ import {
   factoryParticipantSchema,
   factoryProjectSchema,
   factoryQueueJobSchema,
+  captureControlAdmissionRequestSchema,
+  captureControlStatusSchema,
   factoryThreadSchema,
   factoryWorkspaceSchema,
   invitationCreateRequestSchema,
@@ -35,6 +37,10 @@ import {
 } from "@uzina/contracts/factory";
 import {
   EXECUTION_CONTRACT_VERSION,
+  executionCaptureControlClaimRequestSchema,
+  executionCaptureControlReportResponseSchema,
+  executionCaptureControlReportSchema,
+  executionCaptureControlSchema,
   executionHeartbeatRequestSchema,
   executionHeartbeatResponseSchema,
   executionJobReportSchema,
@@ -43,6 +49,7 @@ import {
   executionRegisterRequestSchema,
   executionRegisterResponseSchema,
   executionReportResponseSchema,
+  type ExecutionCaptureControl,
   type ExecutionHeartbeatRequest,
   type ExecutionJob,
   type ExecutionJobReport,
@@ -169,6 +176,27 @@ type ExecutionWorkspaceRow = {
   workspace_id: string;
   ownership_generation: number;
   state: "active" | "fenced";
+};
+type CaptureControlRow = {
+  request_id: string;
+  control_id: string;
+  capture_id: string;
+  actor_json: string;
+  project_id: string;
+  thread_id: string;
+  node_id: string;
+  workspace_id: string;
+  ownership_generation: number;
+  payload_json: string;
+  payload_sha256: string;
+  status: "queued" | "claimed" | "source-capture-fenced" | "blocked";
+  accepted_at: string;
+  updated_at: string;
+  claimed_at: string | null;
+  report_json: string | null;
+  report_sha256: string | null;
+  error_code: string | null;
+  claim_count: number;
 };
 type ExecutionJobRow = {
   job_id: string;
@@ -1417,61 +1445,283 @@ export class FactoryService {
     return this.#thread(row);
   }
 
-  /** Durably fences selected managed work and its exclusive workspace for capture. */
+  /** Durably fences selected managed work and its exclusive workspace for local capture. */
   beginManagedWorkCapture(session: FactorySession, threadId: string) {
     const ownerId = this.#requireOwner(session);
     return this.database.transaction(() => {
-      const row = this.database.all<ThreadRow>(
-        "SELECT thread_id, project_id, title, node_id, workspace_id, ownership_generation, owner_private, created_at FROM threads WHERE thread_id = ?",
-        [threadId],
-      )[0];
-      if (!row) throw notFound("Thread");
-      const shared = this.database.all<{ count: number }>(
-        "SELECT COUNT(*) AS count FROM threads WHERE workspace_id = ?",
-        [row.workspace_id],
-      )[0]?.count;
-      if (shared !== 1) {
-        throw conflict(
-          "capture_workspace_shared",
-          "Managed-work capture requires an exclusive workspace; this workspace is assigned to multiple threads",
-        );
-      }
-      const activeInputs = this.database.all<{ status: string }>(
-        "SELECT status FROM dispatch_intents WHERE thread_id = ? AND status IN ('queued', 'unavailable', 'running', 'dispatched', 'uncertain') LIMIT 1",
-        [threadId],
-      );
-      if (activeInputs.length) {
-        throw conflict(
-          "capture_work_not_quiescent",
-          `Managed work has an unsettled ${activeInputs[0]!.status} input receipt; reconcile or settle it before capture`,
-        );
-      }
-      const activeEffects = this.database.all<{ status: string }>(
-        "SELECT status FROM execution_jobs WHERE workspace_id = ? AND status IN ('queued', 'claimed', 'uncertain') LIMIT 1",
-        [row.workspace_id],
-      );
-      if (activeEffects.length) {
-        throw conflict(
-          "capture_workspace_not_quiescent",
-          `Workspace has a ${activeEffects[0]!.status} execution effect; reconcile or settle it before capture`,
-        );
-      }
-      const existing = this.database.all<{ capture_id: string }>(
-        "SELECT capture_id FROM managed_work_captures WHERE thread_id = ? OR workspace_id = ?",
-        [threadId, row.workspace_id],
-      )[0];
-      if (existing) {
-        throw conflict(
-          "capture_already_active",
-          "A managed-work capture is already active for this work or workspace",
-        );
-      }
+      const row = this.#captureThread(threadId);
+      this.#assertManagedCaptureAdmission(threadId, row);
       const captureId = makeId("capture");
       this.database.exec(
         "INSERT INTO managed_work_captures(capture_id, thread_id, workspace_id, owner_id, started_at) VALUES (?, ?, ?, ?, ?)",
         [captureId, threadId, row.workspace_id, ownerId, now()],
       );
       return { captureId, thread: this.#thread(row) };
+    });
+  }
+
+  /**
+   * Accepts an owner-authenticated, stable capture-control request and durably
+   * blocks Core admission before any node can claim the control.
+   */
+  async requestCaptureControl(
+    session: FactorySession,
+    threadId: string,
+    request: unknown,
+  ) {
+    const ownerId = this.#requireOwner(session);
+    const input = captureControlAdmissionRequestSchema.parse(request);
+    const thread = this.#captureThread(threadId);
+    const binding = {
+      requestId: input.requestId,
+      actor: session.actor,
+      threadId,
+      projectId: thread.project_id,
+      nodeId: thread.node_id,
+      workspaceId: thread.workspace_id,
+      ownershipGeneration: thread.ownership_generation,
+    };
+    const requestHash = await sha256(stableJson(binding));
+    const controlId = makeId("capture-control");
+    const captureId = makeId("capture");
+    const controlBinding = {
+      contractVersion: EXECUTION_CONTRACT_VERSION,
+      controlId,
+      captureId,
+      requestId: input.requestId,
+      nodeId: thread.node_id,
+      target: { nodeId: thread.node_id, workspaceId: thread.workspace_id },
+      ownershipGeneration: thread.ownership_generation,
+    };
+    const control = executionCaptureControlSchema.parse({
+      ...controlBinding,
+      payloadSha256: await sha256(stableJson(controlBinding)),
+    });
+
+    const row = this.database.transaction(() => {
+      this.#requireOwner(session);
+      const existing = this.#captureControlByRequest(input.requestId);
+      if (existing) {
+        if (
+          existing.payload_sha256 !== requestHash ||
+          existing.actor_json !== encode(session.actor) ||
+          existing.thread_id !== threadId
+        ) {
+          throw conflict(
+            "capture_control_request_conflict",
+            "The stable capture request ID is already bound to another actor, thread, or target",
+          );
+        }
+        return existing;
+      }
+      const currentThread = this.#captureThread(threadId);
+      if (
+        currentThread.project_id !== thread.project_id ||
+        currentThread.node_id !== thread.node_id ||
+        currentThread.workspace_id !== thread.workspace_id ||
+        currentThread.ownership_generation !== thread.ownership_generation
+      ) {
+        throw conflict(
+          "capture_control_target_changed",
+          "The selected thread target changed before capture control was committed",
+        );
+      }
+      this.#assertManagedCaptureAdmission(threadId, currentThread);
+      const acceptedAt = now();
+      this.database.exec(
+        "INSERT INTO managed_work_captures(capture_id, thread_id, workspace_id, owner_id, started_at) VALUES (?, ?, ?, ?, ?)",
+        [captureId, threadId, currentThread.workspace_id, ownerId, acceptedAt],
+      );
+      this.database.exec(
+        `INSERT INTO capture_control_requests(
+          request_id, control_id, capture_id, actor_json, project_id, thread_id,
+          node_id, workspace_id, ownership_generation, payload_json, payload_sha256,
+          status, accepted_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`,
+        [
+          input.requestId,
+          control.controlId,
+          control.captureId,
+          encode(session.actor),
+          currentThread.project_id,
+          threadId,
+          currentThread.node_id,
+          currentThread.workspace_id,
+          currentThread.ownership_generation,
+          encode(control),
+          requestHash,
+          acceptedAt,
+          acceptedAt,
+        ],
+      );
+      return this.#captureControlByRequest(input.requestId)!;
+    });
+    return this.#captureControlStatus(row);
+  }
+
+  /** Owner-only durable status lookup; a fenced result never means a checkpoint exists. */
+  getCaptureControlStatus(session: FactorySession, requestId: string) {
+    this.#requireOwner(session);
+    const row = this.#captureControlByRequest(requestId);
+    if (!row) throw notFound("Capture control request");
+    if (row.actor_json !== encode(session.actor)) throw forbidden();
+    return this.#captureControlStatus(row);
+  }
+
+  /** Authenticated node claim for capture controls; it never exposes effect jobs. */
+  claimCaptureControl(
+    session: FactorySession,
+    request: unknown,
+  ): ExecutionCaptureControl | null {
+    const input = executionCaptureControlClaimRequestSchema.parse(request);
+    this.#requireNode(session, input.nodeId);
+    return this.database.transaction(() => {
+      this.#requireNode(session, input.nodeId);
+      const node = this.database.all<NodeRow>(
+        "SELECT node_id, name, availability, last_seen_at FROM nodes WHERE node_id = ?",
+        [input.nodeId],
+      )[0];
+      const runtime = this.database.all<ExecutionNodeStateRow>(
+        "SELECT node_id, daemon_version, capabilities_json, registered_at, last_seen_at FROM execution_node_state WHERE node_id = ?",
+        [input.nodeId],
+      )[0];
+      if (!node || !runtime || !this.#isNodeOnline(node)) return null;
+      const inFlight = this.database.all<CaptureControlRow>(
+        "SELECT * FROM capture_control_requests WHERE node_id = ? AND status = 'claimed' ORDER BY claimed_at, control_id LIMIT 1",
+        [input.nodeId],
+      )[0];
+      const job =
+        inFlight ??
+        this.database.all<CaptureControlRow>(
+          `SELECT * FROM capture_control_requests WHERE node_id = ? AND status = 'queued'
+           ORDER BY accepted_at, control_id LIMIT 1`,
+          [input.nodeId],
+        )[0];
+      if (!job) return null;
+      const currentGeneration = this.#ownershipGeneration();
+      if (
+        job.ownership_generation !== currentGeneration ||
+        !this.#hasActiveWorkspaceReport(
+          job.node_id,
+          job.workspace_id,
+          job.ownership_generation,
+        )
+      ) {
+        return null;
+      }
+      if (job.status === "queued") {
+        this.database.exec(
+          "UPDATE capture_control_requests SET status = 'claimed', claimed_at = ?, updated_at = ?, claim_count = claim_count + 1 WHERE control_id = ? AND status = 'queued'",
+          [now(), now(), job.control_id],
+        );
+      } else {
+        this.database.exec(
+          "UPDATE capture_control_requests SET claim_count = claim_count + 1, updated_at = ? WHERE control_id = ? AND status = 'claimed'",
+          [now(), job.control_id],
+        );
+      }
+      return executionCaptureControlSchema.parse(JSON.parse(job.payload_json));
+    });
+  }
+
+  /** Commits only a correlated node's durable-fence proof or explicit refusal. */
+  async reportCaptureControl(
+    session: FactorySession,
+    nodeId: string,
+    controlId: string,
+    report: unknown,
+  ) {
+    const input = executionCaptureControlReportSchema.parse(report);
+    this.#requireNode(session, nodeId);
+    const row = this.#captureControlById(controlId);
+    if (!row) throw notFound("Assigned capture control");
+    const control = executionCaptureControlSchema.parse(
+      JSON.parse(row.payload_json),
+    );
+    if (
+      nodeId !== input.nodeId ||
+      controlId !== input.controlId ||
+      row.node_id !== nodeId ||
+      row.request_id !== input.requestId ||
+      row.capture_id !== input.captureId ||
+      row.workspace_id !== input.target.workspaceId ||
+      row.node_id !== input.target.nodeId ||
+      row.ownership_generation !== input.ownershipGeneration ||
+      control.payloadSha256 !== input.payloadSha256
+    ) {
+      throw conflict(
+        "capture_control_assignment_mismatch",
+        "Capture-control report does not match its persisted assignment",
+      );
+    }
+    if (input.status === "source-capture-fenced") {
+      const proof = input.sourceFence!;
+      const proofBinding = {
+        controlId: proof.controlId,
+        captureId: proof.captureId,
+        requestId: proof.requestId,
+        nodeId: proof.nodeId,
+        target: proof.target,
+        ownershipGeneration: proof.ownershipGeneration,
+        fencedAt: proof.fencedAt,
+      };
+      if (
+        proof.controlId !== control.controlId ||
+        proof.captureId !== control.captureId ||
+        proof.requestId !== control.requestId ||
+        proof.nodeId !== control.nodeId ||
+        proof.target.workspaceId !== control.target.workspaceId ||
+        proof.target.nodeId !== control.target.nodeId ||
+        proof.ownershipGeneration !== control.ownershipGeneration ||
+        proof.receiptSha256 !== (await sha256(stableJson(proofBinding)))
+      ) {
+        throw conflict(
+          "capture_control_fence_proof_mismatch",
+          "Source fence proof does not match the assigned durable control",
+        );
+      }
+    }
+    const reportHash = await sha256(stableJson(input));
+    const reportJson = encode(input);
+    this.database.transaction(() => {
+      this.#requireNode(session, nodeId);
+      const current = this.#captureControlById(controlId);
+      if (!current) throw notFound("Assigned capture control");
+      if (current.report_json !== null) {
+        if (current.report_sha256 !== reportHash) {
+          throw conflict(
+            "capture_control_report_conflict",
+            "A different capture-control report is already committed",
+          );
+        }
+        return;
+      }
+      if (current.status !== "claimed") {
+        throw conflict(
+          "capture_control_not_claimed",
+          "Capture control has no persisted node claim",
+        );
+      }
+      this.database.exec(
+        `UPDATE capture_control_requests SET status = ?, updated_at = ?, report_json = ?,
+          report_sha256 = ?, error_code = ? WHERE control_id = ? AND status = 'claimed'`,
+        [
+          input.status,
+          input.reportedAt,
+          reportJson,
+          reportHash,
+          input.errorCode ?? null,
+          controlId,
+        ],
+      );
+    });
+    return executionCaptureControlReportResponseSchema.parse({
+      contractVersion: EXECUTION_CONTRACT_VERSION,
+      nodeId,
+      controlId,
+      captureId: input.captureId,
+      accepted: true,
+      status: input.status,
     });
   }
 
@@ -1498,6 +1748,17 @@ export class FactoryService {
       )[0];
       if (!row) return;
       if (row.owner_id !== ownerId) throw forbidden();
+      if (
+        this.database.all(
+          "SELECT control_id FROM capture_control_requests WHERE capture_id = ?",
+          [captureId],
+        ).length
+      ) {
+        throw conflict(
+          "capture_control_fence_held",
+          "Remote capture-control fences remain held for reconciliation",
+        );
+      }
       this.database.exec(
         "DELETE FROM managed_work_captures WHERE capture_id = ?",
         [captureId],
@@ -2658,6 +2919,92 @@ export class FactoryService {
         `Node does not support ${capability}`,
       );
     }
+  }
+
+  #captureThread(threadId: string): ThreadRow {
+    const row = this.database.all<ThreadRow>(
+      "SELECT thread_id, project_id, title, node_id, workspace_id, ownership_generation, owner_private, created_at FROM threads WHERE thread_id = ?",
+      [threadId],
+    )[0];
+    if (!row) throw notFound("Thread");
+    return row;
+  }
+
+  #assertManagedCaptureAdmission(threadId: string, row: ThreadRow): void {
+    const shared = this.database.all<{ count: number }>(
+      "SELECT COUNT(*) AS count FROM threads WHERE workspace_id = ?",
+      [row.workspace_id],
+    )[0]?.count;
+    if (shared !== 1) {
+      throw conflict(
+        "capture_workspace_shared",
+        "Managed-work capture requires an exclusive workspace; this workspace is assigned to multiple threads",
+      );
+    }
+    const activeInputs = this.database.all<{ status: string }>(
+      "SELECT status FROM dispatch_intents WHERE thread_id = ? AND status IN ('queued', 'unavailable', 'running', 'dispatched', 'uncertain') LIMIT 1",
+      [threadId],
+    );
+    if (activeInputs.length) {
+      throw conflict(
+        "capture_work_not_quiescent",
+        `Managed work has an unsettled ${activeInputs[0]!.status} input receipt; reconcile or settle it before capture`,
+      );
+    }
+    const activeEffects = this.database.all<{ status: string }>(
+      "SELECT status FROM execution_jobs WHERE workspace_id = ? AND status IN ('queued', 'claimed', 'uncertain') LIMIT 1",
+      [row.workspace_id],
+    );
+    if (activeEffects.length) {
+      throw conflict(
+        "capture_workspace_not_quiescent",
+        `Workspace has a ${activeEffects[0]!.status} execution effect; reconcile or settle it before capture`,
+      );
+    }
+    const existing = this.database.all<{ capture_id: string }>(
+      "SELECT capture_id FROM managed_work_captures WHERE thread_id = ? OR workspace_id = ?",
+      [threadId, row.workspace_id],
+    )[0];
+    if (existing) {
+      throw conflict(
+        "capture_already_active",
+        "A managed-work capture is already active for this work or workspace",
+      );
+    }
+  }
+
+  #captureControlByRequest(requestId: string): CaptureControlRow | undefined {
+    return this.database.all<CaptureControlRow>(
+      "SELECT * FROM capture_control_requests WHERE request_id = ?",
+      [requestId],
+    )[0];
+  }
+
+  #captureControlById(controlId: string): CaptureControlRow | undefined {
+    return this.database.all<CaptureControlRow>(
+      "SELECT * FROM capture_control_requests WHERE control_id = ?",
+      [controlId],
+    )[0];
+  }
+
+  #captureControlStatus(row: CaptureControlRow) {
+    const report = row.report_json
+      ? executionCaptureControlReportSchema.parse(JSON.parse(row.report_json))
+      : undefined;
+    return captureControlStatusSchema.parse({
+      contractVersion: CONTRACT_VERSION,
+      requestId: row.request_id,
+      controlId: row.control_id,
+      captureId: row.capture_id,
+      threadId: row.thread_id,
+      target: { nodeId: row.node_id, workspaceId: row.workspace_id },
+      ownershipGeneration: row.ownership_generation,
+      status: row.status,
+      acceptedAt: row.accepted_at,
+      updatedAt: row.updated_at,
+      ...(report?.sourceFence ? { sourceFence: report.sourceFence } : {}),
+      ...(row.error_code ? { errorCode: row.error_code } : {}),
+    });
   }
 
   #isWorkspaceCapturing(workspaceId: string): boolean {
