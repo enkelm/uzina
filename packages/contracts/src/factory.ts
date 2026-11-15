@@ -343,6 +343,161 @@ export const managedWorkCheckpointStatusSchema = z
     }
   });
 
+const workspaceRelocationTargetSchema = factoryTargetSchema.strict();
+const workspaceRelocationErrorCodeSchema = z
+  .string()
+  .regex(/^[a-z0-9][a-z0-9._-]{0,127}$/);
+const workspaceRelocationBindingShape = {
+  contractVersion: z.literal(EXECUTION_CONTRACT_VERSION),
+  relocationId: identifier,
+  requestId: identifier,
+  checkpointRequestId: identifier,
+  captureRequestId: identifier,
+  captureId: executionCaptureIdSchema,
+  workspaceSnapshotRequestId: identifier,
+  snapshotId: identifier,
+  threadId: identifier,
+  source: workspaceRelocationTargetSchema,
+  destination: workspaceRelocationTargetSchema,
+  ownershipGeneration: z.number().int().nonnegative().safe(),
+  manifestReference: z.string().regex(/^[a-f0-9]{64}$/),
+};
+
+export const workspaceRelocationRequestSchema = z
+  .object({
+    ...versioned,
+    requestId: identifier,
+    checkpointRequestId: identifier,
+    destination: workspaceRelocationTargetSchema,
+  })
+  .strict();
+export const workspaceRelocationStatusSchema = z
+  .object({
+    ...workspaceRelocationBindingShape,
+    contractVersion: z.literal(CONTRACT_VERSION),
+    status: z.enum([
+      "queued",
+      "claimed",
+      "prepared-inactive",
+      "blocked",
+      "uncertain",
+    ]),
+    acceptedAt: z.string().datetime(),
+    updatedAt: z.string().datetime(),
+    receiptSha256: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
+    previousReceiptSha256: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
+    errorCode: workspaceRelocationErrorCodeSchema.optional(),
+  })
+  .strict()
+  .superRefine((status, context) => {
+    const terminal = ["prepared-inactive", "blocked", "uncertain"].includes(
+      status.status,
+    );
+    if (terminal !== Boolean(status.receiptSha256)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["receiptSha256"],
+        message: "Terminal relocation status requires its local receipt digest",
+      });
+    }
+    if (
+      status.previousReceiptSha256 !== undefined &&
+      status.status !== "uncertain"
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["previousReceiptSha256"],
+        message: "Only an uncertain relocation may retain a prior receipt",
+      });
+    }
+    if (
+      status.status === "prepared-inactive" &&
+      status.errorCode !== undefined
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["errorCode"],
+        message: "Prepared relocation cannot include an error",
+      });
+    }
+    if (
+      (status.status === "blocked" || status.status === "uncertain") !==
+      Boolean(status.errorCode)
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["errorCode"],
+        message: "Blocked or uncertain relocation requires an error code",
+      });
+    }
+  });
+export const workspaceRelocationClaimRequestSchema = z
+  .object({
+    contractVersion: z.literal(EXECUTION_CONTRACT_VERSION),
+    nodeId: identifier,
+  })
+  .strict();
+export const workspaceRelocationClaimSchema = z
+  .object(workspaceRelocationBindingShape)
+  .strict();
+export const workspaceRelocationClaimResponseSchema = z
+  .object({
+    contractVersion: z.literal(EXECUTION_CONTRACT_VERSION),
+    relocation: workspaceRelocationClaimSchema.nullable(),
+  })
+  .strict();
+export const workspaceRelocationReportSchema = z
+  .object({
+    ...workspaceRelocationBindingShape,
+    status: z.enum(["prepared-inactive", "blocked", "uncertain"]),
+    receiptSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    reportedAt: z.string().datetime(),
+    previousReceiptSha256: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
+    errorCode: workspaceRelocationErrorCodeSchema.optional(),
+  })
+  .strict()
+  .superRefine((report, context) => {
+    if (
+      report.previousReceiptSha256 !== undefined &&
+      report.status !== "uncertain"
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["previousReceiptSha256"],
+        message: "Only an uncertain relocation may retain a prior receipt",
+      });
+    }
+    if (
+      (report.status === "prepared-inactive") !==
+      (report.errorCode === undefined)
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["errorCode"],
+        message:
+          "Only blocked or uncertain relocation reports require an error code",
+      });
+    }
+  });
+export const workspaceRelocationReportResponseSchema = z
+  .object({
+    contractVersion: z.literal(EXECUTION_CONTRACT_VERSION),
+    nodeId: identifier,
+    relocationId: identifier,
+    accepted: z.literal(true),
+    status: z.enum(["prepared-inactive", "blocked", "uncertain"]),
+  })
+  .strict();
+
 export const workspaceSnapshotClaimRequestSchema = z
   .object({
     contractVersion: z.literal(EXECUTION_CONTRACT_VERSION),
@@ -619,6 +774,18 @@ export type WorkspaceSnapshotRequest = z.infer<
 >;
 export type WorkspaceSnapshotStatus = z.infer<
   typeof workspaceSnapshotStatusSchema
+>;
+export type WorkspaceRelocationRequest = z.infer<
+  typeof workspaceRelocationRequestSchema
+>;
+export type WorkspaceRelocationStatus = z.infer<
+  typeof workspaceRelocationStatusSchema
+>;
+export type WorkspaceRelocationClaim = z.infer<
+  typeof workspaceRelocationClaimSchema
+>;
+export type WorkspaceRelocationReport = z.infer<
+  typeof workspaceRelocationReportSchema
 >;
 export type ManagedWorkCheckpointRequest = z.infer<
   typeof managedWorkCheckpointRequestSchema

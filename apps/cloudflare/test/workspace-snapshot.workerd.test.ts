@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import {
   chmod,
   mkdtemp,
@@ -7,13 +8,18 @@ import {
   readFile,
   readdir,
   readlink,
+  realpath,
+  rename,
   rm,
   stat,
+  symlink,
+  watch,
   writeFile,
 } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { Miniflare } from "miniflare";
+import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { buildCloudflareWorkerArtifact } from "../scripts/build-worker";
 import {
@@ -48,7 +54,11 @@ import {
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openBunSqliteStorage } from "../../daemon/src/runtime/sqlite";
 import { ExecutionDaemon } from "../../daemon/src/execution/daemon";
-import { HttpExecutionControllerConnector } from "../../daemon/src/execution/connector";
+import {
+  ControllerTransportError,
+  HttpExecutionControllerConnector,
+  type ExecutionControllerConnector,
+} from "../../daemon/src/execution/connector";
 import { ExecutionLoop } from "../../daemon/src/execution/loop";
 
 type Fixture = {
@@ -125,6 +135,248 @@ async function fetchAndConsume(
   const status = response.status;
   await response.arrayBuffer();
   return status;
+}
+
+async function forwardAndDiscardResponse(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+): Promise<number> {
+  const response = await fetch(input, init);
+  const status = response.status;
+  await response.body?.cancel();
+  return status;
+}
+
+type RelocationReplyDrop = {
+  method: "claimWorkspaceRelocation" | "reportWorkspaceRelocation";
+  matches(result: unknown, args: unknown[]): boolean;
+  afterForward(): Promise<void>;
+};
+
+function withDroppedRelocationReplies(
+  controller: ExecutionControllerConnector,
+  drops: readonly RelocationReplyDrop[],
+): ExecutionControllerConnector {
+  const dropped = new Set<number>();
+  const dropIfConfigured = async (
+    method: string | symbol,
+    result: unknown,
+    args: unknown[],
+  ): Promise<void> => {
+    const index = drops.findIndex(
+      (drop, candidate) =>
+        !dropped.has(candidate) &&
+        method === drop.method &&
+        drop.matches(result, args),
+    );
+    if (index >= 0) {
+      dropped.add(index);
+      await drops[index]!.afterForward();
+      throw new ControllerTransportError();
+    }
+  };
+  return new Proxy(controller, {
+    get(target, property) {
+      const method = Reflect.get(target, property, target);
+      if (typeof method !== "function") return method;
+      if (property === "claimWorkspaceRelocation") {
+        return async () => {
+          const result = await target.claimWorkspaceRelocation();
+          await dropIfConfigured(property, result, []);
+          return result;
+        };
+      }
+      if (property === "reportWorkspaceRelocation") {
+        return async (report: unknown) => {
+          await target.reportWorkspaceRelocation(report);
+          await dropIfConfigured(property, undefined, [report]);
+        };
+      }
+      return method.bind(target);
+    },
+  });
+}
+
+function withInterruptedFirstWorkspaceBlob(
+  controller: ExecutionControllerConnector,
+  waitBeforeFailure: () => Promise<void>,
+  onFailureBoundary: () => void,
+  onResponse: (reference: string, size: number) => void,
+): ExecutionControllerConnector {
+  let interrupted = false;
+  return new Proxy(controller, {
+    get(target, property) {
+      const method = Reflect.get(target, property, target);
+      if (typeof method !== "function") return method;
+      if (property !== "fetchWorkspaceRelocationBlob") {
+        return method.bind(target);
+      }
+      return async (relocationId: string, reference: string) => {
+        const response = await target.fetchWorkspaceRelocationBlob(
+          relocationId,
+          reference,
+        );
+        onResponse(reference, response.size);
+        if (interrupted) return response;
+        interrupted = true;
+        const source = response.body.getReader();
+        let partialDelivered = false;
+        const body = new ReadableStream<Uint8Array>(
+          {
+            async pull(stream) {
+              if (!partialDelivered) {
+                let part = await source.read();
+                while (!part.done && part.value.byteLength === 0) {
+                  part = await source.read();
+                }
+                if (part.done) {
+                  stream.close();
+                  return;
+                }
+                partialDelivered = true;
+                stream.enqueue(part.value.subarray(0, 64).slice());
+                return;
+              }
+              onFailureBoundary();
+              await waitBeforeFailure();
+              await source.cancel().catch(() => {});
+              stream.error(new ControllerTransportError());
+            },
+            async cancel(reason) {
+              await source.cancel(reason).catch(() => {});
+            },
+          },
+          { highWaterMark: 0 },
+        );
+        return { body, size: response.size };
+      };
+    },
+  });
+}
+
+function withCapturedRetryClaim(
+  controller: ExecutionControllerConnector,
+  abort: AbortController,
+  shouldCapture: () => boolean,
+  capture: (claim: unknown) => void,
+): ExecutionControllerConnector {
+  let captured = false;
+  return new Proxy(controller, {
+    get(target, property) {
+      const method = Reflect.get(target, property, target);
+      if (typeof method !== "function") return method;
+      if (property !== "claimWorkspaceRelocation") return method.bind(target);
+      return async () => {
+        const result = await target.claimWorkspaceRelocation();
+        if (result && shouldCapture() && !captured) {
+          captured = true;
+          capture(result);
+          abort.abort();
+        }
+        return result;
+      };
+    },
+  });
+}
+
+async function waitForCreatedFile(path: string): Promise<void> {
+  if (existsSync(path)) return;
+  const abort = new AbortController();
+  const watcher = watch(dirname(path), { signal: abort.signal });
+  const observed = (async () => {
+    for await (const event of watcher) {
+      if (
+        event.filename !== null &&
+        String(event.filename) === basename(path) &&
+        existsSync(path)
+      ) {
+        return;
+      }
+    }
+  })();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      observed,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`Timed out waiting for ${basename(path)}`)),
+          20_000,
+        );
+      }),
+    ]);
+    if (!existsSync(path)) throw new Error(`Expected ${path} to exist`);
+  } finally {
+    if (timer) clearTimeout(timer);
+    abort.abort();
+    await observed.catch(() => {});
+  }
+}
+
+async function assertBlockedRelocationPreflight(options: {
+  databasePath: string;
+  nodeId: string;
+  nodeCredential: string;
+  claim: unknown;
+  expectedErrorCode: string;
+  workspaces: Array<{
+    workspaceId: string;
+    directory: string;
+    ownershipGeneration?: number;
+  }>;
+  snapshotCacheDirectory?: string;
+  beforeExecute?: () => Promise<void>;
+}): Promise<void> {
+  const daemon = new ExecutionDaemon({
+    databasePath: options.databasePath,
+    nodeId: options.nodeId,
+    nodeCredential: options.nodeCredential,
+    workspaces: options.workspaces,
+    ...(options.snapshotCacheDirectory
+      ? { snapshotCacheDirectory: options.snapshotCacheDirectory }
+      : {}),
+  });
+  try {
+    await options.beforeExecute?.();
+    const report = await daemon.executeWorkspaceRelocation(
+      options.claim,
+      async () => {
+        throw new Error("A refused relocation must not fetch blobs");
+      },
+    );
+    expect(report).toMatchObject({
+      status: "blocked",
+      errorCode: options.expectedErrorCode,
+    });
+  } finally {
+    daemon.close();
+  }
+}
+
+function startWorkspaceRelocationChild(env: Record<string, string>) {
+  return Bun.spawn({
+    cmd: [
+      process.execPath,
+      join(import.meta.dir, "workspace-relocation-recovery-child.ts"),
+    ],
+    env,
+    stdout: "pipe",
+    stderr: "pipe",
+    detached: true,
+  });
+}
+
+async function stopOwnedProcessGroup(
+  child: ReturnType<typeof startWorkspaceRelocationChild>,
+): Promise<void> {
+  if (child.pid !== undefined) {
+    try {
+      process.kill(-child.pid, "SIGKILL");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    }
+  }
+  await child.exited.catch(() => {});
 }
 
 function managedWorkCall<T>(
@@ -297,13 +549,21 @@ describe("workspace snapshot transport in production-shaped workerd + R2", () =>
     let daemon: ExecutionDaemon | undefined;
     let abort: AbortController | undefined;
     let loop: Promise<void> | undefined;
+    let destinationDaemon: ExecutionDaemon | undefined;
+    let destinationAbort: AbortController | undefined;
+    let destinationLoop: Promise<void> | undefined;
     const fixture: Fixture = {
       directory,
       miniflare,
       async close() {
         abort?.abort();
-        await loop?.catch(() => {});
+        destinationAbort?.abort();
+        await Promise.all([
+          loop?.catch(() => {}),
+          destinationLoop?.catch(() => {}),
+        ]);
         daemon?.close();
+        destinationDaemon?.close();
         await miniflare.dispose();
       },
     };
@@ -1174,6 +1434,1627 @@ describe("workspace snapshot transport in production-shaped workerd + R2", () =>
       requestId: coherentRequest.requestId,
     });
     expect(checkpointStatus.value.manifestReference).toMatch(/^[a-f0-9]{64}$/);
+
+    const destinationNode = await call<{
+      node: { nodeId: string };
+      credential: string;
+    }>(baseUrl, "/v1/nodes", {
+      credential: owner,
+      body: {
+        nodeId: "node:relocation-destination",
+        name: "Offline relocation destination",
+      },
+    });
+    const destinationWorkspace = await call<{ workspaceId: string }>(
+      baseUrl,
+      "/v1/workspaces",
+      {
+        credential: owner,
+        body: {
+          workspaceId: "workspace:relocation-destination",
+          nodeId: destinationNode.value.node.nodeId,
+          name: "Relocation destination",
+        },
+      },
+    );
+    const busyDestinationWorkspace = await call<{ workspaceId: string }>(
+      baseUrl,
+      "/v1/workspaces",
+      {
+        credential: owner,
+        body: {
+          workspaceId: "workspace:relocation-busy",
+          nodeId: destinationNode.value.node.nodeId,
+          name: "Occupied relocation destination",
+        },
+      },
+    );
+    const unrelatedDestinationWorkspace = await call<{
+      workspaceId: string;
+    }>(baseUrl, "/v1/workspaces", {
+      credential: owner,
+      body: {
+        workspaceId: "workspace:relocation-unrelated",
+        nodeId: destinationNode.value.node.nodeId,
+        name: "Unrelated destination workspace",
+      },
+    });
+    const busyDestinationThread = await call<{ threadId: string }>(
+      baseUrl,
+      "/v1/threads",
+      {
+        credential: owner,
+        body: {
+          threadId: "thread:relocation-busy",
+          projectId: project.value.projectId,
+          title: "Existing unrelated destination assignment",
+          target: {
+            nodeId: destinationNode.value.node.nodeId,
+            workspaceId: busyDestinationWorkspace.value.workspaceId,
+          },
+        },
+      },
+    );
+    expect(busyDestinationThread.response.status).toBe(201);
+    const relocationPath = `/v1/threads/${thread.value.threadId}/workspace-relocations`;
+    const relocationRequest = {
+      contractVersion: 1,
+      requestId: "relocation:workerd-coherent-source",
+      checkpointRequestId: coherentRequest.requestId,
+      destination: {
+        nodeId: destinationNode.value.node.nodeId,
+        workspaceId: destinationWorkspace.value.workspaceId,
+      },
+    };
+    const nonStrictRelocationRequest = await call<{ error: string }>(
+      baseUrl,
+      relocationPath,
+      {
+        credential: owner,
+        body: { ...relocationRequest, actor: { kind: "human" } },
+      },
+    );
+    expect(nonStrictRelocationRequest.response.status).toBe(400);
+    const sameNodeRelocation = await call<{ error: string }>(
+      baseUrl,
+      relocationPath,
+      {
+        credential: owner,
+        body: {
+          ...relocationRequest,
+          requestId: "relocation:same-source-node",
+          destination: {
+            nodeId: node.value.node.nodeId,
+            workspaceId: recoveryWorkspaceRecord.value.workspaceId,
+          },
+        },
+      },
+    );
+    expect(sameNodeRelocation.response.status).toBe(409);
+    const busyRelocation = await call<{ error: string }>(
+      baseUrl,
+      relocationPath,
+      {
+        credential: owner,
+        body: {
+          ...relocationRequest,
+          requestId: "relocation:busy-destination",
+          destination: {
+            nodeId: destinationNode.value.node.nodeId,
+            workspaceId: busyDestinationWorkspace.value.workspaceId,
+          },
+        },
+      },
+    );
+    expect(busyRelocation.response.status).toBe(409);
+    const wrongThreadRelocation = await call<{ error: string }>(
+      baseUrl,
+      "/v1/threads/thread:wrong-relocation-thread/workspace-relocations",
+      { credential: owner, body: relocationRequest },
+    );
+    expect(wrongThreadRelocation.response.status).toBe(409);
+    await stopExecutionLoop();
+    const evictFactory = async () => {
+      const factoryNamespace = (await miniflare.getDurableObjectNamespace(
+        "FACTORY",
+      )) as unknown as FactoryNamespace;
+      await miniflare.unsafeEvictDurableObject(
+        "uzina-workspace-snapshot",
+        "CaptureTestFactory",
+        {
+          id: factoryNamespace.idFromName("uzina-single-factory").toString(),
+        },
+      );
+    };
+    const legacyRelocationColumns = await call<string[]>(
+      baseUrl,
+      "/__test/workspace-relocation-schema",
+      { body: { action: "drop-history-columns" } },
+    );
+    expect(legacyRelocationColumns.value).not.toContain("previous_report_json");
+    expect(legacyRelocationColumns.value).not.toContain(
+      "previous_report_sha256",
+    );
+    expect(legacyRelocationColumns.value).not.toContain(
+      "previous_receipt_sha256",
+    );
+    await evictFactory();
+    const reopenedRelocationColumns = await call<string[]>(
+      baseUrl,
+      "/__test/workspace-relocation-schema",
+      { body: { action: "read" } },
+    );
+    expect(reopenedRelocationColumns.value).toContain("previous_report_json");
+    expect(reopenedRelocationColumns.value).toContain("previous_report_sha256");
+    expect(reopenedRelocationColumns.value).toContain(
+      "previous_receipt_sha256",
+    );
+    const lostOwnerAdmissionStatus = await forwardAndDiscardResponse(
+      new URL(relocationPath, baseUrl),
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${owner}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(relocationRequest),
+      },
+    );
+    expect(lostOwnerAdmissionStatus).toBe(202);
+    await evictFactory();
+    const relocationAdmission = await call<{
+      relocationId: string;
+      requestId: string;
+      checkpointRequestId: string;
+      captureRequestId: string;
+      captureId: string;
+      workspaceSnapshotRequestId: string;
+      snapshotId: string;
+      source: { nodeId: string; workspaceId: string };
+      destination: { nodeId: string; workspaceId: string };
+      ownershipGeneration: number;
+      manifestReference: string;
+      status: string;
+      acceptedAt: string;
+      updatedAt: string;
+    }>(baseUrl, relocationPath, {
+      credential: owner,
+      body: relocationRequest,
+    });
+    expect(relocationAdmission.response.status).toBe(202);
+    expect(relocationAdmission.value).toMatchObject({
+      requestId: relocationRequest.requestId,
+      checkpointRequestId: coherentRequest.requestId,
+      captureRequestId: sourceAdmission.value.requestId,
+      captureId: sourceAdmission.value.captureId,
+      workspaceSnapshotRequestId: snapshotAdmission.value.requestId,
+      snapshotId: snapshotAdmission.value.snapshotId,
+      threadId: thread.value.threadId,
+      source: {
+        nodeId: node.value.node.nodeId,
+        workspaceId: workspaceRecord.value.workspaceId,
+      },
+      destination: relocationRequest.destination,
+      ownershipGeneration: thread.value.ownershipGeneration,
+      manifestReference: status.value.manifestReference,
+      status: "queued",
+    });
+    expect(relocationAdmission.value.acceptedAt).toBe(
+      relocationAdmission.value.updatedAt,
+    );
+    expect(relocationAdmission.value.relocationId).toMatch(
+      /^workspace-relocation:/,
+    );
+    const relocationStatusPath = `/v1/workspace-relocations/${relocationRequest.requestId}`;
+    const relocationRetry = await call<Record<string, unknown>>(
+      baseUrl,
+      relocationPath,
+      { credential: owner, body: relocationRequest },
+    );
+    expect(relocationRetry.value).toEqual(relocationAdmission.value);
+    const relocationOwnerStatus = await call<Record<string, unknown>>(
+      baseUrl,
+      relocationStatusPath,
+      { credential: owner },
+    );
+    expect(relocationOwnerStatus.value).toEqual(relocationAdmission.value);
+    const nodeRelocationStatus = await call<{ error: string }>(
+      baseUrl,
+      relocationStatusPath,
+      { credential: destinationNode.value.credential },
+    );
+    expect(nodeRelocationStatus.response.status).toBe(403);
+    const conflictingRelocationRequest = await call<{ error: string }>(
+      baseUrl,
+      relocationPath,
+      {
+        credential: owner,
+        body: {
+          ...relocationRequest,
+          destination: {
+            nodeId: destinationNode.value.node.nodeId,
+            workspaceId: unrelatedDestinationWorkspace.value.workspaceId,
+          },
+        },
+      },
+    );
+    expect(conflictingRelocationRequest.response.status).toBe(409);
+    const secondRelocationForCheckpoint = await call<{ error: string }>(
+      baseUrl,
+      relocationPath,
+      {
+        credential: owner,
+        body: {
+          ...relocationRequest,
+          requestId: "relocation:second-for-same-checkpoint",
+          destination: {
+            nodeId: destinationNode.value.node.nodeId,
+            workspaceId: unrelatedDestinationWorkspace.value.workspaceId,
+          },
+        },
+      },
+    );
+    expect(secondRelocationForCheckpoint.response.status).toBe(409);
+    const reservedDestinationThread = await call<{ error: string }>(
+      baseUrl,
+      "/v1/threads",
+      {
+        credential: owner,
+        body: {
+          threadId: "thread:relocation-reserved-destination",
+          projectId: project.value.projectId,
+          title: "Must not use reserved destination",
+          target: relocationRequest.destination,
+        },
+      },
+    );
+    expect(reservedDestinationThread.response.status).toBe(409);
+    const unrelatedDestinationThread = await call<{ threadId: string }>(
+      baseUrl,
+      "/v1/threads",
+      {
+        credential: owner,
+        body: {
+          threadId: "thread:relocation-unrelated-destination",
+          projectId: project.value.projectId,
+          title: "Unrelated destination remains available",
+          target: {
+            nodeId: destinationNode.value.node.nodeId,
+            workspaceId: unrelatedDestinationWorkspace.value.workspaceId,
+          },
+        },
+      },
+    );
+    expect(unrelatedDestinationThread.response.status).toBe(201);
+    const relocationClaimPath = `/v1/nodes/${destinationNode.value.node.nodeId}/workspace-relocations/claim`;
+    const nonStrictRelocationClaim = await call<{ error: string }>(
+      baseUrl,
+      relocationClaimPath,
+      {
+        credential: destinationNode.value.credential,
+        body: {
+          contractVersion: 1,
+          nodeId: destinationNode.value.node.nodeId,
+          workspaceId: "workspace:anything",
+        },
+      },
+    );
+    expect(nonStrictRelocationClaim.response.status).toBe(400);
+    const relocationReportPath = `/v1/nodes/${destinationNode.value.node.nodeId}/workspace-relocations/${relocationAdmission.value.relocationId}/report`;
+    const nonStrictRelocationReport = await call<{ error: string }>(
+      baseUrl,
+      relocationReportPath,
+      {
+        credential: destinationNode.value.credential,
+        body: {
+          contractVersion: 1,
+          relocationId: relocationAdmission.value.relocationId,
+          actor: { kind: "node", nodeId: destinationNode.value.node.nodeId },
+        },
+      },
+    );
+    expect(nonStrictRelocationReport.response.status).toBe(400);
+    const offlineDestinationClaim = await call<{ relocation: unknown }>(
+      baseUrl,
+      relocationClaimPath,
+      {
+        credential: destinationNode.value.credential,
+        body: { contractVersion: 1, nodeId: destinationNode.value.node.nodeId },
+      },
+    );
+    expect(offlineDestinationClaim.response.status).toBe(200);
+    expect(offlineDestinationClaim.value.relocation).toBeNull();
+    const sourceNodeRead = await fetch(
+      new URL(
+        `/v1/nodes/${destinationNode.value.node.nodeId}/workspace-relocations/${relocationAdmission.value.relocationId}/blobs/${status.value.manifestReference}`,
+        baseUrl,
+      ),
+      { headers: { authorization: `Bearer ${node.value.credential}` } },
+    );
+    expect(sourceNodeRead.status).toBe(403);
+    await sourceNodeRead.body?.cancel();
+    const unclaimedDestinationRead = await fetch(
+      new URL(
+        `/v1/nodes/${destinationNode.value.node.nodeId}/workspace-relocations/${relocationAdmission.value.relocationId}/blobs/${status.value.manifestReference}`,
+        baseUrl,
+      ),
+      {
+        headers: {
+          authorization: `Bearer ${destinationNode.value.credential}`,
+        },
+      },
+    );
+    expect(unclaimedDestinationRead.status).toBe(404);
+    await unclaimedDestinationRead.body?.cancel();
+    const privateCheckpointNodeRead = await fetch(
+      new URL(
+        `/v1/managed-work-checkpoints/${coherentRequest.requestId}/blobs/${checkpointStatus.value.manifestReference}`,
+        baseUrl,
+      ),
+      {
+        headers: {
+          authorization: `Bearer ${destinationNode.value.credential}`,
+        },
+      },
+    );
+    expect(privateCheckpointNodeRead.status).toBe(403);
+    await privateCheckpointNodeRead.body?.cancel();
+
+    const destinationDirectory = join(directory, "destination-workspace");
+    const destinationDatabasePath = join(directory, "destination-node.sqlite");
+    await mkdir(destinationDirectory);
+    destinationDaemon = new ExecutionDaemon({
+      databasePath: destinationDatabasePath,
+      nodeId: destinationNode.value.node.nodeId,
+      nodeCredential: destinationNode.value.credential,
+      workspaces: [
+        {
+          workspaceId: destinationWorkspace.value.workspaceId,
+          directory: destinationDirectory,
+        },
+      ],
+    });
+    let droppedDestinationClaimAcknowledgement = false;
+    let droppedPreparedReportAcknowledgement = false;
+    let lostClaimRelocationId: string | undefined;
+    const destinationController = withDroppedRelocationReplies(
+      new HttpExecutionControllerConnector({
+        controllerUrl: baseUrl,
+        nodeId: destinationNode.value.node.nodeId,
+        credential: destinationNode.value.credential,
+      }),
+      [
+        {
+          method: "claimWorkspaceRelocation",
+          matches: (result) => {
+            if (
+              typeof result !== "object" ||
+              result === null ||
+              !("relocationId" in result) ||
+              typeof result.relocationId !== "string"
+            ) {
+              return false;
+            }
+            lostClaimRelocationId = result.relocationId;
+            return true;
+          },
+          async afterForward() {
+            droppedDestinationClaimAcknowledgement = true;
+            await evictFactory();
+          },
+        },
+        {
+          method: "reportWorkspaceRelocation",
+          matches: (_result, args) =>
+            typeof args[0] === "object" &&
+            args[0] !== null &&
+            "status" in args[0] &&
+            args[0].status === "prepared-inactive",
+          async afterForward() {
+            droppedPreparedReportAcknowledgement = true;
+            await evictFactory();
+          },
+        },
+      ],
+    );
+
+    let signalPartialStreamBoundary!: () => void;
+    const partialStreamBoundary = new Promise<void>((resolve) => {
+      signalPartialStreamBoundary = resolve;
+    });
+    let releasePartialStreamFailure!: () => void;
+    const partialStreamFailureGate = new Promise<void>((resolve) => {
+      releasePartialStreamFailure = resolve;
+    });
+    let interruptedBlob: { reference: string; size: number } | undefined;
+    const interruptedDownloadController = withInterruptedFirstWorkspaceBlob(
+      destinationController,
+      () => partialStreamFailureGate,
+      () => signalPartialStreamBoundary(),
+      (reference, size) => {
+        if (!interruptedBlob) interruptedBlob = { reference, size };
+      },
+    );
+    let captureNextClaim = false;
+    let captureRetriedClaim!: (claim: unknown) => void;
+    const retriedClaimPromise = new Promise<unknown>((resolve) => {
+      captureRetriedClaim = resolve;
+    });
+    destinationAbort = new AbortController();
+    destinationLoop = new ExecutionLoop({
+      daemon: destinationDaemon,
+      controller: withCapturedRetryClaim(
+        interruptedDownloadController,
+        destinationAbort,
+        () => captureNextClaim,
+        captureRetriedClaim,
+      ),
+      pollIntervalMs: 20,
+      heartbeatIntervalMs: 30_000,
+    }).run(destinationAbort.signal);
+    await until(async () => {
+      const nodes = await call<{
+        nodes: Array<{ nodeId: string; availability: string }>;
+      }>(baseUrl, "/v1/nodes", { credential: owner });
+      return nodes.value.nodes.some(
+        (candidate) =>
+          candidate.nodeId === destinationNode.value.node.nodeId &&
+          candidate.availability === "online",
+      );
+    });
+    await partialStreamBoundary;
+    try {
+      const partialReceiptDb = new Database(destinationDatabasePath, {
+        readonly: true,
+      });
+      let partialReceipt:
+        | {
+            status: string;
+            stage: string;
+            cache_directory: string | null;
+            report_json: string | null;
+          }
+        | null
+        | undefined;
+      try {
+        partialReceipt = partialReceiptDb
+          .query<
+            {
+              status: string;
+              stage: string;
+              cache_directory: string | null;
+              report_json: string | null;
+            },
+            [string]
+          >(
+            `SELECT status, stage, cache_directory, report_json
+             FROM execution_workspace_relocations WHERE relocation_id = ?`,
+          )
+          .get(relocationAdmission.value.relocationId);
+      } finally {
+        partialReceiptDb.close();
+      }
+      expect(partialReceipt).toMatchObject({
+        status: "preparing",
+        stage: "downloading",
+        report_json: null,
+      });
+      expect(interruptedBlob).toMatchObject({
+        reference: status.value.manifestReference,
+      });
+      expect(interruptedBlob!.size).toBeGreaterThan(64);
+      expect(await readdir(destinationDirectory)).toEqual([]);
+      const partialFiles = (
+        await readdir(partialReceipt!.cache_directory!)
+      ).filter((name) => name.endsWith(".part"));
+      expect(partialFiles).toHaveLength(1);
+      const partialFile = await stat(
+        join(partialReceipt!.cache_directory!, partialFiles[0]!),
+      );
+      expect(partialFile.size).toBe(64);
+      expect(partialFile.size).toBeLessThan(interruptedBlob!.size);
+      const ownerStillClaimed = await call<{ status: string }>(
+        baseUrl,
+        relocationStatusPath,
+        { credential: owner },
+      );
+      expect(ownerStillClaimed.value.status).toBe("claimed");
+    } finally {
+      captureNextClaim = true;
+      releasePartialStreamFailure();
+    }
+    const retriedClaim = (await retriedClaimPromise) as {
+      relocationId: string;
+      requestId: string;
+      destination: { nodeId: string; workspaceId: string };
+      ownershipGeneration: number;
+      manifestReference: string;
+    };
+    expect(retriedClaim).toMatchObject({
+      relocationId: relocationAdmission.value.relocationId,
+      requestId: relocationAdmission.value.requestId,
+      destination: relocationAdmission.value.destination,
+      ownershipGeneration: thread.value.ownershipGeneration,
+      manifestReference: status.value.manifestReference,
+    });
+    await destinationLoop?.catch(() => {});
+    destinationLoop = undefined;
+    destinationAbort = undefined;
+    destinationDaemon.close();
+    destinationDaemon = undefined;
+    expect(droppedDestinationClaimAcknowledgement).toBe(true);
+    expect(lostClaimRelocationId).toBe(retriedClaim.relocationId);
+    const retryReceiptDb = new Database(destinationDatabasePath, {
+      readonly: true,
+    });
+    let retryReceipt:
+      | {
+          stage: string;
+          cache_directory: string | null;
+          report_json: string | null;
+        }
+      | null
+      | undefined;
+    try {
+      retryReceipt = retryReceiptDb
+        .query<
+          {
+            stage: string;
+            cache_directory: string | null;
+            report_json: string | null;
+          },
+          [string]
+        >(
+          `SELECT stage, cache_directory, report_json
+           FROM execution_workspace_relocations WHERE relocation_id = ?`,
+        )
+        .get(retriedClaim.relocationId);
+    } finally {
+      retryReceiptDb.close();
+    }
+    expect(retryReceipt).toMatchObject({
+      stage: "downloading",
+      report_json: null,
+    });
+    expect(await readdir(retryReceipt!.cache_directory!)).toEqual([]);
+    expect(await readdir(destinationDirectory)).toEqual([]);
+
+    const preflightDirectory = join(directory, "relocation-preflight");
+    await mkdir(preflightDirectory);
+    const preflightWorkspace = (
+      workspaceId: string,
+      directoryPath: string,
+    ) => ({
+      workspaceId,
+      directory: directoryPath,
+      ownershipGeneration: retriedClaim.ownershipGeneration,
+    });
+    const preflightDatabase = (name: string) =>
+      join(preflightDirectory, `${name}.sqlite`);
+    await assertBlockedRelocationPreflight({
+      databasePath: preflightDatabase("missing-mapping"),
+      nodeId: destinationNode.value.node.nodeId,
+      nodeCredential: destinationNode.value.credential,
+      claim: retriedClaim,
+      expectedErrorCode: "workspace_not_configured",
+      workspaces: [],
+    });
+    const missingRoot = join(preflightDirectory, "missing-root");
+    expect(
+      () =>
+        new ExecutionDaemon({
+          databasePath: preflightDatabase("missing-root"),
+          nodeId: destinationNode.value.node.nodeId,
+          nodeCredential: destinationNode.value.credential,
+          workspaces: [
+            preflightWorkspace(
+              destinationWorkspace.value.workspaceId,
+              missingRoot,
+            ),
+          ],
+        }),
+    ).toThrow();
+    expect(existsSync(missingRoot)).toBe(false);
+
+    const nonemptyRoot = join(preflightDirectory, "nonempty-root");
+    await mkdir(nonemptyRoot);
+    await writeFile(join(nonemptyRoot, "operator-data.txt"), "preserve me");
+    await assertBlockedRelocationPreflight({
+      databasePath: preflightDatabase("nonempty"),
+      nodeId: destinationNode.value.node.nodeId,
+      nodeCredential: destinationNode.value.credential,
+      claim: retriedClaim,
+      expectedErrorCode: "workspace_relocation_destination_not_empty",
+      workspaces: [
+        preflightWorkspace(
+          destinationWorkspace.value.workspaceId,
+          nonemptyRoot,
+        ),
+      ],
+    });
+    expect(
+      await readFile(join(nonemptyRoot, "operator-data.txt"), "utf8"),
+    ).toBe("preserve me");
+
+    const symlinkRoot = join(preflightDirectory, "symlink-root");
+    const symlinkRootMoved = join(preflightDirectory, "symlink-root-moved");
+    const symlinkTarget = join(preflightDirectory, "symlink-target");
+    await mkdir(symlinkRoot);
+    await mkdir(symlinkTarget);
+    await assertBlockedRelocationPreflight({
+      databasePath: preflightDatabase("symlink-swap"),
+      nodeId: destinationNode.value.node.nodeId,
+      nodeCredential: destinationNode.value.credential,
+      claim: retriedClaim,
+      expectedErrorCode: "workspace_relocation_destination_path_invalid",
+      workspaces: [
+        preflightWorkspace(destinationWorkspace.value.workspaceId, symlinkRoot),
+      ],
+      beforeExecute: async () => {
+        await rename(symlinkRoot, symlinkRootMoved);
+        await symlink(symlinkTarget, symlinkRoot);
+      },
+    });
+    expect(await readdir(symlinkTarget)).toEqual([]);
+
+    const overlapParent = join(preflightDirectory, "overlap-parent");
+    const overlapDestination = join(overlapParent, "destination");
+    await mkdir(overlapDestination, { recursive: true });
+    await assertBlockedRelocationPreflight({
+      databasePath: preflightDatabase("nested-overlap"),
+      nodeId: destinationNode.value.node.nodeId,
+      nodeCredential: destinationNode.value.credential,
+      claim: retriedClaim,
+      expectedErrorCode: "workspace_relocation_destination_overlap",
+      workspaces: [
+        preflightWorkspace(
+          destinationWorkspace.value.workspaceId,
+          overlapDestination,
+        ),
+        preflightWorkspace(
+          "workspace:relocation-overlap-parent",
+          overlapParent,
+        ),
+      ],
+    });
+
+    const aliasRoot = join(preflightDirectory, "alias-root");
+    await mkdir(aliasRoot);
+    await assertBlockedRelocationPreflight({
+      databasePath: preflightDatabase("alias-overlap"),
+      nodeId: destinationNode.value.node.nodeId,
+      nodeCredential: destinationNode.value.credential,
+      claim: retriedClaim,
+      expectedErrorCode: "workspace_relocation_destination_overlap",
+      workspaces: [
+        preflightWorkspace(destinationWorkspace.value.workspaceId, aliasRoot),
+        preflightWorkspace("workspace:relocation-preflight-alias", aliasRoot),
+      ],
+    });
+
+    const cacheOverlapRoot = join(preflightDirectory, "cache-overlap-root");
+    await mkdir(cacheOverlapRoot);
+    await assertBlockedRelocationPreflight({
+      databasePath: preflightDatabase("cache-overlap"),
+      nodeId: destinationNode.value.node.nodeId,
+      nodeCredential: destinationNode.value.credential,
+      claim: retriedClaim,
+      expectedErrorCode: "workspace_relocation_cache_overlap",
+      workspaces: [
+        preflightWorkspace(
+          destinationWorkspace.value.workspaceId,
+          cacheOverlapRoot,
+        ),
+      ],
+      snapshotCacheDirectory: join(cacheOverlapRoot, "private-cache"),
+    });
+
+    const databaseCacheRoot = join(preflightDirectory, "database-cache-root");
+    const databaseCacheDirectory = join(
+      databaseCacheRoot,
+      "workspace-relocations",
+      createHash("sha256").update(retriedClaim.relocationId).digest("hex"),
+    );
+    await mkdir(databaseCacheDirectory, { recursive: true, mode: 0o700 });
+    await chmod(databaseCacheRoot, 0o700);
+    await chmod(join(databaseCacheRoot, "workspace-relocations"), 0o700);
+    await chmod(databaseCacheDirectory, 0o700);
+    const databaseOverlapDestination = join(
+      preflightDirectory,
+      "database-overlap-destination",
+    );
+    await mkdir(databaseOverlapDestination);
+    await assertBlockedRelocationPreflight({
+      databasePath: join(databaseCacheDirectory, "daemon.sqlite"),
+      nodeId: destinationNode.value.node.nodeId,
+      nodeCredential: destinationNode.value.credential,
+      claim: retriedClaim,
+      expectedErrorCode: "workspace_relocation_database_overlap",
+      workspaces: [
+        preflightWorkspace(
+          destinationWorkspace.value.workspaceId,
+          databaseOverlapDestination,
+        ),
+      ],
+      snapshotCacheDirectory: databaseCacheRoot,
+    });
+
+    const exerciseCorruptLocalCache = async (
+      name: string,
+      corrupt: "manifest" | "workspace-blob" | "workspace-blob-size",
+    ) => {
+      const localRoot = join(preflightDirectory, `${name}-destination`);
+      const localDatabasePath = preflightDatabase(name);
+      await mkdir(localRoot);
+      const cacheDirectory = join(
+        `${localDatabasePath}.snapshot-cache`,
+        "workspace-relocations",
+        createHash("sha256").update(retriedClaim.relocationId).digest("hex"),
+      );
+      const controller = new HttpExecutionControllerConnector({
+        controllerUrl: baseUrl,
+        nodeId: destinationNode.value.node.nodeId,
+        credential: destinationNode.value.credential,
+      });
+      const requestedReferences: string[] = [];
+      let corruptionCreated = false;
+      let corruptReference = retriedClaim.manifestReference;
+      let corruptBytes: Buffer | undefined;
+      const fetchBlob = async (relocationId: string, reference: string) => {
+        if (
+          corrupt === "manifest" &&
+          !corruptionCreated &&
+          reference !== retriedClaim.manifestReference
+        ) {
+          corruptBytes = Buffer.from("corrupt manifest cache evidence");
+          await writeFile(
+            join(cacheDirectory, retriedClaim.manifestReference),
+            corruptBytes,
+            { mode: 0o600 },
+          );
+          corruptionCreated = true;
+          throw new ControllerTransportError();
+        }
+        const response = await controller.fetchWorkspaceRelocationBlob(
+          relocationId,
+          reference,
+        );
+        requestedReferences.push(reference);
+        if (
+          corrupt !== "manifest" &&
+          !corruptionCreated &&
+          reference !== retriedClaim.manifestReference
+        ) {
+          const validBytes = Buffer.from(
+            await new Response(response.body).arrayBuffer(),
+          );
+          if (validBytes.byteLength === 0)
+            throw new Error("Expected a non-empty workspace blob");
+          corruptBytes =
+            corrupt === "workspace-blob-size"
+              ? Buffer.concat([validBytes, Buffer.from([0])])
+              : Buffer.from(validBytes);
+          if (corrupt === "workspace-blob") {
+            corruptBytes[0] = corruptBytes[0]! ^ 0xff;
+          }
+          corruptReference = reference;
+          await writeFile(
+            join(cacheDirectory, corruptReference),
+            corruptBytes,
+            { mode: 0o600 },
+          );
+          corruptionCreated = true;
+          throw new ControllerTransportError();
+        }
+        return response;
+      };
+      const daemon = new ExecutionDaemon({
+        databasePath: localDatabasePath,
+        nodeId: destinationNode.value.node.nodeId,
+        nodeCredential: destinationNode.value.credential,
+        workspaces: [
+          preflightWorkspace(destinationWorkspace.value.workspaceId, localRoot),
+        ],
+      });
+      try {
+        await expect(
+          daemon.executeWorkspaceRelocation(retriedClaim, fetchBlob),
+        ).rejects.toBeInstanceOf(ControllerTransportError);
+        expect(corruptionCreated).toBe(true);
+        if (!corruptBytes)
+          throw new Error("Corrupt cache fixture did not create bytes");
+        const expectedCorruptHex = Buffer.from(corruptBytes).toString("hex");
+        const localStateDb = new Database(localDatabasePath, {
+          readonly: true,
+        });
+        let localState:
+          | { status: string; stage: string; report_json: string | null }
+          | null
+          | undefined;
+        try {
+          localState = localStateDb
+            .query<
+              { status: string; stage: string; report_json: string | null },
+              [string]
+            >(
+              `SELECT status, stage, report_json
+               FROM execution_workspace_relocations WHERE relocation_id = ?`,
+            )
+            .get(retriedClaim.relocationId);
+        } finally {
+          localStateDb.close();
+        }
+        expect(localState).toMatchObject({
+          status: "preparing",
+          stage: "downloading",
+          report_json: null,
+        });
+        expect(await readdir(localRoot)).toEqual([]);
+        const corruptedBeforeRetry = await readFile(
+          join(cacheDirectory, corruptReference),
+        );
+        expect(corruptedBeforeRetry.toString("hex")).toBe(expectedCorruptHex);
+        const corruptReferenceFetchesBeforeRetry = requestedReferences.filter(
+          (reference) => reference === corruptReference,
+        ).length;
+        expect(corruptReferenceFetchesBeforeRetry).toBe(1);
+
+        const blocked = await daemon.executeWorkspaceRelocation(
+          retriedClaim,
+          fetchBlob,
+        );
+        expect(blocked.status).toBe("blocked");
+        expect(blocked.errorCode).toBe(
+          corrupt === "manifest"
+            ? "workspace_relocation_cache_hash_mismatch"
+            : corrupt === "workspace-blob-size"
+              ? "workspace_relocation_cache_size_mismatch"
+              : "workspace_relocation_checkpoint_invalid",
+        );
+        expect(
+          requestedReferences.filter(
+            (reference) => reference === corruptReference,
+          ),
+        ).toHaveLength(corruptReferenceFetchesBeforeRetry);
+        expect(
+          (await readFile(join(cacheDirectory, corruptReference))).toString(
+            "hex",
+          ),
+        ).toBe(expectedCorruptHex);
+        expect(await readdir(localRoot)).toEqual([]);
+      } finally {
+        daemon.close();
+      }
+    };
+    await exerciseCorruptLocalCache("corrupt-manifest", "manifest");
+    await exerciseCorruptLocalCache("corrupt-workspace-blob", "workspace-blob");
+    await exerciseCorruptLocalCache(
+      "wrong-size-workspace-blob",
+      "workspace-blob-size",
+    );
+
+    const realGitPath = execFileSync("which", ["git"], {
+      encoding: "utf8",
+    }).trim();
+    const partialCrashDirectory = join(directory, "partial-restore-crash");
+    const partialDestination = join(partialCrashDirectory, "destination");
+    const partialDatabasePath = join(
+      partialCrashDirectory,
+      "destination-node.sqlite",
+    );
+    await mkdir(partialDestination, { recursive: true });
+    const partialBarrierDirectory = join(partialCrashDirectory, "barrier");
+    const partialGitShimDirectory = join(partialBarrierDirectory, "git-bin");
+    await mkdir(partialGitShimDirectory, { recursive: true });
+    const partialEnteredPath = join(partialBarrierDirectory, "entered");
+    const partialOutputPath = join(partialBarrierDirectory, "git-output");
+    const partialReleasePath = join(partialBarrierDirectory, "release");
+    const partialGitShimPath = join(partialGitShimDirectory, "git");
+    execFileSync("mkfifo", [partialReleasePath]);
+    await writeFile(
+      partialGitShimPath,
+      `#!/bin/sh
+set -e
+case "$PWD" in
+  "$UZINA_RELOCATION_TEST_STAGING_PARENT"/.uzina-restore-*)
+    if [ "$1" = "diff" ] && [ "$2" = "--cached" ] &&
+       [ "$3" = "--name-only" ] && [ "$4" = "-z" ] &&
+       [ "$5" = "--no-renames" ] && [ "$6" = "HEAD" ]; then
+      set +e
+      "$UZINA_RELOCATION_TEST_REAL_GIT" "$@" > "$UZINA_RELOCATION_TEST_GIT_OUTPUT"
+      status=$?
+      set -e
+      : > "$UZINA_RELOCATION_TEST_GIT_ENTERED"
+      IFS= read -r release < "$UZINA_RELOCATION_TEST_GIT_RELEASE"
+      cat "$UZINA_RELOCATION_TEST_GIT_OUTPUT"
+      exit "$status"
+    fi
+    ;;
+esac
+exec "$UZINA_RELOCATION_TEST_REAL_GIT" "$@"
+`,
+    );
+    await chmod(partialGitShimPath, 0o755);
+    const partialGitBarrierWait = waitForCreatedFile(partialEnteredPath);
+    let interruptedStaging: string | undefined;
+    const partialRestoreChild = startWorkspaceRelocationChild({
+      PATH: `${partialGitShimDirectory}:${process.env.PATH ?? ""}`,
+      HOME: process.env.HOME ?? tmpdir(),
+      TMPDIR: process.env.TMPDIR ?? tmpdir(),
+      UZINA_RELOCATION_TEST_CLAIM: JSON.stringify(retriedClaim),
+      UZINA_RELOCATION_TEST_DATABASE: partialDatabasePath,
+      UZINA_RELOCATION_TEST_WORKSPACE: partialDestination,
+      UZINA_RELOCATION_TEST_CONTROLLER: baseUrl,
+      UZINA_RELOCATION_TEST_NODE_ID: destinationNode.value.node.nodeId,
+      UZINA_RELOCATION_TEST_NODE_CREDENTIAL: destinationNode.value.credential,
+      UZINA_RELOCATION_TEST_GIT_CWD: "unused",
+      UZINA_RELOCATION_TEST_GIT_OUTPUT: partialOutputPath,
+      UZINA_RELOCATION_TEST_GIT_ENTERED: partialEnteredPath,
+      UZINA_RELOCATION_TEST_GIT_RELEASE: partialReleasePath,
+      UZINA_RELOCATION_TEST_REAL_GIT: realGitPath,
+      UZINA_RELOCATION_TEST_STAGING_PARENT: await realpath(
+        partialCrashDirectory,
+      ),
+    });
+    try {
+      await Promise.race([
+        partialGitBarrierWait,
+        partialRestoreChild.exited.then(async (exitCode) => {
+          const output = await new Response(partialRestoreChild.stdout).text();
+          throw new Error(
+            `Partial relocation child exited before restore barrier (${exitCode}): ${output}`,
+          );
+        }),
+      ]);
+      const partialStateDb = new Database(partialDatabasePath, {
+        readonly: true,
+      });
+      let partialState:
+        | { status: string; stage: string; report_json: string | null }
+        | null
+        | undefined;
+      try {
+        partialState = partialStateDb
+          .query<
+            { status: string; stage: string; report_json: string | null },
+            [string]
+          >(
+            `SELECT status, stage, report_json
+             FROM execution_workspace_relocations WHERE relocation_id = ?`,
+          )
+          .get(retriedClaim.relocationId);
+      } finally {
+        partialStateDb.close();
+      }
+      expect(partialState).toMatchObject({
+        status: "preparing",
+        stage: "restore-started",
+        report_json: null,
+      });
+      expect(await readdir(partialDestination)).toEqual([]);
+      const stagingDirectories = (await readdir(partialCrashDirectory)).filter(
+        (name) => name.startsWith(".uzina-restore-"),
+      );
+      expect(stagingDirectories).toHaveLength(1);
+      interruptedStaging = join(partialCrashDirectory, stagingDirectories[0]!);
+      expect(await readdir(interruptedStaging)).toEqual([".git"]);
+      await stopOwnedProcessGroup(partialRestoreChild);
+    } finally {
+      await stopOwnedProcessGroup(partialRestoreChild);
+    }
+    const partialRecoveryDaemon = new ExecutionDaemon({
+      databasePath: partialDatabasePath,
+      nodeId: destinationNode.value.node.nodeId,
+      nodeCredential: destinationNode.value.credential,
+      workspaces: [
+        {
+          workspaceId: destinationWorkspace.value.workspaceId,
+          directory: partialDestination,
+        },
+      ],
+    });
+    try {
+      await partialRecoveryDaemon.reconcileWorkspaceRelocations();
+      const uncertainPartialReport =
+        partialRecoveryDaemon.pendingWorkspaceRelocationReports()[0];
+      expect(uncertainPartialReport).toMatchObject({
+        relocationId: retriedClaim.relocationId,
+        status: "uncertain",
+        errorCode: "workspace_relocation_restore_unverified",
+      });
+      const uncertainPartialJson = JSON.stringify(uncertainPartialReport);
+      expect(await readdir(partialDestination)).toEqual([]);
+      expect(await readdir(interruptedStaging!)).toEqual([".git"]);
+      await partialRecoveryDaemon.reconcileWorkspaceRelocations();
+      expect(
+        JSON.stringify(
+          partialRecoveryDaemon.pendingWorkspaceRelocationReports()[0],
+        ),
+      ).toBe(uncertainPartialJson);
+      expect(await readdir(partialDestination)).toEqual([]);
+      expect(await readdir(interruptedStaging!)).toEqual([".git"]);
+    } finally {
+      partialRecoveryDaemon.close();
+    }
+    const claimStillUnreported = await call<{ status: string }>(
+      baseUrl,
+      relocationStatusPath,
+      { credential: owner },
+    );
+    expect(claimStillUnreported.value.status).toBe("claimed");
+
+    const barrierDirectory = join(directory, "restore-crash-barrier");
+    const gitShimDirectory = join(barrierDirectory, "git-bin");
+    await mkdir(gitShimDirectory, { recursive: true });
+    const enteredPath = join(barrierDirectory, "verification-entered");
+    const outputPath = join(barrierDirectory, "verification-output");
+    const releasePath = join(barrierDirectory, "release-verification");
+    const gitShimPath = join(gitShimDirectory, "git");
+    execFileSync("mkfifo", [releasePath]);
+    await writeFile(
+      gitShimPath,
+      `#!/bin/sh
+set -eu
+if [ "$PWD" = "$UZINA_RELOCATION_TEST_GIT_CWD" ] &&
+   [ "$1" = "diff" ] && [ "$2" = "--cached" ] &&
+   [ "$3" = "--name-only" ] && [ "$4" = "-z" ] &&
+   [ "$5" = "--no-renames" ] && [ "$6" = "HEAD" ]; then
+  set +e
+  "$UZINA_RELOCATION_TEST_REAL_GIT" "$@" > "$UZINA_RELOCATION_TEST_GIT_OUTPUT"
+  status=$?
+  set -e
+  : > "$UZINA_RELOCATION_TEST_GIT_ENTERED"
+  IFS= read -r release < "$UZINA_RELOCATION_TEST_GIT_RELEASE"
+  cat "$UZINA_RELOCATION_TEST_GIT_OUTPUT"
+  exit "$status"
+fi
+exec "$UZINA_RELOCATION_TEST_REAL_GIT" "$@"
+`,
+    );
+    await chmod(gitShimPath, 0o755);
+    const gitBarrierWait = waitForCreatedFile(enteredPath);
+    const restoreChild = startWorkspaceRelocationChild({
+      PATH: `${gitShimDirectory}:${process.env.PATH ?? ""}`,
+      HOME: process.env.HOME ?? tmpdir(),
+      TMPDIR: process.env.TMPDIR ?? tmpdir(),
+      UZINA_RELOCATION_TEST_CLAIM: JSON.stringify(retriedClaim),
+      UZINA_RELOCATION_TEST_DATABASE: destinationDatabasePath,
+      UZINA_RELOCATION_TEST_WORKSPACE: destinationDirectory,
+      UZINA_RELOCATION_TEST_CONTROLLER: baseUrl,
+      UZINA_RELOCATION_TEST_NODE_ID: destinationNode.value.node.nodeId,
+      UZINA_RELOCATION_TEST_NODE_CREDENTIAL: destinationNode.value.credential,
+      UZINA_RELOCATION_TEST_GIT_CWD: await realpath(destinationDirectory),
+      UZINA_RELOCATION_TEST_GIT_OUTPUT: outputPath,
+      UZINA_RELOCATION_TEST_GIT_ENTERED: enteredPath,
+      UZINA_RELOCATION_TEST_GIT_RELEASE: releasePath,
+      UZINA_RELOCATION_TEST_REAL_GIT: realGitPath,
+    });
+    try {
+      await Promise.race([
+        gitBarrierWait,
+        restoreChild.exited.then(async (exitCode) => {
+          const output = await new Response(restoreChild.stdout).text();
+          throw new Error(
+            `Relocation restore child exited before verification barrier (${exitCode}): ${output}`,
+          );
+        }),
+      ]);
+      const restoreStartedDb = new Database(destinationDatabasePath, {
+        readonly: true,
+      });
+      let restoreStartedReceipt:
+        | {
+            status: string;
+            stage: string;
+            cache_directory: string | null;
+            report_json: string | null;
+          }
+        | null
+        | undefined;
+      try {
+        restoreStartedReceipt = restoreStartedDb
+          .query<
+            {
+              status: string;
+              stage: string;
+              cache_directory: string | null;
+              report_json: string | null;
+            },
+            [string]
+          >(
+            `SELECT status, stage, cache_directory, report_json
+             FROM execution_workspace_relocations WHERE relocation_id = ?`,
+          )
+          .get(relocationAdmission.value.relocationId);
+      } finally {
+        restoreStartedDb.close();
+      }
+      expect(restoreStartedReceipt).toMatchObject({
+        status: "preparing",
+        stage: "restore-started",
+        report_json: null,
+      });
+      const manifestBytes = await readFile(
+        join(
+          restoreStartedReceipt!.cache_directory!,
+          retriedClaim.manifestReference,
+        ),
+      );
+      const manifest = JSON.parse(
+        manifestBytes.toString("utf8"),
+      ) as WorkspaceCheckpointManifest;
+      const verifiedReferences = portableWorkspaceBlobReferences(
+        manifest,
+        retriedClaim.manifestReference,
+        manifestBytes.byteLength,
+      );
+      const cacheNames = await readdir(restoreStartedReceipt!.cache_directory!);
+      expect(cacheNames.sort()).toEqual(
+        verifiedReferences.map(({ reference }) => reference).sort(),
+      );
+      for (const reference of verifiedReferences) {
+        const bytes = await readFile(
+          join(restoreStartedReceipt!.cache_directory!, reference.reference),
+        );
+        expect(bytes.byteLength).toBe(reference.size);
+        expect(createHash("sha256").update(bytes).digest("hex")).toBe(
+          reference.reference,
+        );
+      }
+      expect(
+        await readFile(join(destinationDirectory, "tracked.txt"), "utf8"),
+      ).toBe("unstaged content\n");
+      expect(await readdir(destinationDirectory)).toContain("binary");
+      if (restoreChild.pid === undefined)
+        throw new Error("Restore child has no owned process identifier");
+      await stopOwnedProcessGroup(restoreChild);
+      expect(existsSync(enteredPath)).toBe(true);
+    } finally {
+      await stopOwnedProcessGroup(restoreChild);
+    }
+
+    await evictFactory();
+    destinationDaemon = new ExecutionDaemon({
+      databasePath: destinationDatabasePath,
+      nodeId: destinationNode.value.node.nodeId,
+      nodeCredential: destinationNode.value.credential,
+      workspaces: [
+        {
+          workspaceId: destinationWorkspace.value.workspaceId,
+          directory: destinationDirectory,
+        },
+      ],
+    });
+    await destinationDaemon.reconcileWorkspaceRelocations();
+    expect(destinationDaemon.pendingWorkspaceRelocationReports()).toHaveLength(
+      1,
+    );
+    destinationAbort = new AbortController();
+    destinationLoop = new ExecutionLoop({
+      daemon: destinationDaemon,
+      controller: destinationController,
+      pollIntervalMs: 20,
+      heartbeatIntervalMs: 30_000,
+    }).run(destinationAbort.signal);
+    await until(async () => {
+      const current = await call<{
+        status: string;
+        receiptSha256?: string;
+        errorCode?: string;
+      }>(baseUrl, relocationStatusPath, { credential: owner });
+      if (
+        current.value.status === "blocked" ||
+        current.value.status === "uncertain"
+      ) {
+        throw new Error(JSON.stringify(current.value));
+      }
+      return current.value.status === "prepared-inactive";
+    });
+    const preparedRelocationStatus = await call<{
+      status: string;
+      receiptSha256: string;
+    }>(baseUrl, relocationStatusPath, { credential: owner });
+    expect(preparedRelocationStatus.value).toMatchObject({
+      status: "prepared-inactive",
+    });
+    expect(preparedRelocationStatus.value.receiptSha256).toMatch(
+      /^[a-f0-9]{64}$/,
+    );
+    expect(git(destinationDirectory, "show", ":tracked.txt")).toBe(
+      "staged content\n",
+    );
+    expect(
+      await readFile(join(destinationDirectory, "tracked.txt"), "utf8"),
+    ).toBe("unstaged content\n");
+    expect(await readFile(join(destinationDirectory, "binary"))).toEqual(
+      Buffer.from([0, 255, 17, 128]),
+    );
+    expect(git(destinationDirectory, "status", "--porcelain").trim()).toBe(
+      "MM tracked.txt\n?? binary",
+    );
+    expect(
+      await stat(join(destinationDirectory, "binary")).then(
+        (file) => file.mode & 0o111,
+      ),
+    ).toBe(0o111);
+
+    expect(droppedDestinationClaimAcknowledgement).toBe(true);
+    expect(lostClaimRelocationId).toBe(relocationAdmission.value.relocationId);
+    expect(droppedPreparedReportAcknowledgement).toBe(true);
+
+    const preparedHistory = await call<{
+      status: string;
+      currentReport: Record<string, unknown>;
+      reportSha256: string;
+      receiptSha256: string;
+      previousReport: unknown;
+      previousReportSha256: string | null;
+      previousReceiptSha256: string | null;
+    }>(baseUrl, "/__test/workspace-relocation-history", {
+      body: { requestId: relocationRequest.requestId },
+    });
+    expect(preparedHistory.value).toMatchObject({
+      status: "prepared-inactive",
+      currentReport: { status: "prepared-inactive" },
+      receiptSha256: preparedRelocationStatus.value.receiptSha256,
+      previousReport: null,
+      previousReportSha256: null,
+      previousReceiptSha256: null,
+    });
+    const originalPreparedReport = preparedHistory.value.currentReport;
+
+    destinationAbort.abort();
+    await destinationLoop?.catch(() => {});
+    destinationLoop = undefined;
+    destinationAbort = undefined;
+    await destinationDaemon.reconcileWorkspaceRelocations();
+    expect(destinationDaemon.pendingWorkspaceRelocationReports()).toEqual([]);
+    expect(
+      await readFile(join(destinationDirectory, "tracked.txt"), "utf8"),
+    ).toBe("unstaged content\n");
+
+    const forgedDegradation = await call<{ error: string }>(
+      baseUrl,
+      `/v1/nodes/${destinationNode.value.node.nodeId}/workspace-relocations/${relocationAdmission.value.relocationId}/report`,
+      {
+        credential: destinationNode.value.credential,
+        body: {
+          contractVersion: 1,
+          relocationId: relocationAdmission.value.relocationId,
+          requestId: relocationAdmission.value.requestId,
+          checkpointRequestId: relocationAdmission.value.checkpointRequestId,
+          captureRequestId: relocationAdmission.value.captureRequestId,
+          captureId: relocationAdmission.value.captureId,
+          workspaceSnapshotRequestId:
+            relocationAdmission.value.workspaceSnapshotRequestId,
+          snapshotId: relocationAdmission.value.snapshotId,
+          threadId: thread.value.threadId,
+          source: relocationAdmission.value.source,
+          destination: relocationAdmission.value.destination,
+          ownershipGeneration: thread.value.ownershipGeneration,
+          manifestReference: status.value.manifestReference,
+          status: "uncertain",
+          receiptSha256: "f".repeat(64),
+          previousReceiptSha256: "0".repeat(64),
+          reportedAt: new Date().toISOString(),
+          errorCode: "workspace_relocation_restore_unverified",
+        },
+      },
+    );
+    expect(forgedDegradation.response.status).toBe(409);
+    const unchangedPreparedHistory = await call<{
+      status: string;
+      currentReport: Record<string, unknown>;
+      reportSha256: string;
+      previousReport: unknown;
+    }>(baseUrl, "/__test/workspace-relocation-history", {
+      body: { requestId: relocationRequest.requestId },
+    });
+    expect(unchangedPreparedHistory.value).toMatchObject({
+      status: "prepared-inactive",
+      currentReport: originalPreparedReport,
+      reportSha256: preparedHistory.value.reportSha256,
+      previousReport: null,
+    });
+
+    const previousReceiptSha256 = preparedRelocationStatus.value.receiptSha256;
+    const changedDestinationContent = "changed after preparation\n";
+    await writeFile(
+      join(destinationDirectory, "tracked.txt"),
+      changedDestinationContent,
+    );
+    destinationDaemon.close();
+    destinationDaemon = undefined;
+    const unrelatedDestinationDirectory = join(
+      directory,
+      "unrelated-destination-workspace",
+    );
+    await mkdir(unrelatedDestinationDirectory);
+    const reopenedDestinationDaemon = new ExecutionDaemon({
+      databasePath: destinationDatabasePath,
+      nodeId: destinationNode.value.node.nodeId,
+      nodeCredential: destinationNode.value.credential,
+      workspaces: [
+        {
+          workspaceId: destinationWorkspace.value.workspaceId,
+          directory: destinationDirectory,
+        },
+        {
+          workspaceId: unrelatedDestinationWorkspace.value.workspaceId,
+          directory: unrelatedDestinationDirectory,
+        },
+      ],
+    });
+    destinationDaemon = reopenedDestinationDaemon;
+    await reopenedDestinationDaemon.reconcileWorkspaceRelocations();
+    const pendingDegradation =
+      reopenedDestinationDaemon.pendingWorkspaceRelocationReports();
+    expect(pendingDegradation).toHaveLength(1);
+    expect(pendingDegradation[0]).toMatchObject({
+      relocationId: relocationAdmission.value.relocationId,
+      status: "uncertain",
+      previousReceiptSha256,
+      errorCode: "workspace_relocation_restore_unverified",
+    });
+    expect(
+      await readFile(join(destinationDirectory, "tracked.txt"), "utf8"),
+    ).toBe(changedDestinationContent);
+    expect(() =>
+      reopenedDestinationDaemon.activateWorkspace(
+        destinationWorkspace.value.workspaceId,
+        thread.value.ownershipGeneration,
+      ),
+    ).toThrow(/workspace_relocation_reserved/);
+    await expect(
+      reopenedDestinationDaemon.executeJob({
+        contractVersion: 1,
+        jobId: "job:relocation-destination-must-stay-inactive",
+        nodeId: destinationNode.value.node.nodeId,
+        target: relocationRequest.destination,
+        ownershipGeneration: thread.value.ownershipGeneration,
+        operation: "write-file",
+        path: "must-not-run.txt",
+        contentBase64: Buffer.from("inactive").toString("base64"),
+      }),
+    ).rejects.toMatchObject({ code: "workspace_fenced" });
+    await expect(
+      reopenedDestinationDaemon.rex.launch({
+        contractVersion: 1,
+        processId: "rex:relocation-destination-must-stay-inactive",
+        nodeId: destinationNode.value.node.nodeId,
+        target: relocationRequest.destination,
+        ownershipGeneration: thread.value.ownershipGeneration,
+        argv: ["true"],
+      }),
+    ).rejects.toMatchObject({ code: "workspace_fenced" });
+    expect(await readdir(destinationDirectory)).not.toContain(
+      "must-not-run.txt",
+    );
+
+    const canonicalDestinationDirectory = await realpath(destinationDirectory);
+    const readLocalRelocation = () => {
+      const destinationReceiptDb = new Database(destinationDatabasePath);
+      try {
+        return destinationReceiptDb
+          .query<
+            {
+              status: string;
+              stage: string;
+              manifest_reference: string;
+              workspace_root: string;
+              receipt_sha256: string;
+              previous_receipt_sha256: string | null;
+              previous_receipt_json: string | null;
+              receipt_json: string;
+              report_json: string;
+              reported_at: string | null;
+            },
+            [string]
+          >(
+            `SELECT status, stage, manifest_reference, workspace_root,
+              receipt_sha256, previous_receipt_sha256, previous_receipt_json,
+              receipt_json, report_json, reported_at
+             FROM execution_workspace_relocations WHERE relocation_id = ?`,
+          )
+          .get(relocationAdmission.value.relocationId);
+      } finally {
+        destinationReceiptDb.close();
+      }
+    };
+    const localUncertainReceipt = readLocalRelocation();
+    expect(localUncertainReceipt).toMatchObject({
+      status: "uncertain",
+      stage: "terminal",
+      manifest_reference: status.value.manifestReference,
+      workspace_root: canonicalDestinationDirectory,
+      previous_receipt_sha256: previousReceiptSha256,
+    });
+    expect(
+      JSON.parse(localUncertainReceipt!.previous_receipt_json!).status,
+    ).toBe("prepared-inactive");
+    expect(
+      JSON.parse(localUncertainReceipt!.receipt_json).previousReceiptSha256,
+    ).toBe(previousReceiptSha256);
+
+    let droppedUncertainReportAcknowledgement = false;
+    const degradedDestinationController = withDroppedRelocationReplies(
+      new HttpExecutionControllerConnector({
+        controllerUrl: baseUrl,
+        nodeId: destinationNode.value.node.nodeId,
+        credential: destinationNode.value.credential,
+      }),
+      [
+        {
+          method: "reportWorkspaceRelocation",
+          matches: (_result, args) =>
+            typeof args[0] === "object" &&
+            args[0] !== null &&
+            "status" in args[0] &&
+            args[0].status === "uncertain",
+          async afterForward() {
+            droppedUncertainReportAcknowledgement = true;
+            await evictFactory();
+          },
+        },
+      ],
+    );
+    destinationAbort = new AbortController();
+    destinationLoop = new ExecutionLoop({
+      daemon: reopenedDestinationDaemon,
+      controller: degradedDestinationController,
+      pollIntervalMs: 20,
+      heartbeatIntervalMs: 30_000,
+    }).run(destinationAbort.signal);
+    await until(async () => {
+      const current = await call<{ status: string }>(
+        baseUrl,
+        relocationStatusPath,
+        { credential: owner },
+      );
+      return current.value.status === "uncertain";
+    });
+    expect(droppedUncertainReportAcknowledgement).toBe(true);
+    await until(async () => Boolean(readLocalRelocation()?.reported_at));
+    const uncertainRelocationStatus = await call<{
+      relocationId: string;
+      requestId: string;
+      checkpointRequestId: string;
+      captureRequestId: string;
+      captureId: string;
+      workspaceSnapshotRequestId: string;
+      snapshotId: string;
+      source: { nodeId: string; workspaceId: string };
+      destination: { nodeId: string; workspaceId: string };
+      ownershipGeneration: number;
+      manifestReference: string;
+      status: string;
+      receiptSha256: string;
+      previousReceiptSha256: string;
+      errorCode: string;
+    }>(baseUrl, relocationStatusPath, { credential: owner });
+    expect(uncertainRelocationStatus.value).toMatchObject({
+      relocationId: relocationAdmission.value.relocationId,
+      requestId: relocationAdmission.value.requestId,
+      checkpointRequestId: relocationAdmission.value.checkpointRequestId,
+      captureRequestId: relocationAdmission.value.captureRequestId,
+      captureId: relocationAdmission.value.captureId,
+      workspaceSnapshotRequestId:
+        relocationAdmission.value.workspaceSnapshotRequestId,
+      snapshotId: relocationAdmission.value.snapshotId,
+      source: relocationAdmission.value.source,
+      destination: relocationAdmission.value.destination,
+      ownershipGeneration: thread.value.ownershipGeneration,
+      manifestReference: status.value.manifestReference,
+      status: "uncertain",
+      previousReceiptSha256,
+      errorCode: "workspace_relocation_restore_unverified",
+    });
+    expect(uncertainRelocationStatus.value.receiptSha256).not.toBe(
+      previousReceiptSha256,
+    );
+    const degradedHistory = await call<{
+      status: string;
+      currentReport: Record<string, unknown>;
+      reportSha256: string;
+      receiptSha256: string;
+      previousReport: Record<string, unknown>;
+      previousReportSha256: string;
+      previousReceiptSha256: string;
+    }>(baseUrl, "/__test/workspace-relocation-history", {
+      body: { requestId: relocationRequest.requestId },
+    });
+    expect(degradedHistory.value).toMatchObject({
+      status: "uncertain",
+      currentReport: {
+        status: "uncertain",
+        previousReceiptSha256,
+      },
+      reportSha256: expect.any(String),
+      receiptSha256: uncertainRelocationStatus.value.receiptSha256,
+      previousReport: originalPreparedReport,
+      previousReportSha256: preparedHistory.value.reportSha256,
+      previousReceiptSha256,
+    });
+    const sourceFenceAfterDegradation = await call<Record<string, unknown>>(
+      baseUrl,
+      `/v1/capture-controls/${sourceAdmission.value.requestId}`,
+      { credential: owner },
+    );
+    expect(sourceFenceAfterDegradation.value).toEqual(
+      fencedCaptureReceipt.value,
+    );
+
+    destinationAbort.abort();
+    await destinationLoop?.catch(() => {});
+    destinationLoop = undefined;
+    destinationAbort = undefined;
+    await expect(
+      reopenedDestinationDaemon.executeJob({
+        contractVersion: 1,
+        jobId: "job:relocation-unrelated-workspace-remains-usable",
+        nodeId: destinationNode.value.node.nodeId,
+        target: {
+          nodeId: destinationNode.value.node.nodeId,
+          workspaceId: unrelatedDestinationWorkspace.value.workspaceId,
+        },
+        ownershipGeneration: thread.value.ownershipGeneration,
+        operation: "write-file",
+        path: "still-operational.txt",
+        contentBase64: Buffer.from("unrelated remains usable").toString(
+          "base64",
+        ),
+      }),
+    ).resolves.toMatchObject({ status: "completed" });
+    expect(
+      await readFile(
+        join(unrelatedDestinationDirectory, "still-operational.txt"),
+        "utf8",
+      ),
+    ).toBe("unrelated remains usable");
+
+    reopenedDestinationDaemon.close();
+    destinationDaemon = undefined;
+    const aliasDestinationDaemon = new ExecutionDaemon({
+      databasePath: destinationDatabasePath,
+      nodeId: destinationNode.value.node.nodeId,
+      nodeCredential: destinationNode.value.credential,
+      workspaces: [
+        {
+          workspaceId: destinationWorkspace.value.workspaceId,
+          directory: destinationDirectory,
+        },
+        {
+          workspaceId: "workspace:relocation-alias",
+          directory: destinationDirectory,
+        },
+        {
+          workspaceId: unrelatedDestinationWorkspace.value.workspaceId,
+          directory: unrelatedDestinationDirectory,
+        },
+      ],
+    });
+    destinationDaemon = aliasDestinationDaemon;
+    await expect(
+      aliasDestinationDaemon.executeJob({
+        contractVersion: 1,
+        jobId: "job:relocation-physical-alias-must-stay-fenced",
+        nodeId: destinationNode.value.node.nodeId,
+        target: {
+          nodeId: destinationNode.value.node.nodeId,
+          workspaceId: "workspace:relocation-alias",
+        },
+        ownershipGeneration: thread.value.ownershipGeneration,
+        operation: "write-file",
+        path: "alias-must-not-run.txt",
+        contentBase64: Buffer.from("must remain blocked").toString("base64"),
+      }),
+    ).rejects.toMatchObject({ code: "workspace_relocation_reserved" });
+    expect(await readdir(destinationDirectory)).not.toContain(
+      "alias-must-not-run.txt",
+    );
+    aliasDestinationDaemon.close();
+    destinationDaemon = undefined;
+
     const completedJournal = await readCheckpointJournal();
     expect(completedJournal).toMatchObject({
       status: "available",
@@ -1240,28 +3121,57 @@ describe("workspace snapshot transport in production-shaped workerd + R2", () =>
     );
     expect(wrongThreadCheckpointStatus.response.status).toBe(404);
 
-    const factoryNamespace = (await miniflare.getDurableObjectNamespace(
-      "FACTORY",
-    )) as unknown as FactoryNamespace;
-    await miniflare.unsafeEvictDurableObject(
-      "uzina-workspace-snapshot",
-      "CaptureTestFactory",
-      {
-        id: factoryNamespace.idFromName("uzina-single-factory").toString(),
-      },
-    );
+    await evictFactory();
     const reopenedCheckpointStatus = await call<Record<string, unknown>>(
       baseUrl,
       checkpointStatusPath,
       { credential: owner },
     );
     expect(reopenedCheckpointStatus.value).toEqual(checkpointStatus.value);
+    const reopenedRelocationStatus = await call<Record<string, unknown>>(
+      baseUrl,
+      relocationStatusPath,
+      { credential: owner },
+    );
+    expect(reopenedRelocationStatus.value).toMatchObject({
+      relocationId: relocationAdmission.value.relocationId,
+      requestId: relocationAdmission.value.requestId,
+      checkpointRequestId: relocationAdmission.value.checkpointRequestId,
+      captureRequestId: relocationAdmission.value.captureRequestId,
+      captureId: relocationAdmission.value.captureId,
+      workspaceSnapshotRequestId:
+        relocationAdmission.value.workspaceSnapshotRequestId,
+      snapshotId: relocationAdmission.value.snapshotId,
+      source: relocationAdmission.value.source,
+      destination: relocationAdmission.value.destination,
+      ownershipGeneration: relocationAdmission.value.ownershipGeneration,
+      manifestReference: relocationAdmission.value.manifestReference,
+      status: "uncertain",
+      previousReceiptSha256,
+    });
+    expect(reopenedRelocationStatus.value.receiptSha256).toBe(
+      uncertainRelocationStatus.value.receiptSha256,
+    );
+    const reopenedRelocationRetry = await call<Record<string, unknown>>(
+      baseUrl,
+      relocationPath,
+      { credential: owner, body: relocationRequest },
+    );
+    expect(reopenedRelocationRetry.value).toMatchObject({
+      relocationId: relocationAdmission.value.relocationId,
+      requestId: relocationAdmission.value.requestId,
+      status: "uncertain",
+      receiptSha256: reopenedRelocationStatus.value.receiptSha256,
+      previousReceiptSha256,
+    });
     const reopenedCheckpointRetry = await call<Record<string, unknown>>(
       baseUrl,
       checkpointPath,
       { credential: owner, body: coherentRequest },
     );
     expect(reopenedCheckpointRetry.value).toEqual(checkpointStatus.value);
+    startExecutionLoop();
+    await waitForNodeOnline();
 
     const getManagedCheckpointBlob = async (
       reference: string,
@@ -2258,6 +4168,12 @@ describe("workspace snapshot transport in production-shaped workerd + R2", () =>
       { credential: owner },
     );
     expect(staleCheckpointStatus.response.status).toBe(409);
+    const staleRelocationStatus = await call<{ error: string }>(
+      baseUrl,
+      relocationStatusPath,
+      { credential: owner },
+    );
+    expect(staleRelocationStatus.response.status).toBe(409);
     const staleGenerationRefusal = await managedWorkCall<string>(
       baseUrl,
       thread.value.threadId,

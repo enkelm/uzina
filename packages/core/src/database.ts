@@ -259,6 +259,44 @@ const schema = [
     verified_at TEXT NOT NULL,
     PRIMARY KEY (request_id, role, reference)
   )`,
+  `CREATE TABLE IF NOT EXISTS workspace_relocations (
+    request_id TEXT PRIMARY KEY,
+    relocation_id TEXT NOT NULL UNIQUE,
+    checkpoint_request_id TEXT NOT NULL UNIQUE REFERENCES managed_work_checkpoint_requests(request_id),
+    capture_request_id TEXT NOT NULL UNIQUE REFERENCES capture_control_requests(request_id),
+    capture_id TEXT NOT NULL UNIQUE,
+    workspace_snapshot_request_id TEXT NOT NULL UNIQUE REFERENCES workspace_snapshot_requests(request_id),
+    snapshot_id TEXT NOT NULL UNIQUE,
+    actor_json TEXT NOT NULL,
+    project_id TEXT NOT NULL REFERENCES projects(project_id),
+    thread_id TEXT NOT NULL REFERENCES threads(thread_id),
+    source_node_id TEXT NOT NULL REFERENCES nodes(node_id),
+    source_workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id),
+    destination_node_id TEXT NOT NULL REFERENCES nodes(node_id),
+    destination_workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id),
+    ownership_generation INTEGER NOT NULL CHECK (ownership_generation >= 0),
+    manifest_reference TEXT NOT NULL CHECK (length(manifest_reference) = 64 AND manifest_reference NOT GLOB '*[^a-f0-9]*'),
+    status TEXT NOT NULL CHECK (status IN ('queued', 'claimed', 'prepared-inactive', 'blocked', 'uncertain')),
+    accepted_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    claimed_at TEXT,
+    report_json TEXT,
+    report_sha256 TEXT,
+    receipt_sha256 TEXT,
+    previous_report_json TEXT,
+    previous_report_sha256 TEXT,
+    previous_receipt_sha256 TEXT,
+    error_code TEXT,
+    UNIQUE (destination_node_id, destination_workspace_id),
+    CHECK (source_node_id <> destination_node_id),
+    CHECK (source_workspace_id <> destination_workspace_id),
+    CHECK (
+      (status IN ('queued', 'claimed') AND report_json IS NULL AND report_sha256 IS NULL AND receipt_sha256 IS NULL AND error_code IS NULL)
+      OR (status = 'prepared-inactive' AND report_json IS NOT NULL AND report_sha256 IS NOT NULL AND receipt_sha256 IS NOT NULL AND error_code IS NULL)
+      OR (status IN ('blocked', 'uncertain') AND report_json IS NOT NULL AND report_sha256 IS NOT NULL AND receipt_sha256 IS NOT NULL AND error_code IS NOT NULL)
+    )
+  )`,
+  `CREATE INDEX IF NOT EXISTS workspace_relocation_queue_by_node ON workspace_relocations(status, destination_node_id, accepted_at)`,
   `CREATE INDEX IF NOT EXISTS workspace_snapshot_queue_by_node ON workspace_snapshot_requests(status, node_id, accepted_at)`,
   `CREATE INDEX IF NOT EXISTS capture_control_queue_by_node ON capture_control_requests(status, node_id, accepted_at)`,
   `CREATE INDEX IF NOT EXISTS factory_events_by_cursor ON factory_events(cursor)`,
@@ -277,6 +315,22 @@ export function initializeFactoryDatabase(database: FactoryDatabase): void {
     database.exec(
       "ALTER TABLE managed_work_checkpoint_requests ADD COLUMN runtime_requirements_json TEXT",
     );
+  }
+  const workspaceRelocationColumns = new Set(
+    database
+      .all<{ name: string }>("PRAGMA table_info(workspace_relocations)")
+      .map((column) => column.name),
+  );
+  for (const column of [
+    "previous_report_json",
+    "previous_report_sha256",
+    "previous_receipt_sha256",
+  ] as const) {
+    if (!workspaceRelocationColumns.has(column)) {
+      database.exec(
+        `ALTER TABLE workspace_relocations ADD COLUMN ${column} TEXT`,
+      );
+    }
   }
   const columns = new Set(
     database

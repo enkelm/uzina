@@ -3,7 +3,12 @@ import {
   workspaceSnapshotClaimResponseSchema,
   workspaceSnapshotReportSchema,
   workspaceSnapshotReportResponseSchema,
+  workspaceRelocationClaimRequestSchema,
+  workspaceRelocationClaimResponseSchema,
+  workspaceRelocationReportSchema,
+  workspaceRelocationReportResponseSchema,
   type WorkspaceSnapshotClaim,
+  type WorkspaceRelocationClaim,
 } from "@uzina/contracts/factory";
 import {
   executionCaptureControlClaimRequestSchema,
@@ -65,6 +70,26 @@ export function isRetryableControllerFailure(error: unknown): boolean {
   );
 }
 
+function transportStream(
+  stream: ReadableStream<Uint8Array>,
+): ReadableStream<Uint8Array> {
+  const reader = stream.getReader();
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const part = await reader.read();
+        if (part.done) controller.close();
+        else controller.enqueue(part.value);
+      } catch {
+        controller.error(new ControllerTransportError());
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+}
+
 export interface ExecutionControllerConnector {
   register(request: unknown): Promise<void>;
   heartbeat(request: unknown): Promise<void>;
@@ -80,6 +105,12 @@ export interface ExecutionControllerConnector {
     stream: ReadableStream<Uint8Array>,
     contentLength: number,
   ): Promise<void>;
+  claimWorkspaceRelocation(): Promise<WorkspaceRelocationClaim | null>;
+  fetchWorkspaceRelocationBlob(
+    relocationId: string,
+    reference: string,
+  ): Promise<{ body: ReadableStream<Uint8Array>; size: number }>;
+  reportWorkspaceRelocation(report: unknown): Promise<void>;
 }
 
 export interface HttpExecutionControllerConnectorOptions {
@@ -302,6 +333,100 @@ export class HttpExecutionControllerConnector implements ExecutionControllerConn
     }
   }
 
+  async claimWorkspaceRelocation(): Promise<WorkspaceRelocationClaim | null> {
+    const body = workspaceRelocationClaimRequestSchema.parse({
+      contractVersion: 1,
+      nodeId: this.#nodeId,
+    });
+    const response = await this.#post(
+      `/v1/nodes/${encodeURIComponent(this.#nodeId)}/workspace-relocations/claim`,
+      body,
+      workspaceRelocationClaimResponseSchema,
+    );
+    if (response.relocation) {
+      if (
+        response.relocation.destination.nodeId !== this.#nodeId ||
+        response.relocation.source.nodeId === this.#nodeId
+      ) {
+        throw new ControllerProtocolError(
+          "Controller relocation node assignment mismatch",
+        );
+      }
+    }
+    return response.relocation;
+  }
+
+  async fetchWorkspaceRelocationBlob(
+    relocationId: string,
+    reference: string,
+  ): Promise<{ body: ReadableStream<Uint8Array>; size: number }> {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(relocationId)) {
+      throw new ControllerProtocolError("Invalid relocation identity");
+    }
+    if (!/^[a-f0-9]{64}$/.test(reference)) {
+      throw new ControllerProtocolError("Invalid workspace blob reference");
+    }
+    const timeout = AbortSignal.timeout(10 * 60_000);
+    let response: Response;
+    try {
+      response = await fetch(
+        `${this.#baseUrl}/v1/nodes/${encodeURIComponent(this.#nodeId)}/workspace-relocations/${encodeURIComponent(relocationId)}/blobs/${reference}`,
+        {
+          method: "GET",
+          headers: {
+            authorization: `Bearer ${this.#credential}`,
+            accept: "application/octet-stream",
+          },
+          redirect: "manual",
+          signal: timeout,
+        },
+      );
+    } catch (error) {
+      if (isTransportFailure(error)) throw new ControllerTransportError();
+      throw error;
+    }
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new ControllerHttpError(response.status);
+    }
+    const rawSize = response.headers.get("content-length");
+    const size = rawSize && /^\d+$/.test(rawSize) ? Number(rawSize) : NaN;
+    if (
+      response.status !== 200 ||
+      response.headers.get("content-type") !== "application/octet-stream" ||
+      response.headers.get("x-content-sha256") !== reference ||
+      !response.body ||
+      !Number.isSafeInteger(size) ||
+      size < 0 ||
+      size > 512 * 1024 * 1024
+    ) {
+      await response.body?.cancel();
+      throw new ControllerProtocolError(
+        "Controller returned invalid workspace relocation blob metadata",
+      );
+    }
+    return { body: transportStream(response.body), size };
+  }
+
+  async reportWorkspaceRelocation(report: unknown): Promise<void> {
+    const body = workspaceRelocationReportSchema.parse(report);
+    this.#assertNode(body.destination.nodeId);
+    const response = await this.#post(
+      `/v1/nodes/${encodeURIComponent(this.#nodeId)}/workspace-relocations/${encodeURIComponent(body.relocationId)}/report`,
+      body,
+      workspaceRelocationReportResponseSchema,
+    );
+    if (
+      response.nodeId !== this.#nodeId ||
+      response.relocationId !== body.relocationId ||
+      response.status !== body.status
+    ) {
+      throw new ControllerProtocolError(
+        "Controller relocation report acknowledgement mismatch",
+      );
+    }
+  }
+
   async #post<T>(
     route: string,
     body: unknown,
@@ -324,6 +449,7 @@ export class HttpExecutionControllerConnector implements ExecutionControllerConn
           accept: "application/json",
         },
         body: requestBody,
+        redirect: "manual",
         signal: timeout,
       });
     } catch (error) {

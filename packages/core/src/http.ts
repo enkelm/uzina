@@ -19,6 +19,10 @@ import {
   workspaceSnapshotClaimRequestSchema,
   workspaceSnapshotClaimResponseSchema,
   workspaceSnapshotReportSchema,
+  workspaceRelocationRequestSchema,
+  workspaceRelocationClaimRequestSchema,
+  workspaceRelocationClaimResponseSchema,
+  workspaceRelocationReportSchema,
 } from "@uzina/contracts/factory";
 import {
   executionCaptureControlClaimRequestSchema,
@@ -372,6 +376,31 @@ export function createFactoryHttpHandler(
           },
         });
       }
+      const workspaceRelocationAdmissionMatch = path.match(
+        /^\/v1\/threads\/([^/]+)\/workspace-relocations$/,
+      );
+      if (request.method === "POST" && workspaceRelocationAdmissionMatch) {
+        const input = await body(request, workspaceRelocationRequestSchema);
+        return json(
+          await factory.requestWorkspaceRelocation(
+            session,
+            decodeURIComponent(workspaceRelocationAdmissionMatch[1]!),
+            input,
+          ),
+          202,
+        );
+      }
+      const workspaceRelocationStatusMatch = path.match(
+        /^\/v1\/workspace-relocations\/([^/]+)$/,
+      );
+      if (request.method === "GET" && workspaceRelocationStatusMatch) {
+        return json(
+          await factory.getWorkspaceRelocationStatus(
+            session,
+            decodeURIComponent(workspaceRelocationStatusMatch[1]!),
+          ),
+        );
+      }
       const captureAdmissionMatch = path.match(
         /^\/v1\/threads\/([^/]+)\/capture-controls$/,
       );
@@ -385,6 +414,63 @@ export function createFactoryHttpHandler(
           ),
           202,
         );
+      }
+      const workspaceRelocationBlobMatch = path.match(
+        /^\/v1\/nodes\/([^/]+)\/workspace-relocations\/([^/]+)\/blobs\/([a-f0-9]{64})$/,
+      );
+      if (request.method === "GET" && workspaceRelocationBlobMatch) {
+        const nodeId = decodeURIComponent(workspaceRelocationBlobMatch[1]!);
+        const relocationId = decodeURIComponent(
+          workspaceRelocationBlobMatch[2]!,
+        );
+        const reference = workspaceRelocationBlobMatch[3]!;
+        const authorized = await factory.getAuthorizedWorkspaceRelocationBlob(
+          session,
+          nodeId,
+          relocationId,
+          reference,
+        );
+        if (!snapshotStorage) {
+          throw new FactoryError(503, "workspace_snapshot_storage_unavailable");
+        }
+        const blob = await snapshotStorage.getBlob(
+          authorized.captureId,
+          reference,
+        );
+        if (!blob || blob.size !== authorized.size) {
+          await blob?.body.cancel().catch(() => {});
+          throw new FactoryError(404, "workspace_relocation_blob_not_found");
+        }
+        let current: Awaited<
+          ReturnType<FactoryService["getAuthorizedWorkspaceRelocationBlob"]>
+        >;
+        try {
+          current = await factory.getAuthorizedWorkspaceRelocationBlob(
+            session,
+            nodeId,
+            relocationId,
+            reference,
+          );
+        } catch (error) {
+          await blob.body.cancel().catch(() => {});
+          throw error;
+        }
+        if (
+          current.captureId !== authorized.captureId ||
+          current.reference !== authorized.reference ||
+          current.size !== authorized.size
+        ) {
+          await blob.body.cancel().catch(() => {});
+          throw new FactoryError(404, "workspace_relocation_blob_not_found");
+        }
+        return new Response(blob.body, {
+          headers: {
+            "content-type": "application/octet-stream",
+            "content-length": String(blob.size),
+            "cache-control": "private, no-store",
+            "x-content-sha256": reference,
+          },
+        });
       }
       const snapshotBlobUploadMatch = path.match(
         /^\/v1\/nodes\/([^/]+)\/captures\/([^/]+)\/blobs\/([a-f0-9]{64})$/,
@@ -655,6 +741,40 @@ export function createFactoryHttpHandler(
           throw new FactoryError(403, "node_identity_mismatch");
         }
         return json(factory.heartbeatExecutionNode(session, input));
+      }
+      const workspaceRelocationClaimMatch = path.match(
+        /^\/v1\/nodes\/([^/]+)\/workspace-relocations\/claim$/,
+      );
+      if (request.method === "POST" && workspaceRelocationClaimMatch) {
+        const input = await body(
+          request,
+          workspaceRelocationClaimRequestSchema,
+        );
+        if (
+          input.nodeId !== decodeURIComponent(workspaceRelocationClaimMatch[1]!)
+        ) {
+          throw new FactoryError(403, "node_identity_mismatch");
+        }
+        return json(
+          workspaceRelocationClaimResponseSchema.parse({
+            contractVersion: CONTRACT_VERSION,
+            relocation: await factory.claimWorkspaceRelocation(session, input),
+          }),
+        );
+      }
+      const workspaceRelocationReportMatch = path.match(
+        /^\/v1\/nodes\/([^/]+)\/workspace-relocations\/([^/]+)\/report$/,
+      );
+      if (request.method === "POST" && workspaceRelocationReportMatch) {
+        const input = await body(request, workspaceRelocationReportSchema);
+        return json(
+          await factory.reportWorkspaceRelocation(
+            session,
+            decodeURIComponent(workspaceRelocationReportMatch[1]!),
+            decodeURIComponent(workspaceRelocationReportMatch[2]!),
+            input,
+          ),
+        );
       }
       const captureControlClaimMatch = path.match(
         /^\/v1\/nodes\/([^/]+)\/capture-controls\/claim$/,

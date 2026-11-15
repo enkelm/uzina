@@ -34,6 +34,15 @@ import {
   workspaceSnapshotClaimSchema,
   workspaceSnapshotReportSchema,
   workspaceSnapshotReportResponseSchema,
+  workspaceRelocationRequestSchema,
+  workspaceRelocationStatusSchema,
+  workspaceRelocationClaimRequestSchema,
+  workspaceRelocationClaimSchema,
+  workspaceRelocationReportSchema,
+  workspaceRelocationReportResponseSchema,
+  type WorkspaceRelocationClaim,
+  type WorkspaceRelocationReport,
+  type WorkspaceRelocationStatus,
   type WorkspaceSnapshotClaim,
   factoryThreadSchema,
   factoryWorkspaceSchema,
@@ -242,6 +251,35 @@ type ManagedWorkCheckpointBindingRow = Pick<
   | "workspace_id"
   | "ownership_generation"
 >;
+type WorkspaceRelocationRow = {
+  request_id: string;
+  relocation_id: string;
+  checkpoint_request_id: string;
+  capture_request_id: string;
+  capture_id: string;
+  workspace_snapshot_request_id: string;
+  snapshot_id: string;
+  actor_json: string;
+  project_id: string;
+  thread_id: string;
+  source_node_id: string;
+  source_workspace_id: string;
+  destination_node_id: string;
+  destination_workspace_id: string;
+  ownership_generation: number;
+  manifest_reference: string;
+  status: WorkspaceRelocationStatus["status"];
+  accepted_at: string;
+  updated_at: string;
+  claimed_at: string | null;
+  report_json: string | null;
+  report_sha256: string | null;
+  receipt_sha256: string | null;
+  previous_report_json: string | null;
+  previous_report_sha256: string | null;
+  previous_receipt_sha256: string | null;
+  error_code: string | null;
+};
 type WorkspaceSnapshotRow = {
   request_id: string;
   capture_request_id: string;
@@ -2039,6 +2077,172 @@ export class FactoryService {
     return this.#managedWorkCheckpointStatus(current);
   }
 
+  /** Admit one owner-bound destination reservation against an available coherent checkpoint. */
+  async requestWorkspaceRelocation(
+    session: FactorySession,
+    threadId: string,
+    request: unknown,
+  ): Promise<WorkspaceRelocationStatus> {
+    this.#requireOwner(session);
+    const input = workspaceRelocationRequestSchema.parse(request);
+    const initialRequest = this.#workspaceRelocationByRequest(input.requestId);
+    if (
+      initialRequest &&
+      (initialRequest.actor_json !== encode(session.actor) ||
+        initialRequest.thread_id !== threadId ||
+        initialRequest.checkpoint_request_id !== input.checkpointRequestId ||
+        initialRequest.destination_node_id !== input.destination.nodeId ||
+        initialRequest.destination_workspace_id !==
+          input.destination.workspaceId)
+    ) {
+      throw conflict(
+        "workspace_relocation_request_conflict",
+        "The stable relocation request ID is already bound to another checkpoint or destination",
+      );
+    }
+    const initialCheckpoint = this.#managedWorkCheckpointByRequest(
+      initialRequest?.checkpoint_request_id ?? input.checkpointRequestId,
+    );
+    if (
+      !initialCheckpoint ||
+      initialCheckpoint.actor_json !== encode(session.actor)
+    ) {
+      throw notFound("Owner's available coherent checkpoint");
+    }
+    const state = await this.getManagedWorkCaptureState(
+      initialCheckpoint.thread_id,
+    );
+    const result = this.database.transaction(() => {
+      this.#requireOwner(session);
+      const existing = this.#workspaceRelocationByRequest(input.requestId);
+      if (existing) {
+        if (
+          existing.actor_json !== encode(session.actor) ||
+          existing.thread_id !== threadId ||
+          existing.checkpoint_request_id !== input.checkpointRequestId ||
+          existing.destination_node_id !== input.destination.nodeId ||
+          existing.destination_workspace_id !== input.destination.workspaceId
+        ) {
+          throw conflict(
+            "workspace_relocation_request_conflict",
+            "The stable relocation request ID is already bound to another checkpoint or destination",
+          );
+        }
+        this.#assertWorkspaceRelocationAuthority(session, existing, state);
+        return existing;
+      }
+
+      const checkpoint = this.#managedWorkCheckpointByRequest(
+        input.checkpointRequestId,
+      );
+      if (
+        !checkpoint ||
+        checkpoint.actor_json !== encode(session.actor) ||
+        checkpoint.thread_id !== threadId
+      ) {
+        throw conflict(
+          "workspace_relocation_checkpoint_mismatch",
+          "The checkpoint is not bound to this owner and thread",
+        );
+      }
+      if (
+        checkpoint.status !== "available" ||
+        checkpoint.stage !== "available" ||
+        !checkpoint.manifest_reference
+      ) {
+        throw conflict(
+          "workspace_relocation_checkpoint_unavailable",
+          "Relocation requires an available published coherent checkpoint",
+        );
+      }
+      this.#assertManagedWorkCheckpointAuthority(session, checkpoint, state);
+      const alreadyBound = this.database.all<{ request_id: string }>(
+        `SELECT request_id FROM workspace_relocations
+         WHERE checkpoint_request_id = ? OR capture_request_id = ?
+           OR capture_id = ? OR workspace_snapshot_request_id = ? LIMIT 1`,
+        [
+          checkpoint.request_id,
+          checkpoint.capture_request_id,
+          checkpoint.capture_id,
+          checkpoint.workspace_snapshot_request_id,
+        ],
+      )[0];
+      if (alreadyBound) {
+        throw conflict(
+          "workspace_relocation_checkpoint_already_bound",
+          "A coherent checkpoint and its source snapshot may be prepared for only one destination",
+        );
+      }
+      const snapshot = this.#workspaceSnapshotByRequest(
+        checkpoint.workspace_snapshot_request_id,
+      );
+      if (!snapshot || snapshot.status !== "workspace-checkpoint-available") {
+        throw conflict("workspace_relocation_snapshot_unavailable");
+      }
+      this.#assertWorkspaceRelocationDestination({
+        sourceNodeId: checkpoint.node_id,
+        sourceWorkspaceId: checkpoint.workspace_id,
+        destinationNodeId: input.destination.nodeId,
+        destinationWorkspaceId: input.destination.workspaceId,
+      });
+      const acceptedAt = now();
+      this.database.exec(
+        `INSERT INTO workspace_relocations(
+          request_id, relocation_id, checkpoint_request_id, capture_request_id,
+          capture_id, workspace_snapshot_request_id, snapshot_id, actor_json,
+          project_id, thread_id, source_node_id, source_workspace_id,
+          destination_node_id, destination_workspace_id, ownership_generation,
+          manifest_reference, status, accepted_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`,
+        [
+          input.requestId,
+          makeId("workspace-relocation"),
+          checkpoint.request_id,
+          checkpoint.capture_request_id,
+          checkpoint.capture_id,
+          checkpoint.workspace_snapshot_request_id,
+          snapshot.snapshot_id,
+          checkpoint.actor_json,
+          checkpoint.project_id,
+          checkpoint.thread_id,
+          checkpoint.node_id,
+          checkpoint.workspace_id,
+          input.destination.nodeId,
+          input.destination.workspaceId,
+          checkpoint.ownership_generation,
+          snapshot.manifest_reference,
+          acceptedAt,
+          acceptedAt,
+        ],
+      );
+      const created = this.#workspaceRelocationByRequest(input.requestId);
+      if (!created) throw new Error("Workspace relocation insert was lost");
+      return created;
+    });
+    return this.#workspaceRelocationStatus(result);
+  }
+
+  /** Owner status lookup rechecks the same source fence and immutable checkpoint binding. */
+  async getWorkspaceRelocationStatus(
+    session: FactorySession,
+    requestId: string,
+  ): Promise<WorkspaceRelocationStatus> {
+    this.#requireOwner(session);
+    const initial = this.#workspaceRelocationByRequest(requestId);
+    if (!initial) throw notFound("Workspace relocation request");
+    if (initial.actor_json !== encode(session.actor)) throw forbidden();
+    const state = await this.getManagedWorkCaptureState(initial.thread_id);
+    const current = this.database.transaction(() => {
+      this.#requireOwner(session);
+      const row = this.#workspaceRelocationByRequest(requestId);
+      if (!row) throw notFound("Workspace relocation request");
+      if (row.actor_json !== encode(session.actor)) throw forbidden();
+      this.#assertWorkspaceRelocationAuthority(session, row, state);
+      return row;
+    });
+    return this.#workspaceRelocationStatus(current);
+  }
+
   /** Trusted FactoryController read; authority is checked before and after bounded projections. */
   async getManagedWorkCheckpointAssembly(requestId: string) {
     const initial = this.#managedWorkCheckpointByRequest(requestId);
@@ -2716,6 +2920,199 @@ export class FactoryService {
         [captureId],
       )
       .map((item) => item.reference);
+  }
+
+  /** Destination-node claims are fixed to their provisioned workspace and never reassigned. */
+  async claimWorkspaceRelocation(
+    session: FactorySession,
+    request: unknown,
+  ): Promise<WorkspaceRelocationClaim | null> {
+    const input = workspaceRelocationClaimRequestSchema.parse(request);
+    this.#requireNode(session, input.nodeId);
+    const node = this.database.all<NodeRow>(
+      "SELECT node_id, name, availability, last_seen_at FROM nodes WHERE node_id = ?",
+      [input.nodeId],
+    )[0];
+    if (!node || !this.#isNodeOnline(node)) return null;
+    const initial = this.database.all<WorkspaceRelocationRow>(
+      `SELECT * FROM workspace_relocations WHERE destination_node_id = ?
+       AND status IN ('claimed', 'queued')
+       ORDER BY CASE status WHEN 'claimed' THEN 0 ELSE 1 END, accepted_at, relocation_id LIMIT 1`,
+      [input.nodeId],
+    )[0];
+    if (!initial) return null;
+    const ownerSession = this.#workspaceRelocationOwnerSession(initial);
+    const state = await this.getManagedWorkCaptureState(initial.thread_id);
+    return this.database.transaction(() => {
+      this.#requireNode(session, input.nodeId);
+      const currentNode = this.database.all<NodeRow>(
+        "SELECT node_id, name, availability, last_seen_at FROM nodes WHERE node_id = ?",
+        [input.nodeId],
+      )[0];
+      if (!currentNode || !this.#isNodeOnline(currentNode)) return null;
+      const current = this.#workspaceRelocationById(initial.relocation_id);
+      if (
+        !current ||
+        current.destination_node_id !== input.nodeId ||
+        !["queued", "claimed"].includes(current.status)
+      ) {
+        return null;
+      }
+      this.#assertWorkspaceRelocationAuthority(ownerSession, current, state);
+      if (current.status === "queued") {
+        this.database.exec(
+          "UPDATE workspace_relocations SET status = 'claimed', claimed_at = ?, updated_at = ? WHERE relocation_id = ? AND status = 'queued'",
+          [now(), now(), current.relocation_id],
+        );
+      }
+      const claimed = this.#workspaceRelocationById(current.relocation_id);
+      if (!claimed || claimed.status !== "claimed") return null;
+      return workspaceRelocationClaimSchema.parse(
+        this.#workspaceRelocationAssignment(claimed),
+      );
+    });
+  }
+
+  /** Persist the destination node's exact local receipt binding once; retries are idempotent. */
+  async reportWorkspaceRelocation(
+    session: FactorySession,
+    nodeId: string,
+    relocationId: string,
+    report: unknown,
+  ) {
+    const input = workspaceRelocationReportSchema.parse(report);
+    this.#requireNode(session, nodeId);
+    const initial = this.#workspaceRelocationById(relocationId);
+    if (!initial) throw notFound("Assigned workspace relocation");
+    this.#assertWorkspaceRelocationReportBinding(
+      initial,
+      nodeId,
+      relocationId,
+      input,
+    );
+    const ownerSession = this.#workspaceRelocationOwnerSession(initial);
+    const reportHash = await sha256(stableJson(input));
+    const state = await this.getManagedWorkCaptureState(initial.thread_id);
+    this.database.transaction(() => {
+      this.#requireNode(session, nodeId);
+      const current = this.#workspaceRelocationById(relocationId);
+      if (!current) throw notFound("Assigned workspace relocation");
+      this.#assertWorkspaceRelocationReportBinding(
+        current,
+        nodeId,
+        relocationId,
+        input,
+      );
+      this.#assertWorkspaceRelocationAuthority(ownerSession, current, state);
+      if (current.report_json !== null) {
+        if (current.report_sha256 === reportHash) return;
+        if (
+          current.status !== "prepared-inactive" ||
+          input.status !== "uncertain" ||
+          input.previousReceiptSha256 !== current.receipt_sha256
+        ) {
+          throw conflict(
+            "workspace_relocation_report_conflict",
+            "A different destination preparation report is already committed",
+          );
+        }
+        this.database.exec(
+          `UPDATE workspace_relocations SET status = 'uncertain', updated_at = ?,
+            previous_report_json = report_json,
+            previous_report_sha256 = report_sha256,
+            previous_receipt_sha256 = receipt_sha256,
+            report_json = ?, report_sha256 = ?, receipt_sha256 = ?, error_code = ?
+           WHERE relocation_id = ? AND status = 'prepared-inactive' AND receipt_sha256 = ?`,
+          [
+            input.reportedAt,
+            encode(input),
+            reportHash,
+            input.receiptSha256,
+            input.errorCode ?? null,
+            relocationId,
+            input.previousReceiptSha256,
+          ],
+        );
+        return;
+      }
+      if (current.status !== "claimed") {
+        throw conflict(
+          "workspace_relocation_not_claimed",
+          "A relocation report requires the persisted destination claim",
+        );
+      }
+      this.database.exec(
+        `UPDATE workspace_relocations SET status = ?, updated_at = ?, report_json = ?,
+          report_sha256 = ?, receipt_sha256 = ?, previous_receipt_sha256 = ?, error_code = ?
+         WHERE relocation_id = ? AND status = 'claimed' AND report_json IS NULL`,
+        [
+          input.status,
+          input.reportedAt,
+          encode(input),
+          reportHash,
+          input.receiptSha256,
+          input.previousReceiptSha256 ?? null,
+          input.errorCode ?? null,
+          relocationId,
+        ],
+      );
+    });
+    return workspaceRelocationReportResponseSchema.parse({
+      contractVersion: EXECUTION_CONTRACT_VERSION,
+      nodeId,
+      relocationId,
+      accepted: true,
+      status: input.status,
+    });
+  }
+
+  /** Narrow destination-only stream authorization for an exact verified source snapshot blob. */
+  async getAuthorizedWorkspaceRelocationBlob(
+    session: FactorySession,
+    nodeId: string,
+    relocationId: string,
+    reference: string,
+  ) {
+    this.#requireNode(session, nodeId);
+    if (!/^[a-f0-9]{64}$/.test(reference)) {
+      throw notFound("Workspace relocation blob");
+    }
+    const initial = this.#workspaceRelocationById(relocationId);
+    if (
+      !initial ||
+      initial.destination_node_id !== nodeId ||
+      initial.status !== "claimed"
+    ) {
+      throw notFound("Claimed workspace relocation blob");
+    }
+    const ownerSession = this.#workspaceRelocationOwnerSession(initial);
+    const state = await this.getManagedWorkCaptureState(initial.thread_id);
+    return this.database.transaction(() => {
+      this.#requireNode(session, nodeId);
+      const current = this.#workspaceRelocationById(relocationId);
+      if (
+        !current ||
+        current.destination_node_id !== nodeId ||
+        current.status !== "claimed"
+      ) {
+        throw notFound("Claimed workspace relocation blob");
+      }
+      this.#assertWorkspaceRelocationAuthority(ownerSession, current, state);
+      const blob = this.database.all<{
+        reference: string;
+        size_bytes: number;
+      }>(
+        "SELECT reference, size_bytes FROM workspace_snapshot_blobs WHERE capture_id = ? AND reference = ?",
+        [current.capture_id, reference],
+      )[0];
+      if (!blob) throw notFound("Workspace relocation blob");
+      return {
+        relocationId,
+        captureId: current.capture_id,
+        reference: blob.reference,
+        size: blob.size_bytes,
+      };
+    });
   }
 
   /** Owner-only durable status lookup; a fenced result never means a checkpoint exists. */
@@ -4323,6 +4720,7 @@ export class FactoryService {
   }
 
   #assertManagedCaptureAdmission(threadId: string, row: ThreadRow): void {
+    this.#assertWorkspaceNotReservedForRelocation(row.workspace_id);
     const shared = this.database.all<{ count: number }>(
       "SELECT COUNT(*) AS count FROM threads WHERE workspace_id = ?",
       [row.workspace_id],
@@ -4371,6 +4769,177 @@ export class FactoryService {
       throw conflict(
         "capture_already_active",
         "A managed-work capture is already active for this work or workspace",
+      );
+    }
+  }
+
+  #workspaceRelocationOwnerSession(
+    row: WorkspaceRelocationRow,
+  ): FactorySession {
+    const checkpoint = this.#managedWorkCheckpointByRequest(
+      row.checkpoint_request_id,
+    );
+    if (!checkpoint || checkpoint.actor_json !== row.actor_json) {
+      throw conflict("workspace_relocation_checkpoint_unavailable");
+    }
+    return this.#managedWorkCheckpointOwnerSession(checkpoint);
+  }
+
+  #assertWorkspaceRelocationAuthority(
+    session: FactorySession,
+    row: WorkspaceRelocationRow,
+    state: ManagedWorkCaptureState,
+  ): void {
+    this.#requireOwner(session);
+    const checkpoint = this.#managedWorkCheckpointByRequest(
+      row.checkpoint_request_id,
+    );
+    const snapshot = this.#workspaceSnapshotByRequest(
+      row.workspace_snapshot_request_id,
+    );
+    if (
+      session.actor.kind !== "human" ||
+      row.actor_json !== encode(session.actor) ||
+      !checkpoint ||
+      checkpoint.actor_json !== row.actor_json ||
+      checkpoint.request_id !== row.checkpoint_request_id ||
+      checkpoint.capture_request_id !== row.capture_request_id ||
+      checkpoint.workspace_snapshot_request_id !==
+        row.workspace_snapshot_request_id ||
+      checkpoint.capture_id !== row.capture_id ||
+      checkpoint.project_id !== row.project_id ||
+      checkpoint.thread_id !== row.thread_id ||
+      checkpoint.node_id !== row.source_node_id ||
+      checkpoint.workspace_id !== row.source_workspace_id ||
+      checkpoint.ownership_generation !== row.ownership_generation ||
+      checkpoint.status !== "available" ||
+      checkpoint.stage !== "available" ||
+      !checkpoint.manifest_reference ||
+      !snapshot ||
+      snapshot.request_id !== row.workspace_snapshot_request_id ||
+      snapshot.snapshot_id !== row.snapshot_id ||
+      snapshot.capture_request_id !== row.capture_request_id ||
+      snapshot.capture_id !== row.capture_id ||
+      snapshot.actor_json !== row.actor_json ||
+      snapshot.project_id !== row.project_id ||
+      snapshot.thread_id !== row.thread_id ||
+      snapshot.node_id !== row.source_node_id ||
+      snapshot.workspace_id !== row.source_workspace_id ||
+      snapshot.ownership_generation !== row.ownership_generation ||
+      snapshot.status !== "workspace-checkpoint-available" ||
+      snapshot.manifest_reference !== row.manifest_reference
+    ) {
+      throw conflict(
+        "workspace_relocation_checkpoint_unavailable",
+        "The exact published coherent checkpoint and verified source snapshot are required",
+      );
+    }
+    this.#assertManagedWorkCheckpointAuthority(session, checkpoint, state);
+    this.#assertWorkspaceRelocationDestination(
+      {
+        sourceNodeId: row.source_node_id,
+        sourceWorkspaceId: row.source_workspace_id,
+        destinationNodeId: row.destination_node_id,
+        destinationWorkspaceId: row.destination_workspace_id,
+      },
+      row.relocation_id,
+    );
+  }
+
+  #assertWorkspaceRelocationDestination(
+    binding: {
+      sourceNodeId: string;
+      sourceWorkspaceId: string;
+      destinationNodeId: string;
+      destinationWorkspaceId: string;
+    },
+    existingRelocationId?: string,
+  ): void {
+    if (
+      binding.destinationNodeId === binding.sourceNodeId ||
+      binding.destinationWorkspaceId === binding.sourceWorkspaceId
+    ) {
+      throw conflict(
+        "workspace_relocation_destination_not_distinct",
+        "Destination node and workspace must differ from the held source",
+      );
+    }
+    const destination = this.database.all<WorkspaceRow>(
+      "SELECT workspace_id, node_id, name FROM workspaces WHERE workspace_id = ?",
+      [binding.destinationWorkspaceId],
+    )[0];
+    const node = this.database.all<{ node_id: string }>(
+      "SELECT node_id FROM nodes WHERE node_id = ?",
+      [binding.destinationNodeId],
+    )[0];
+    if (
+      !node ||
+      !destination ||
+      destination.node_id !== binding.destinationNodeId
+    ) {
+      throw conflict(
+        "workspace_relocation_destination_not_provisioned",
+        "Destination must be an owner-provisioned node and its assigned workspace",
+      );
+    }
+    const capture = this.database.all<{ capture_id: string }>(
+      "SELECT capture_id FROM managed_work_captures WHERE workspace_id = ? LIMIT 1",
+      [binding.destinationWorkspaceId],
+    )[0];
+    if (capture) {
+      throw conflict(
+        "workspace_relocation_destination_busy",
+        "Destination workspace already has an active capture reservation",
+      );
+    }
+    const runtime = this.database.all<{ permit_id: string }>(
+      `SELECT p.permit_id FROM managed_work_runtime_permits p
+       JOIN threads t ON t.thread_id = p.thread_id
+       WHERE t.workspace_id = ? AND p.released_at IS NULL LIMIT 1`,
+      [binding.destinationWorkspaceId],
+    )[0];
+    const input = this.database.all<{ status: string }>(
+      `SELECT d.status FROM dispatch_intents d JOIN threads t ON t.thread_id = d.thread_id
+       WHERE t.workspace_id = ? AND d.status IN ('queued', 'unavailable', 'running', 'dispatched', 'uncertain') LIMIT 1`,
+      [binding.destinationWorkspaceId],
+    )[0];
+    const effect = this.database.all<{ status: string }>(
+      "SELECT status FROM execution_jobs WHERE workspace_id = ? AND status IN ('queued', 'claimed', 'uncertain') LIMIT 1",
+      [binding.destinationWorkspaceId],
+    )[0];
+    if (runtime || input || effect) {
+      throw conflict(
+        "workspace_relocation_destination_busy",
+        "Destination workspace has active runtime, input, or effect work",
+      );
+    }
+    const assigned = this.database.all<{ thread_id: string }>(
+      "SELECT thread_id FROM threads WHERE workspace_id = ? LIMIT 1",
+      [binding.destinationWorkspaceId],
+    )[0];
+    if (assigned) {
+      throw conflict(
+        "workspace_relocation_destination_busy",
+        "Destination workspace is already assigned to a thread",
+      );
+    }
+    const reservation = existingRelocationId
+      ? this.database.all<{ relocation_id: string }>(
+          "SELECT relocation_id FROM workspace_relocations WHERE destination_node_id = ? AND destination_workspace_id = ? AND relocation_id <> ? LIMIT 1",
+          [
+            binding.destinationNodeId,
+            binding.destinationWorkspaceId,
+            existingRelocationId,
+          ],
+        )[0]
+      : this.database.all<{ relocation_id: string }>(
+          "SELECT relocation_id FROM workspace_relocations WHERE destination_node_id = ? AND destination_workspace_id = ? LIMIT 1",
+          [binding.destinationNodeId, binding.destinationWorkspaceId],
+        )[0];
+    if (reservation) {
+      throw conflict(
+        "workspace_relocation_destination_reserved",
+        "Destination workspace is reserved by another relocation",
       );
     }
   }
@@ -4660,6 +5229,96 @@ export class FactoryService {
       "SELECT * FROM managed_work_checkpoint_requests WHERE request_id = ?",
       [requestId],
     )[0];
+  }
+
+  #workspaceRelocationByRequest(
+    requestId: string,
+  ): WorkspaceRelocationRow | undefined {
+    return this.database.all<WorkspaceRelocationRow>(
+      "SELECT * FROM workspace_relocations WHERE request_id = ?",
+      [requestId],
+    )[0];
+  }
+
+  #workspaceRelocationById(
+    relocationId: string,
+  ): WorkspaceRelocationRow | undefined {
+    return this.database.all<WorkspaceRelocationRow>(
+      "SELECT * FROM workspace_relocations WHERE relocation_id = ?",
+      [relocationId],
+    )[0];
+  }
+
+  #workspaceRelocationAssignment(
+    row: WorkspaceRelocationRow,
+  ): WorkspaceRelocationClaim {
+    return workspaceRelocationClaimSchema.parse({
+      contractVersion: EXECUTION_CONTRACT_VERSION,
+      relocationId: row.relocation_id,
+      requestId: row.request_id,
+      checkpointRequestId: row.checkpoint_request_id,
+      captureRequestId: row.capture_request_id,
+      captureId: row.capture_id,
+      workspaceSnapshotRequestId: row.workspace_snapshot_request_id,
+      snapshotId: row.snapshot_id,
+      threadId: row.thread_id,
+      source: {
+        nodeId: row.source_node_id,
+        workspaceId: row.source_workspace_id,
+      },
+      destination: {
+        nodeId: row.destination_node_id,
+        workspaceId: row.destination_workspace_id,
+      },
+      ownershipGeneration: row.ownership_generation,
+      manifestReference: row.manifest_reference,
+    });
+  }
+
+  #workspaceRelocationStatus(row: WorkspaceRelocationRow) {
+    return workspaceRelocationStatusSchema.parse({
+      ...this.#workspaceRelocationAssignment(row),
+      contractVersion: CONTRACT_VERSION,
+      status: row.status,
+      acceptedAt: row.accepted_at,
+      updatedAt: row.updated_at,
+      ...(row.receipt_sha256 ? { receiptSha256: row.receipt_sha256 } : {}),
+      ...(row.previous_receipt_sha256
+        ? { previousReceiptSha256: row.previous_receipt_sha256 }
+        : {}),
+      ...(row.error_code ? { errorCode: row.error_code } : {}),
+    });
+  }
+
+  #assertWorkspaceRelocationReportBinding(
+    row: WorkspaceRelocationRow,
+    nodeId: string,
+    relocationId: string,
+    report: WorkspaceRelocationReport,
+  ): void {
+    if (
+      row.relocation_id !== relocationId ||
+      row.destination_node_id !== nodeId ||
+      report.relocationId !== row.relocation_id ||
+      report.requestId !== row.request_id ||
+      report.checkpointRequestId !== row.checkpoint_request_id ||
+      report.captureRequestId !== row.capture_request_id ||
+      report.captureId !== row.capture_id ||
+      report.workspaceSnapshotRequestId !== row.workspace_snapshot_request_id ||
+      report.snapshotId !== row.snapshot_id ||
+      report.threadId !== row.thread_id ||
+      report.source.nodeId !== row.source_node_id ||
+      report.source.workspaceId !== row.source_workspace_id ||
+      report.destination.nodeId !== row.destination_node_id ||
+      report.destination.workspaceId !== row.destination_workspace_id ||
+      report.ownershipGeneration !== row.ownership_generation ||
+      report.manifestReference !== row.manifest_reference
+    ) {
+      throw conflict(
+        "workspace_relocation_assignment_mismatch",
+        "Destination report does not match its immutable relocation assignment",
+      );
+    }
   }
 
   #managedWorkCheckpointStatus(row: ManagedWorkCheckpointRow) {
@@ -4962,6 +5621,20 @@ export class FactoryService {
       throw conflict(
         "managed_work_capture_active",
         "Input or execution admission is blocked while this managed workspace is being captured",
+      );
+    }
+    this.#assertWorkspaceNotReservedForRelocation(workspaceId);
+  }
+
+  #assertWorkspaceNotReservedForRelocation(workspaceId: string): void {
+    const reservation = this.database.all<{ relocation_id: string }>(
+      "SELECT relocation_id FROM workspace_relocations WHERE destination_workspace_id = ? LIMIT 1",
+      [workspaceId],
+    )[0];
+    if (reservation) {
+      throw conflict(
+        "workspace_relocation_reserved",
+        "Workspace admission is blocked while an inactive relocation reservation exists",
       );
     }
   }

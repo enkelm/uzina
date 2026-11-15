@@ -327,6 +327,62 @@ export class CaptureTestFactory extends FactoryObject {
     };
   }
 
+  workspaceRelocationHistoryForTest(requestId: string) {
+    const row = this.#storage.sql
+      .exec<{
+        status: string;
+        report_json: string | null;
+        report_sha256: string | null;
+        receipt_sha256: string | null;
+        previous_report_json: string | null;
+        previous_report_sha256: string | null;
+        previous_receipt_sha256: string | null;
+      }>(
+        `SELECT status, report_json, report_sha256, receipt_sha256,
+          previous_report_json, previous_report_sha256, previous_receipt_sha256
+         FROM workspace_relocations WHERE request_id = ?`,
+        requestId,
+      )
+      .toArray()[0];
+    if (!row) return null;
+    return {
+      status: row.status,
+      currentReport: row.report_json ? JSON.parse(row.report_json) : null,
+      reportSha256: row.report_sha256,
+      receiptSha256: row.receipt_sha256,
+      previousReport: row.previous_report_json
+        ? JSON.parse(row.previous_report_json)
+        : null,
+      previousReportSha256: row.previous_report_sha256,
+      previousReceiptSha256: row.previous_receipt_sha256,
+    };
+  }
+
+  workspaceRelocationSchemaForTest(action: "drop-history-columns" | "read") {
+    if (action === "drop-history-columns") {
+      const count = this.#storage.sql
+        .exec<{ count: number }>(
+          "SELECT COUNT(*) AS count FROM workspace_relocations",
+        )
+        .toArray()[0]?.count;
+      if (count !== 0)
+        throw new Error("Relocation evidence must remain intact");
+      for (const column of [
+        "previous_report_json",
+        "previous_report_sha256",
+        "previous_receipt_sha256",
+      ]) {
+        this.#storage.sql.exec(
+          `ALTER TABLE workspace_relocations DROP COLUMN ${column}`,
+        );
+      }
+    }
+    return this.#storage.sql
+      .exec<{ name: string }>("PRAGMA table_info(workspace_relocations)")
+      .toArray()
+      .map(({ name }) => name);
+  }
+
   override async publishManagedWorkCheckpoint(
     requestId: string,
     manifestReference: string,
@@ -842,6 +898,40 @@ export default {
         await checkpointBucket.put(key, request.body);
       }
       return new Response(null, { status: 204 });
+    }
+    if (
+      request.method === "POST" &&
+      url.pathname === "/__test/workspace-relocation-history"
+    ) {
+      const input = (await request.json()) as { requestId: string };
+      const factory = environment.FACTORY.get(
+        environment.FACTORY.idFromName("uzina-single-factory"),
+      ) as FactoryRpc & {
+        workspaceRelocationHistoryForTest(
+          requestId: string,
+        ): ReturnType<CaptureTestFactory["workspaceRelocationHistoryForTest"]>;
+      };
+      return Response.json(
+        await factory.workspaceRelocationHistoryForTest(input.requestId),
+      );
+    }
+    if (
+      request.method === "POST" &&
+      url.pathname === "/__test/workspace-relocation-schema"
+    ) {
+      const input = (await request.json()) as {
+        action: "drop-history-columns" | "read";
+      };
+      const factory = environment.FACTORY.get(
+        environment.FACTORY.idFromName("uzina-single-factory"),
+      ) as FactoryRpc & {
+        workspaceRelocationSchemaForTest(
+          action: "drop-history-columns" | "read",
+        ): ReturnType<CaptureTestFactory["workspaceRelocationSchemaForTest"]>;
+      };
+      return Response.json(
+        await factory.workspaceRelocationSchemaForTest(input.action),
+      );
     }
     if (
       request.method === "POST" &&

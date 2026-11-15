@@ -80,6 +80,7 @@ export class ExecutionLoop {
     };
 
     try {
+      await this.#daemon.reconcileWorkspaceRelocations();
       while (!registered && !shutdown.signal.aborted) {
         try {
           await this.#controller.register(this.#daemon.registerRequest());
@@ -127,6 +128,36 @@ export class ExecutionLoop {
               report.snapshotId,
               report,
             );
+          }
+
+          for (const report of this.#daemon.pendingWorkspaceRelocationReports()) {
+            if (shutdown.signal.aborted) break;
+            await this.#controller.reportWorkspaceRelocation(report);
+            this.#daemon.markWorkspaceRelocationReported(
+              report.relocationId,
+              report,
+            );
+          }
+
+          if (shutdown.signal.aborted) break;
+          const relocation = await this.#controller.claimWorkspaceRelocation();
+          if (shutdown.signal.aborted) break;
+          if (relocation) {
+            const report = await this.#daemon.executeWorkspaceRelocation(
+              relocation,
+              (relocationId, reference) =>
+                this.#controller.fetchWorkspaceRelocationBlob(
+                  relocationId,
+                  reference,
+                ),
+            );
+            if (!credentialRejected) {
+              await this.#controller.reportWorkspaceRelocation(report);
+              this.#daemon.markWorkspaceRelocationReported(
+                report.relocationId,
+                report,
+              );
+            }
           }
 
           if (shutdown.signal.aborted) break;

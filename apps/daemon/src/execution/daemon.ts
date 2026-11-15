@@ -4,14 +4,19 @@ import {
   constants,
   createReadStream,
   existsSync,
+  fstatSync,
   fsyncSync,
   lstatSync,
+  linkSync,
   mkdirSync,
   openSync,
+  readFileSync,
   readSync,
+  readdirSync,
   realpathSync,
   renameSync,
   rmSync,
+  unlinkSync,
   statSync,
   writeSync,
 } from "node:fs";
@@ -21,13 +26,25 @@ import { tmpdir } from "node:os";
 import {
   captureWorkspaceCheckpoint,
   FileBlobTransport,
+  restoreWorkspaceCheckpoint,
+  validateWorkspaceCheckpoint,
+  verifyRestoredWorkspaceCheckpoint,
   type WorkspaceCheckpointManifest,
 } from "@uzina/checkpoints";
 import {
+  portableWorkspaceBlobReferences,
+  PORTABLE_WORKSPACE_MANIFEST_MAX_BYTES,
+  PORTABLE_WORKSPACE_TOTAL_MAX_BYTES,
+} from "@uzina/checkpoints/portable";
+import {
   workspaceSnapshotClaimSchema,
   workspaceSnapshotReportSchema,
+  workspaceRelocationClaimSchema,
+  workspaceRelocationReportSchema,
   type WorkspaceSnapshotClaim,
   type WorkspaceSnapshotReport,
+  type WorkspaceRelocationClaim,
+  type WorkspaceRelocationReport,
 } from "@uzina/contracts/factory";
 import { Database } from "bun:sqlite";
 import {
@@ -57,6 +74,7 @@ import {
   type ExecutionResult,
   type ExecutionWorkspaceReport,
 } from "../../../../packages/contracts/src/execution";
+import { ControllerHttpError, ControllerProtocolError } from "./connector";
 import { ExecutionError } from "./errors";
 import { executionPayloadSha256 } from "./payload";
 import { RexProcessManager } from "./rex";
@@ -100,6 +118,43 @@ interface CaptureControlRow {
   reported_at: string | null;
   error_code: string | null;
 }
+
+interface WorkspaceRelocationReceiptRow {
+  relocation_id: string;
+  request_id: string;
+  checkpoint_request_id: string;
+  capture_request_id: string;
+  capture_id: string;
+  workspace_snapshot_request_id: string;
+  snapshot_id: string;
+  source_node_id: string;
+  source_workspace_id: string;
+  destination_node_id: string;
+  destination_workspace_id: string;
+  ownership_generation: number;
+  manifest_reference: string;
+  binding_json: string;
+  binding_sha256: string;
+  workspace_root: string | null;
+  cache_directory: string | null;
+  status: "preparing" | "prepared-inactive" | "blocked" | "uncertain";
+  stage: "downloading" | "restore-started" | "terminal";
+  receipt_json: string | null;
+  receipt_sha256: string | null;
+  previous_receipt_json: string | null;
+  previous_receipt_sha256: string | null;
+  report_json: string | null;
+  report_sha256: string | null;
+  reported_at: string | null;
+  accepted_at: string;
+  updated_at: string;
+  error_code: string | null;
+}
+
+type WorkspaceRelocationBlobFetcher = (
+  relocationId: string,
+  reference: string,
+) => Promise<{ body: ReadableStream<Uint8Array>; size: number }>;
 
 interface WorkspaceSnapshotReceiptRow {
   snapshot_id: string;
@@ -287,7 +342,9 @@ export class ExecutionDaemon {
   readonly #nodeId: string;
   readonly #daemonVersion: string;
   readonly #snapshotCacheDirectory: string;
+  readonly #databasePath: string | undefined;
   readonly #workspaces = new Map<string, string>();
+  readonly #workspaceRelocationsInFlight = new Set<string>();
   readonly rex: RexProcessManager;
   #closed = false;
 
@@ -310,6 +367,10 @@ export class ExecutionDaemon {
           : `${resolve(options.databasePath)}.snapshot-cache`),
     );
     this.#db = new Database(options.databasePath);
+    this.#databasePath =
+      options.databasePath === ":memory:"
+        ? undefined
+        : resolve(options.databasePath);
     try {
       this.#db.exec(`
       PRAGMA journal_mode = WAL;
@@ -379,6 +440,44 @@ export class ExecutionDaemon {
         accepted_at TEXT NOT NULL,
         reported_at TEXT
       );
+      CREATE TABLE IF NOT EXISTS execution_workspace_relocations (
+        relocation_id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL UNIQUE,
+        checkpoint_request_id TEXT NOT NULL,
+        capture_request_id TEXT NOT NULL,
+        capture_id TEXT NOT NULL,
+        workspace_snapshot_request_id TEXT NOT NULL,
+        snapshot_id TEXT NOT NULL UNIQUE,
+        source_node_id TEXT NOT NULL,
+        source_workspace_id TEXT NOT NULL,
+        destination_node_id TEXT NOT NULL,
+        destination_workspace_id TEXT NOT NULL UNIQUE,
+        ownership_generation INTEGER NOT NULL CHECK (ownership_generation >= 0),
+        manifest_reference TEXT NOT NULL CHECK (length(manifest_reference) = 64 AND manifest_reference NOT GLOB '*[^a-f0-9]*'),
+        binding_json TEXT NOT NULL,
+        binding_sha256 TEXT NOT NULL CHECK (length(binding_sha256) = 64 AND binding_sha256 NOT GLOB '*[^a-f0-9]*'),
+        workspace_root TEXT,
+        cache_directory TEXT,
+        status TEXT NOT NULL CHECK (status IN ('preparing', 'prepared-inactive', 'blocked', 'uncertain')),
+        stage TEXT NOT NULL CHECK (stage IN ('downloading', 'restore-started', 'terminal')),
+        receipt_json TEXT,
+        receipt_sha256 TEXT,
+        previous_receipt_json TEXT,
+        previous_receipt_sha256 TEXT,
+        report_json TEXT,
+        report_sha256 TEXT,
+        reported_at TEXT,
+        accepted_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        error_code TEXT,
+        CHECK (
+          (status = 'preparing' AND report_json IS NULL AND report_sha256 IS NULL AND receipt_json IS NULL AND receipt_sha256 IS NULL AND error_code IS NULL)
+          OR (status = 'prepared-inactive' AND stage = 'terminal' AND report_json IS NOT NULL AND report_sha256 IS NOT NULL AND receipt_json IS NOT NULL AND receipt_sha256 IS NOT NULL AND error_code IS NULL)
+          OR (status IN ('blocked', 'uncertain') AND stage = 'terminal' AND report_json IS NOT NULL AND report_sha256 IS NOT NULL AND receipt_json IS NOT NULL AND receipt_sha256 IS NOT NULL AND error_code IS NOT NULL)
+        )
+      );
+      CREATE INDEX IF NOT EXISTS execution_workspace_relocations_pending
+        ON execution_workspace_relocations(status, reported_at, accepted_at);
       CREATE TABLE IF NOT EXISTS execution_rex_processes (
         process_id TEXT PRIMARY KEY,
         payload_sha256 TEXT NOT NULL,
@@ -970,6 +1069,196 @@ export class ExecutionDaemon {
         "UPDATE execution_workspace_snapshots SET reported_at = ?, status = CASE WHEN status IN ('blocked', 'uncertain') THEN status ELSE 'available' END WHERE snapshot_id = ? AND reported_at IS NULL",
       )
       .run(new Date().toISOString(), snapshotId);
+  }
+
+  pendingWorkspaceRelocationReports(): WorkspaceRelocationReport[] {
+    this.#assertOpen();
+    return this.#db
+      .query<{ report_json: string }, []>(
+        "SELECT report_json FROM execution_workspace_relocations WHERE report_json IS NOT NULL AND reported_at IS NULL ORDER BY accepted_at, relocation_id",
+      )
+      .all()
+      .map((row) =>
+        workspaceRelocationReportSchema.parse(JSON.parse(row.report_json)),
+      );
+  }
+
+  markWorkspaceRelocationReported(
+    relocationId: string,
+    report: WorkspaceRelocationReport,
+  ): void {
+    this.#assertOpen();
+    const row = this.#workspaceRelocationRow(relocationId);
+    if (!row || row.report_sha256 !== executionPayloadSha256(report)) {
+      throw new ExecutionError("workspace_relocation_report_ack_mismatch");
+    }
+    this.#db
+      .query(
+        "UPDATE execution_workspace_relocations SET reported_at = ? WHERE relocation_id = ? AND reported_at IS NULL",
+      )
+      .run(new Date().toISOString(), relocationId);
+  }
+
+  /** Reconciles local receipts before the daemon can accept new controller work. */
+  async reconcileWorkspaceRelocations(): Promise<void> {
+    this.#assertOpen();
+    const rows = this.#db
+      .query<WorkspaceRelocationReceiptRow, []>(
+        "SELECT * FROM execution_workspace_relocations WHERE status IN ('preparing', 'prepared-inactive') ORDER BY accepted_at, relocation_id",
+      )
+      .all();
+    for (const row of rows) {
+      if (this.#workspaceRelocationsInFlight.has(row.relocation_id)) continue;
+      this.#workspaceRelocationsInFlight.add(row.relocation_id);
+      try {
+        const claim = workspaceRelocationClaimSchema.parse(
+          JSON.parse(row.binding_json),
+        );
+        this.#assertWorkspaceRelocationIdentity(claim, row);
+        if (row.status === "preparing" && row.stage === "downloading") {
+          if (!this.#relocationWorkspaceIsEmpty(row)) {
+            this.#storeWorkspaceRelocationReport(
+              claim,
+              "uncertain",
+              "workspace_relocation_destination_changed",
+            );
+          }
+          continue;
+        }
+        try {
+          this.#assertWorkspaceRelocationReady(row, false);
+          const manifest = this.#loadWorkspaceRelocationManifest(row);
+          const transport = new FileBlobTransport(row.cache_directory!);
+          const validation = await validateWorkspaceCheckpoint(
+            manifest,
+            transport,
+          );
+          if (!validation.valid) {
+            throw new ExecutionError("workspace_relocation_checkpoint_invalid");
+          }
+          await verifyRestoredWorkspaceCheckpoint(
+            manifest,
+            transport,
+            row.workspace_root!,
+          );
+          this.#assertWorkspaceRelocationReady(row, false);
+          if (row.status === "preparing") {
+            this.#storeWorkspaceRelocationReport(claim, "prepared-inactive");
+          }
+        } catch {
+          this.#storeWorkspaceRelocationReport(
+            claim,
+            "uncertain",
+            "workspace_relocation_restore_unverified",
+          );
+        }
+      } finally {
+        this.#workspaceRelocationsInFlight.delete(row.relocation_id);
+      }
+    }
+  }
+
+  async executeWorkspaceRelocation(
+    input: unknown,
+    fetchBlob: WorkspaceRelocationBlobFetcher,
+  ): Promise<WorkspaceRelocationReport> {
+    this.#assertOpen();
+    const claim = workspaceRelocationClaimSchema.parse(input);
+    if (
+      claim.destination.nodeId !== this.#nodeId ||
+      claim.source.nodeId === claim.destination.nodeId ||
+      claim.source.workspaceId === claim.destination.workspaceId
+    ) {
+      throw new ExecutionError("workspace_relocation_node_mismatch");
+    }
+    if (this.#workspaceRelocationsInFlight.has(claim.relocationId)) {
+      throw new ExecutionError("workspace_relocation_already_running");
+    }
+    this.#workspaceRelocationsInFlight.add(claim.relocationId);
+    try {
+      let row = this.#workspaceRelocationRow(claim.relocationId);
+      if (row) {
+        this.#assertWorkspaceRelocationIdentity(claim, row);
+        if (row.report_json && row.status !== "prepared-inactive") {
+          return workspaceRelocationReportSchema.parse(
+            JSON.parse(row.report_json),
+          );
+        }
+        if (row.status === "prepared-inactive") {
+          try {
+            this.#assertWorkspaceRelocationReady(row, false);
+            const manifest = this.#loadWorkspaceRelocationManifest(row);
+            const transport = new FileBlobTransport(row.cache_directory!);
+            const validation = await validateWorkspaceCheckpoint(
+              manifest,
+              transport,
+            );
+            if (!validation.valid) {
+              throw new ExecutionError(
+                "workspace_relocation_checkpoint_invalid",
+              );
+            }
+            await verifyRestoredWorkspaceCheckpoint(
+              manifest,
+              transport,
+              row.workspace_root!,
+            );
+            this.#assertWorkspaceRelocationReady(row, false);
+            return workspaceRelocationReportSchema.parse(
+              JSON.parse(row.report_json!),
+            );
+          } catch {
+            return this.#storeWorkspaceRelocationReport(
+              claim,
+              "uncertain",
+              "workspace_relocation_restore_unverified",
+            );
+          }
+        }
+        if (row.stage === "restore-started") {
+          return this.#reconcileStartedWorkspaceRelocation(claim, row);
+        }
+      } else {
+        row = this.#reserveWorkspaceRelocation(claim);
+        if (row.report_json) {
+          return workspaceRelocationReportSchema.parse(
+            JSON.parse(row.report_json),
+          );
+        }
+      }
+
+      try {
+        return await this.#prepareWorkspaceRelocation(claim, row, fetchBlob);
+      } catch (error) {
+        if (error instanceof ControllerHttpError) {
+          if ([404, 409, 422].includes(error.status)) {
+            return this.#storeWorkspaceRelocationReport(
+              claim,
+              "uncertain",
+              "workspace_relocation_source_unavailable",
+            );
+          }
+          throw error;
+        }
+        if (error instanceof ControllerProtocolError) {
+          return this.#storeWorkspaceRelocationReport(
+            claim,
+            row.stage === "restore-started" ? "uncertain" : "blocked",
+            "workspace_relocation_blob_invalid",
+          );
+        }
+        if (error instanceof ExecutionError) {
+          return this.#storeWorkspaceRelocationReport(
+            claim,
+            row.stage === "restore-started" ? "uncertain" : "blocked",
+            error.code,
+          );
+        }
+        throw error;
+      }
+    } finally {
+      this.#workspaceRelocationsInFlight.delete(claim.relocationId);
+    }
   }
 
   /** Produces once under the held CONTROL fence, then retries only immutable cached uploads. */
@@ -1735,6 +2024,850 @@ export class ExecutionDaemon {
     return report;
   }
 
+  #reserveWorkspaceRelocation(
+    claim: WorkspaceRelocationClaim,
+  ): WorkspaceRelocationReceiptRow {
+    const acceptedAt = new Date().toISOString();
+    const workspaceRoot =
+      this.#workspaces.get(claim.destination.workspaceId) ?? null;
+    const cacheDirectory = workspaceRoot
+      ? this.#workspaceRelocationCacheDirectory(claim.relocationId)
+      : null;
+    let refusal: string | undefined;
+    if (
+      claim.destination.nodeId !== this.#nodeId ||
+      claim.source.nodeId === claim.destination.nodeId ||
+      claim.source.workspaceId === claim.destination.workspaceId
+    ) {
+      throw new ExecutionError("workspace_relocation_node_mismatch");
+    }
+    if (!workspaceRoot) {
+      refusal = "workspace_not_configured";
+    } else {
+      refusal = this.#workspaceRelocationPreflightError(
+        claim,
+        workspaceRoot,
+        cacheDirectory!,
+      );
+    }
+    this.#transaction(() => {
+      const existing = this.#workspaceRelocationRow(claim.relocationId);
+      if (existing) {
+        this.#assertWorkspaceRelocationIdentity(claim, existing);
+        return;
+      }
+      const bindingJson = JSON.stringify(claim);
+      this.#db
+        .query(
+          `INSERT INTO execution_workspace_relocations(
+            relocation_id, request_id, checkpoint_request_id, capture_request_id,
+            capture_id, workspace_snapshot_request_id, snapshot_id, source_node_id,
+            source_workspace_id, destination_node_id, destination_workspace_id,
+            ownership_generation, manifest_reference, binding_json, binding_sha256,
+            workspace_root, cache_directory, status, stage, accepted_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'preparing', 'downloading', ?, ?)`,
+        )
+        .run(
+          claim.relocationId,
+          claim.requestId,
+          claim.checkpointRequestId,
+          claim.captureRequestId,
+          claim.captureId,
+          claim.workspaceSnapshotRequestId,
+          claim.snapshotId,
+          claim.source.nodeId,
+          claim.source.workspaceId,
+          claim.destination.nodeId,
+          claim.destination.workspaceId,
+          claim.ownershipGeneration,
+          claim.manifestReference,
+          bindingJson,
+          executionPayloadSha256(claim),
+          workspaceRoot,
+          cacheDirectory,
+          acceptedAt,
+          acceptedAt,
+        );
+      this.#db
+        .query(
+          "UPDATE execution_workspaces SET active = 0 WHERE workspace_id = ?",
+        )
+        .run(claim.destination.workspaceId);
+    });
+    let row = this.#workspaceRelocationRow(claim.relocationId);
+    if (!row) throw new ExecutionError("workspace_relocation_receipt_missing");
+    if (refusal) {
+      this.#storeWorkspaceRelocationReport(claim, "blocked", refusal);
+      row = this.#workspaceRelocationRow(claim.relocationId);
+      if (!row)
+        throw new ExecutionError("workspace_relocation_receipt_missing");
+    }
+    return row;
+  }
+
+  #workspaceRelocationPreflightError(
+    claim: WorkspaceRelocationClaim,
+    workspaceRoot: string,
+    cacheDirectory: string,
+  ): string | undefined {
+    try {
+      const workspace = this.#workspaceRow(claim.destination.workspaceId);
+      if (!workspace) return "workspace_not_configured";
+      if (
+        workspace.directory !== workspaceRoot ||
+        realpathSync(workspace.directory) !== workspaceRoot ||
+        lstatSync(workspaceRoot).isSymbolicLink() ||
+        !lstatSync(workspaceRoot).isDirectory()
+      ) {
+        return "workspace_relocation_destination_path_invalid";
+      }
+      if (workspace.ownership_generation !== claim.ownershipGeneration) {
+        return "stale_ownership_generation";
+      }
+      if (!workspace.active) return "workspace_fenced";
+      if (readdirSync(workspaceRoot).length !== 0) {
+        return "workspace_relocation_destination_not_empty";
+      }
+      const roots = this.#db
+        .query<{ workspace_id: string; directory: string }, []>(
+          "SELECT workspace_id, directory FROM execution_workspaces",
+        )
+        .all();
+      for (const other of roots) {
+        if (other.workspace_id === claim.destination.workspaceId) continue;
+        const root = realpathSync(other.directory);
+        if (within(root, workspaceRoot) || within(workspaceRoot, root)) {
+          return "workspace_relocation_destination_overlap";
+        }
+      }
+      if (
+        this.#databasePath &&
+        within(workspaceRoot, realpathSync(this.#databasePath))
+      ) {
+        return "workspace_relocation_database_overlap";
+      }
+      let cacheAncestor = resolve(this.#snapshotCacheDirectory);
+      while (!existsSync(cacheAncestor)) cacheAncestor = dirname(cacheAncestor);
+      const projectedCache = resolve(
+        realpathSync(cacheAncestor),
+        relative(cacheAncestor, resolve(cacheDirectory)),
+      );
+      if (
+        within(workspaceRoot, projectedCache) ||
+        within(projectedCache, workspaceRoot)
+      ) {
+        return "workspace_relocation_cache_overlap";
+      }
+      if (
+        this.#databasePath &&
+        within(projectedCache, realpathSync(this.#databasePath))
+      ) {
+        return "workspace_relocation_database_overlap";
+      }
+      if (
+        this.#db
+          .query<{ workspace_id: string }, [string]>(
+            "SELECT workspace_id FROM execution_workspace_captures WHERE workspace_id = ?",
+          )
+          .get(claim.destination.workspaceId)
+      ) {
+        return "workspace_capture_active";
+      }
+      if (
+        this.#db
+          .query<{ job_id: string }, [string]>(
+            "SELECT job_id FROM execution_jobs WHERE workspace_id = ? AND status NOT IN ('completed', 'failed') LIMIT 1",
+          )
+          .get(claim.destination.workspaceId)
+      ) {
+        return "workspace_relocation_destination_busy";
+      }
+      if (this.rex.hasBlockingProcesses(claim.destination.workspaceId)) {
+        return "workspace_relocation_destination_busy";
+      }
+      return undefined;
+    } catch {
+      return "workspace_relocation_destination_path_invalid";
+    }
+  }
+
+  async #prepareWorkspaceRelocation(
+    claim: WorkspaceRelocationClaim,
+    row: WorkspaceRelocationReceiptRow,
+    fetchBlob: WorkspaceRelocationBlobFetcher,
+  ): Promise<WorkspaceRelocationReport> {
+    this.#assertWorkspaceRelocationIdentity(claim, row);
+    if (
+      row.status !== "preparing" ||
+      row.stage !== "downloading" ||
+      !row.workspace_root ||
+      !row.cache_directory
+    ) {
+      throw new ExecutionError("workspace_relocation_not_preparing");
+    }
+    this.#assertWorkspaceRelocationReady(row, true);
+    await this.#assertSnapshotCacheOutsideWorkspaces(row.cache_directory);
+    this.#assertWorkspaceRelocationCacheDirectory(row);
+    this.#assertWorkspaceRelocationCacheOutsideDatabase(row.cache_directory);
+    const manifestPath = join(row.cache_directory, claim.manifestReference);
+    if (existsSync(manifestPath)) {
+      this.#assertRelocationCacheBlob(
+        row.cache_directory,
+        claim.manifestReference,
+        undefined,
+        PORTABLE_WORKSPACE_MANIFEST_MAX_BYTES,
+      );
+    } else {
+      this.#assertWorkspaceRelocationReady(row, true);
+      const response = await fetchBlob(
+        claim.relocationId,
+        claim.manifestReference,
+      );
+      await this.#writeWorkspaceRelocationBlob(
+        row.cache_directory,
+        claim.manifestReference,
+        response.body,
+        response.size,
+        PORTABLE_WORKSPACE_MANIFEST_MAX_BYTES,
+      );
+    }
+    const manifestBytes = readFileSync(manifestPath);
+    let manifest: WorkspaceCheckpointManifest;
+    try {
+      manifest = JSON.parse(
+        new TextDecoder("utf-8", { fatal: true }).decode(manifestBytes),
+      ) as WorkspaceCheckpointManifest;
+    } catch {
+      throw new ExecutionError("invalid_workspace_checkpoint_manifest");
+    }
+    let references: ReturnType<typeof portableWorkspaceBlobReferences>;
+    try {
+      references = portableWorkspaceBlobReferences(
+        manifest,
+        claim.manifestReference,
+        manifestBytes.byteLength,
+      );
+    } catch {
+      throw new ExecutionError("invalid_workspace_checkpoint_manifest");
+    }
+    const cacheTotal = references.reduce((total, reference) => {
+      if (reference.size > PORTABLE_WORKSPACE_TOTAL_MAX_BYTES) {
+        throw new ExecutionError("workspace_checkpoint_blob_limit");
+      }
+      return total + reference.size;
+    }, 0);
+    if (
+      references.length > 200_002 ||
+      cacheTotal >
+        PORTABLE_WORKSPACE_TOTAL_MAX_BYTES +
+          PORTABLE_WORKSPACE_MANIFEST_MAX_BYTES
+    ) {
+      throw new ExecutionError("workspace_checkpoint_bounds_exceeded");
+    }
+    for (const reference of references) {
+      if (reference.reference === claim.manifestReference) continue;
+      const path = join(row.cache_directory, reference.reference);
+      if (existsSync(path)) {
+        this.#assertRelocationCacheBlobMetadata(
+          row.cache_directory,
+          reference.reference,
+          reference.size,
+          PORTABLE_WORKSPACE_TOTAL_MAX_BYTES,
+        );
+        continue;
+      }
+      const response = await fetchBlob(claim.relocationId, reference.reference);
+      await this.#writeWorkspaceRelocationBlob(
+        row.cache_directory,
+        reference.reference,
+        response.body,
+        reference.size,
+        PORTABLE_WORKSPACE_TOTAL_MAX_BYTES,
+      );
+    }
+    const transport = new FileBlobTransport(row.cache_directory);
+    const validation = await validateWorkspaceCheckpoint(manifest, transport);
+    if (!validation.valid) {
+      throw new ExecutionError("workspace_relocation_checkpoint_invalid");
+    }
+    this.#assertWorkspaceRelocationReady(row, true);
+    this.#transaction(() => {
+      const current = this.#workspaceRelocationRow(claim.relocationId);
+      if (!current) {
+        throw new ExecutionError("workspace_relocation_receipt_missing");
+      }
+      this.#assertWorkspaceRelocationIdentity(claim, current);
+      this.#assertWorkspaceRelocationReady(current, true);
+      this.#db
+        .query(
+          "UPDATE execution_workspace_relocations SET stage = 'restore-started', updated_at = ? WHERE relocation_id = ? AND status = 'preparing' AND stage = 'downloading'",
+        )
+        .run(new Date().toISOString(), claim.relocationId);
+    });
+    try {
+      await restoreWorkspaceCheckpoint({
+        manifest,
+        transport,
+        destinationPath: row.workspace_root,
+      });
+      await verifyRestoredWorkspaceCheckpoint(
+        manifest,
+        transport,
+        row.workspace_root,
+      );
+      this.#assertWorkspaceRelocationReady(
+        this.#workspaceRelocationRow(claim.relocationId)!,
+        false,
+      );
+      return this.#storeWorkspaceRelocationReport(claim, "prepared-inactive");
+    } catch {
+      return this.#storeWorkspaceRelocationReport(
+        claim,
+        "uncertain",
+        "workspace_relocation_restore_unverified",
+      );
+    }
+  }
+
+  async #reconcileStartedWorkspaceRelocation(
+    claim: WorkspaceRelocationClaim,
+    row: WorkspaceRelocationReceiptRow,
+  ): Promise<WorkspaceRelocationReport> {
+    try {
+      const manifest = this.#loadWorkspaceRelocationManifest(row);
+      const transport = new FileBlobTransport(row.cache_directory!);
+      const validation = await validateWorkspaceCheckpoint(manifest, transport);
+      if (!validation.valid) {
+        throw new ExecutionError("workspace_relocation_checkpoint_invalid");
+      }
+      await verifyRestoredWorkspaceCheckpoint(
+        manifest,
+        transport,
+        row.workspace_root!,
+      );
+      this.#assertWorkspaceRelocationReady(row, false);
+      return this.#storeWorkspaceRelocationReport(claim, "prepared-inactive");
+    } catch {
+      return this.#storeWorkspaceRelocationReport(
+        claim,
+        "uncertain",
+        "workspace_relocation_restore_unverified",
+      );
+    }
+  }
+
+  #loadWorkspaceRelocationManifest(
+    row: WorkspaceRelocationReceiptRow,
+  ): WorkspaceCheckpointManifest {
+    if (!row.cache_directory || !row.manifest_reference) {
+      throw new ExecutionError("workspace_relocation_cache_missing");
+    }
+    this.#assertWorkspaceRelocationCacheDirectory(row);
+    const path = join(row.cache_directory, row.manifest_reference);
+    this.#assertRelocationCacheBlob(
+      row.cache_directory,
+      row.manifest_reference,
+      undefined,
+      PORTABLE_WORKSPACE_MANIFEST_MAX_BYTES,
+    );
+    let bytes: Buffer;
+    let manifest: WorkspaceCheckpointManifest;
+    try {
+      bytes = readFileSync(path);
+      manifest = JSON.parse(
+        new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+      ) as WorkspaceCheckpointManifest;
+    } catch {
+      throw new ExecutionError("invalid_workspace_checkpoint_manifest");
+    }
+    let references: ReturnType<typeof portableWorkspaceBlobReferences>;
+    try {
+      references = portableWorkspaceBlobReferences(
+        manifest,
+        row.manifest_reference,
+        bytes.byteLength,
+      );
+    } catch {
+      throw new ExecutionError("invalid_workspace_checkpoint_manifest");
+    }
+    for (const reference of references) {
+      this.#assertRelocationCacheBlobMetadata(
+        row.cache_directory,
+        reference.reference,
+        reference.size,
+        reference.reference === row.manifest_reference
+          ? PORTABLE_WORKSPACE_MANIFEST_MAX_BYTES
+          : PORTABLE_WORKSPACE_TOTAL_MAX_BYTES,
+      );
+    }
+    return manifest;
+  }
+
+  #assertRelocationCacheBlob(
+    cacheDirectory: string,
+    reference: string,
+    expectedSize: number | undefined,
+    maximumSize: number,
+  ): void {
+    this.#assertRelocationCacheBlobMetadata(
+      cacheDirectory,
+      reference,
+      expectedSize,
+      maximumSize,
+    );
+    const path = join(cacheDirectory, reference);
+    let descriptor: number | undefined;
+    try {
+      descriptor = openSync(
+        path,
+        constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+      );
+      const info = fstatSync(descriptor);
+      if (
+        !info.isFile() ||
+        info.size > maximumSize ||
+        (expectedSize !== undefined && info.size !== expectedSize) ||
+        (info.mode & 0o077) !== 0
+      ) {
+        throw new ExecutionError("workspace_relocation_cache_file_invalid");
+      }
+      const hasher = createHash("sha256");
+      const chunk = Buffer.alloc(64 * 1024);
+      const size = info.size;
+      let offset = 0;
+      while (offset < size) {
+        const length = readSync(
+          descriptor,
+          chunk,
+          0,
+          Math.min(chunk.byteLength, size - offset),
+          offset,
+        );
+        if (length === 0) {
+          throw new ExecutionError("workspace_relocation_cache_truncated");
+        }
+        hasher.update(chunk.subarray(0, length));
+        offset += length;
+      }
+      if (hasher.digest("hex") !== reference) {
+        throw new ExecutionError("workspace_relocation_cache_hash_mismatch");
+      }
+    } catch (error) {
+      if (error instanceof ExecutionError) throw error;
+      throw new ExecutionError("workspace_relocation_cache_unavailable");
+    } finally {
+      if (descriptor !== undefined) closeSync(descriptor);
+    }
+  }
+
+  #assertRelocationCacheBlobMetadata(
+    cacheDirectory: string,
+    reference: string,
+    expectedSize: number | undefined,
+    maximumSize: number,
+  ): void {
+    const path = join(cacheDirectory, reference);
+    try {
+      const info = lstatSync(path);
+      if (
+        !info.isFile() ||
+        info.isSymbolicLink() ||
+        (info.mode & 0o077) !== 0
+      ) {
+        throw new ExecutionError("workspace_relocation_cache_file_invalid");
+      }
+      if (
+        info.size > maximumSize ||
+        (expectedSize !== undefined && info.size !== expectedSize)
+      ) {
+        throw new ExecutionError("workspace_relocation_cache_size_mismatch");
+      }
+    } catch (error) {
+      if (error instanceof ExecutionError) throw error;
+      throw new ExecutionError("workspace_relocation_cache_unavailable");
+    }
+  }
+
+  async #writeWorkspaceRelocationBlob(
+    cacheDirectory: string,
+    reference: string,
+    body: ReadableStream<Uint8Array>,
+    expectedSize: number,
+    maximumSize: number,
+  ): Promise<void> {
+    if (
+      !/^[a-f0-9]{64}$/.test(reference) ||
+      !Number.isSafeInteger(expectedSize) ||
+      expectedSize < 0 ||
+      expectedSize > maximumSize
+    ) {
+      throw new ExecutionError("workspace_relocation_blob_metadata_invalid");
+    }
+    const destination = join(cacheDirectory, reference);
+    if (existsSync(destination)) {
+      this.#assertRelocationCacheBlob(
+        cacheDirectory,
+        reference,
+        expectedSize,
+        maximumSize,
+      );
+      return;
+    }
+    const temporary = join(
+      cacheDirectory,
+      `.${reference}.${randomUUID()}.part`,
+    );
+    let descriptor: number | undefined;
+    const reader = body.getReader();
+    let bytes = 0;
+    const hasher = createHash("sha256");
+    try {
+      descriptor = openSync(
+        temporary,
+        constants.O_WRONLY |
+          constants.O_CREAT |
+          constants.O_EXCL |
+          (constants.O_NOFOLLOW ?? 0),
+        0o600,
+      );
+      while (true) {
+        // A rejected network stream leaves the durable claim at the download stage.
+        // The connector wraps stream failures as retryable transport errors.
+        const part = await reader.read();
+        if (part.done) break;
+        if (!(part.value instanceof Uint8Array)) {
+          throw new ExecutionError("workspace_relocation_blob_invalid");
+        }
+        bytes += part.value.byteLength;
+        if (bytes > maximumSize || bytes > expectedSize) {
+          void reader.cancel().catch(() => {});
+          throw new ExecutionError("workspace_relocation_blob_size_mismatch");
+        }
+        hasher.update(part.value);
+        let offset = 0;
+        while (offset < part.value.byteLength) {
+          offset += writeSync(
+            descriptor,
+            part.value,
+            offset,
+            part.value.byteLength - offset,
+          );
+        }
+      }
+      fsyncSync(descriptor);
+      closeSync(descriptor);
+      descriptor = undefined;
+      if (bytes !== expectedSize || hasher.digest("hex") !== reference) {
+        throw new ExecutionError("workspace_relocation_blob_integrity_failed");
+      }
+      try {
+        linkSync(temporary, destination);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        this.#assertRelocationCacheBlob(
+          cacheDirectory,
+          reference,
+          expectedSize,
+          maximumSize,
+        );
+      }
+      unlinkSync(temporary);
+    } catch (error) {
+      await reader.cancel(error).catch(() => {});
+      if (descriptor !== undefined) closeSync(descriptor);
+      rmSync(temporary, { force: true });
+      if (error instanceof ExecutionError) throw error;
+      if (error instanceof Error && error.name === "ControllerTransportError") {
+        throw error;
+      }
+      throw new ExecutionError("workspace_relocation_cache_write_failed");
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
+  #workspaceRelocationCacheDirectory(relocationId: string): string {
+    return join(
+      this.#snapshotCacheDirectory,
+      "workspace-relocations",
+      sha256(relocationId),
+    );
+  }
+
+  #assertWorkspaceRelocationCacheDirectory(
+    row: WorkspaceRelocationReceiptRow,
+  ): void {
+    if (!row.cache_directory) {
+      throw new ExecutionError("workspace_relocation_cache_missing");
+    }
+    try {
+      const root = resolve(this.#snapshotCacheDirectory);
+      const namespace = dirname(row.cache_directory);
+      const leaf = resolve(row.cache_directory);
+      if (
+        leaf !== this.#workspaceRelocationCacheDirectory(row.relocation_id) ||
+        !within(root, leaf) ||
+        leaf === root
+      ) {
+        throw new ExecutionError("workspace_relocation_cache_path_invalid");
+      }
+      const rootInfo = lstatSync(root);
+      const namespaceInfo = lstatSync(namespace);
+      const leafInfo = lstatSync(leaf);
+      if (
+        !rootInfo.isDirectory() ||
+        rootInfo.isSymbolicLink() ||
+        !namespaceInfo.isDirectory() ||
+        namespaceInfo.isSymbolicLink() ||
+        !leafInfo.isDirectory() ||
+        leafInfo.isSymbolicLink() ||
+        [rootInfo, namespaceInfo, leafInfo].some(
+          (info) => (info.mode & 0o077) !== 0,
+        ) ||
+        !within(realpathSync(root), realpathSync(leaf))
+      ) {
+        throw new ExecutionError(
+          "workspace_relocation_cache_permissions_unsafe",
+        );
+      }
+      this.#assertWorkspaceRelocationCacheOutsideDatabase(leaf);
+    } catch (error) {
+      if (error instanceof ExecutionError) throw error;
+      throw new ExecutionError("workspace_relocation_cache_unavailable");
+    }
+  }
+
+  #assertWorkspaceRelocationCacheOutsideDatabase(cacheDirectory: string): void {
+    if (!this.#databasePath) return;
+    const databasePath = realpathSync(this.#databasePath);
+    let cacheAncestor = resolve(cacheDirectory);
+    while (!existsSync(cacheAncestor)) cacheAncestor = dirname(cacheAncestor);
+    const projectedCache = resolve(
+      realpathSync(cacheAncestor),
+      relative(cacheAncestor, resolve(cacheDirectory)),
+    );
+    if (within(projectedCache, databasePath)) {
+      throw new ExecutionError("workspace_relocation_database_overlap");
+    }
+  }
+
+  #assertWorkspaceRelocationReady(
+    row: WorkspaceRelocationReceiptRow,
+    requireEmpty: boolean,
+  ): void {
+    if (!row.workspace_root || !row.cache_directory) {
+      throw new ExecutionError("workspace_relocation_destination_unconfigured");
+    }
+    if (
+      this.#workspaces.get(row.destination_workspace_id) !== row.workspace_root
+    ) {
+      throw new ExecutionError("workspace_relocation_destination_changed");
+    }
+    if (
+      resolve(row.cache_directory) !==
+      this.#workspaceRelocationCacheDirectory(row.relocation_id)
+    ) {
+      throw new ExecutionError("workspace_relocation_cache_path_invalid");
+    }
+    const workspace = this.#workspaceRow(row.destination_workspace_id);
+    if (
+      !workspace ||
+      workspace.directory !== row.workspace_root ||
+      workspace.ownership_generation !== row.ownership_generation ||
+      workspace.active !== 0
+    ) {
+      throw new ExecutionError("workspace_relocation_destination_fence_lost");
+    }
+    let info;
+    try {
+      info = lstatSync(row.workspace_root);
+      if (
+        !info.isDirectory() ||
+        info.isSymbolicLink() ||
+        realpathSync(row.workspace_root) !== row.workspace_root
+      ) {
+        throw new ExecutionError(
+          "workspace_relocation_destination_path_invalid",
+        );
+      }
+      if (requireEmpty && readdirSync(row.workspace_root).length !== 0) {
+        throw new ExecutionError("workspace_relocation_destination_changed");
+      }
+      const roots = this.#db
+        .query<{ workspace_id: string; directory: string }, []>(
+          "SELECT workspace_id, directory FROM execution_workspaces",
+        )
+        .all();
+      for (const other of roots) {
+        if (other.workspace_id === row.destination_workspace_id) continue;
+        const root = realpathSync(other.directory);
+        if (
+          within(root, row.workspace_root) ||
+          within(row.workspace_root, root)
+        ) {
+          throw new ExecutionError("workspace_relocation_destination_overlap");
+        }
+      }
+      let cacheAncestor = resolve(this.#snapshotCacheDirectory);
+      while (!existsSync(cacheAncestor)) cacheAncestor = dirname(cacheAncestor);
+      const projectedCache = resolve(
+        realpathSync(cacheAncestor),
+        relative(cacheAncestor, resolve(row.cache_directory)),
+      );
+      if (
+        within(row.workspace_root, projectedCache) ||
+        within(projectedCache, row.workspace_root)
+      ) {
+        throw new ExecutionError("workspace_relocation_cache_overlap");
+      }
+      if (
+        this.#databasePath &&
+        within(row.workspace_root, realpathSync(this.#databasePath))
+      ) {
+        throw new ExecutionError("workspace_relocation_database_overlap");
+      }
+      if (
+        this.#db
+          .query<{ workspace_id: string }, [string]>(
+            "SELECT workspace_id FROM execution_workspace_captures WHERE workspace_id = ?",
+          )
+          .get(row.destination_workspace_id)
+      ) {
+        throw new ExecutionError("workspace_capture_active");
+      }
+      if (
+        this.#db
+          .query<{ job_id: string }, [string]>(
+            "SELECT job_id FROM execution_jobs WHERE workspace_id = ? AND status NOT IN ('completed', 'failed') LIMIT 1",
+          )
+          .get(row.destination_workspace_id)
+      ) {
+        throw new ExecutionError("workspace_relocation_destination_busy");
+      }
+      if (this.rex.hasBlockingProcesses(row.destination_workspace_id)) {
+        throw new ExecutionError("workspace_relocation_destination_busy");
+      }
+      this.#assertWorkspaceRelocationCacheOutsideDatabase(row.cache_directory);
+    } catch (error) {
+      if (error instanceof ExecutionError) throw error;
+      throw new ExecutionError("workspace_relocation_destination_path_invalid");
+    }
+  }
+
+  #relocationWorkspaceIsEmpty(row: WorkspaceRelocationReceiptRow): boolean {
+    try {
+      this.#assertWorkspaceRelocationReady(row, true);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  #storeWorkspaceRelocationReport(
+    claim: WorkspaceRelocationClaim,
+    status: WorkspaceRelocationReport["status"],
+    code?: string,
+  ): WorkspaceRelocationReport {
+    return this.#transaction(() => {
+      const row = this.#workspaceRelocationRow(claim.relocationId);
+      if (!row) {
+        throw new ExecutionError("workspace_relocation_receipt_not_found");
+      }
+      this.#assertWorkspaceRelocationIdentity(claim, row);
+      if (row.report_json && row.status !== "prepared-inactive") {
+        return workspaceRelocationReportSchema.parse(
+          JSON.parse(row.report_json),
+        );
+      }
+      if (row.report_json && status !== "uncertain") {
+        return workspaceRelocationReportSchema.parse(
+          JSON.parse(row.report_json),
+        );
+      }
+      const now = new Date().toISOString();
+      const receipt = {
+        relocationId: claim.relocationId,
+        requestId: claim.requestId,
+        bindingSha256: row.binding_sha256,
+        destinationNodeId: claim.destination.nodeId,
+        destinationWorkspaceId: claim.destination.workspaceId,
+        workspaceRoot: row.workspace_root,
+        cacheDirectory: row.cache_directory,
+        manifestReference: claim.manifestReference,
+        status,
+        reportedAt: now,
+        ...(row.receipt_sha256
+          ? { previousReceiptSha256: row.receipt_sha256 }
+          : {}),
+        ...(code ? { errorCode: code } : {}),
+      };
+      const receiptJson = JSON.stringify(receipt);
+      const receiptSha256 = executionPayloadSha256(receipt);
+      const report = workspaceRelocationReportSchema.parse({
+        ...claim,
+        status,
+        receiptSha256,
+        reportedAt: now,
+        ...(status === "uncertain" && row.status === "prepared-inactive"
+          ? { previousReceiptSha256: row.receipt_sha256! }
+          : {}),
+        ...(code ? { errorCode: code } : {}),
+      });
+      const reportJson = JSON.stringify(report);
+      this.#db
+        .query(
+          `UPDATE execution_workspace_relocations SET
+            status = ?, stage = 'terminal', receipt_json = ?, receipt_sha256 = ?,
+            previous_receipt_json = CASE WHEN ? = 'uncertain' AND status = 'prepared-inactive' THEN receipt_json ELSE previous_receipt_json END,
+            previous_receipt_sha256 = CASE WHEN ? = 'uncertain' AND status = 'prepared-inactive' THEN receipt_sha256 ELSE previous_receipt_sha256 END,
+            report_json = ?, report_sha256 = ?, reported_at = NULL, updated_at = ?, error_code = ?
+          WHERE relocation_id = ?`,
+        )
+        .run(
+          status,
+          receiptJson,
+          receiptSha256,
+          status,
+          status,
+          reportJson,
+          executionPayloadSha256(report),
+          now,
+          code ?? null,
+          claim.relocationId,
+        );
+      return report;
+    });
+  }
+
+  #assertWorkspaceRelocationIdentity(
+    claim: WorkspaceRelocationClaim,
+    row: WorkspaceRelocationReceiptRow,
+  ): void {
+    if (
+      row.binding_sha256 !== executionPayloadSha256(claim) ||
+      row.relocation_id !== claim.relocationId ||
+      row.request_id !== claim.requestId ||
+      row.snapshot_id !== claim.snapshotId ||
+      row.destination_node_id !== claim.destination.nodeId ||
+      row.destination_workspace_id !== claim.destination.workspaceId ||
+      row.manifest_reference !== claim.manifestReference
+    ) {
+      throw new ExecutionError("workspace_relocation_identity_conflict");
+    }
+  }
+
+  #workspaceRelocationRow(
+    relocationId: string,
+  ): WorkspaceRelocationReceiptRow | undefined {
+    return (
+      this.#db
+        .query<WorkspaceRelocationReceiptRow, [string]>(
+          "SELECT * FROM execution_workspace_relocations WHERE relocation_id = ?",
+        )
+        .get(relocationId) ?? undefined
+    );
+  }
+
   async #assertSnapshotCacheOutsideWorkspaces(
     captureCacheDirectory: string,
   ): Promise<void> {
@@ -1924,6 +3057,58 @@ export class ExecutionDaemon {
         .get(workspaceId)
     ) {
       throw new ExecutionError("workspace_capture_active");
+    }
+    if (
+      this.#db
+        .query<{ relocation_id: string }, [string]>(
+          "SELECT relocation_id FROM execution_workspace_relocations WHERE destination_workspace_id = ? LIMIT 1",
+        )
+        .get(workspaceId)
+    ) {
+      throw new ExecutionError("workspace_relocation_reserved");
+    }
+    const workspace = this.#workspaceRow(workspaceId);
+    if (!workspace) return;
+    const workspaceRoots = new Set([
+      resolve(workspace.directory),
+      ...(this.#workspaces.has(workspaceId)
+        ? [this.#workspaces.get(workspaceId)!]
+        : []),
+    ]);
+    try {
+      workspaceRoots.add(realpathSync(workspace.directory));
+    } catch {
+      // A missing ordinary workspace is rejected later by its filesystem effect.
+    }
+    const reservedRoots = this.#db
+      .query<{ workspace_root: string }, []>(
+        "SELECT workspace_root FROM execution_workspace_relocations WHERE workspace_root IS NOT NULL",
+      )
+      .all();
+    for (const reservation of reservedRoots) {
+      const roots = new Set([resolve(reservation.workspace_root)]);
+      try {
+        roots.add(realpathSync(reservation.workspace_root));
+      } catch (error) {
+        const errorCode =
+          error && typeof error === "object" && "code" in error
+            ? error.code
+            : undefined;
+        if (errorCode !== "ENOENT") {
+          throw new ExecutionError("workspace_relocation_destination_changed");
+        }
+        // Keep the durable path in the comparison if it was removed.
+      }
+      for (const workspaceRoot of workspaceRoots) {
+        for (const reservedRoot of roots) {
+          if (
+            within(workspaceRoot, reservedRoot) ||
+            within(reservedRoot, workspaceRoot)
+          ) {
+            throw new ExecutionError("workspace_relocation_reserved");
+          }
+        }
+      }
     }
   }
 
