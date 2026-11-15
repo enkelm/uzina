@@ -517,6 +517,29 @@ const schema = [
     verified_at TEXT NOT NULL,
     PRIMARY KEY (request_id, role, reference)
   )`,
+  `CREATE TABLE IF NOT EXISTS managed_work_imports (
+    request_id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    actor_json TEXT NOT NULL,
+    source_catalog_id TEXT NOT NULL,
+    manifest_sha256 TEXT NOT NULL CHECK (length(manifest_sha256) = 64 AND manifest_sha256 NOT GLOB '*[^a-f0-9]*'),
+    source_catalog_root TEXT NOT NULL,
+    destination_id TEXT NOT NULL UNIQUE,
+    destination_root TEXT NOT NULL UNIQUE,
+    host_binding_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('admitted', 'preparing', 'prepared-inactive', 'blocked', 'uncertain')),
+    accepted_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    preparation_receipt_json TEXT,
+    preparation_receipt_sha256 TEXT CHECK (preparation_receipt_sha256 IS NULL OR (length(preparation_receipt_sha256) = 64 AND preparation_receipt_sha256 NOT GLOB '*[^a-f0-9]*')),
+    error_code TEXT,
+    CHECK (
+      (status IN ('admitted', 'preparing') AND preparation_receipt_json IS NULL AND preparation_receipt_sha256 IS NULL AND error_code IS NULL)
+      OR (status = 'prepared-inactive' AND preparation_receipt_json IS NOT NULL AND preparation_receipt_sha256 IS NOT NULL AND error_code IS NULL)
+      OR (status = 'blocked' AND preparation_receipt_json IS NULL AND preparation_receipt_sha256 IS NULL AND error_code IS NOT NULL)
+      OR (status = 'uncertain' AND error_code IS NOT NULL AND ((preparation_receipt_json IS NULL AND preparation_receipt_sha256 IS NULL) OR (preparation_receipt_json IS NOT NULL AND preparation_receipt_sha256 IS NOT NULL)))
+    )
+  )`,
   `CREATE TABLE IF NOT EXISTS workspace_relocations (
     request_id TEXT PRIMARY KEY,
     relocation_id TEXT NOT NULL UNIQUE,

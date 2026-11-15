@@ -89,6 +89,28 @@ describe("Cloudflare Factory in Miniflare workerd", () => {
       expect(bootstrap.response.status).toBe(201);
       expect(bootstrap.value.actor.kind).toBe("human");
       const ownerCredential = bootstrap.value.credential;
+      const unavailableImport = await request<{ error: string }>(
+        "/v1/managed-work-imports",
+        {
+          credential: ownerCredential,
+          body: {
+            contractVersion: 1,
+            requestId: "import:worker-host-missing",
+            sourceCatalogId: "catalog:worker",
+            manifestSha256: "c".repeat(64),
+            destinationId: "destination:worker",
+          },
+        },
+      );
+      expect(unavailableImport.response.status).toBe(503);
+      expect(unavailableImport.value.error).toBe(
+        "managed_work_import_host_unavailable",
+      );
+      const noImportWasAdmitted = await request<{ error: string }>(
+        "/v1/managed-work-imports/import:worker-host-missing",
+        { credential: ownerCredential },
+      );
+      expect(noImportWasAdmitted.response.status).toBe(404);
 
       const project = await request<{ projectId: string }>("/v1/projects", {
         credential: ownerCredential,

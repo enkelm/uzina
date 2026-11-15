@@ -24,12 +24,20 @@ import {
   workspaceSnapshotStatusSchema,
   managedWorkCheckpointRequestSchema,
   managedWorkCheckpointStatusSchema,
+  managedWorkImportRequestSchema,
+  managedWorkImportHostBindingSchema,
+  managedWorkImportPreparationReceiptSchema,
+  managedWorkImportOutcomeSchema,
+  managedWorkImportStatusSchema,
   factoryProvenanceEvidenceSchema,
   type FactoryCommandReceipt,
   type FactoryProvenanceCommand,
   type FactoryProvenanceEvidence,
   type FactoryProvenanceExecutionEffect,
   type ManagedWorkCheckpointStage,
+  type ManagedWorkImportRequest,
+  type ManagedWorkImportHostBinding,
+  type ManagedWorkImportStatus,
   workspaceSnapshotClaimRequestSchema,
   workspaceSnapshotClaimSchema,
   workspaceSnapshotReportSchema,
@@ -270,6 +278,23 @@ type ManagedWorkCheckpointExecutionPlacement = {
   nodeId: string;
   workspaceId: string;
   ownershipGeneration: number;
+};
+type ManagedWorkImportRow = {
+  request_id: string;
+  owner_id: string;
+  actor_json: string;
+  source_catalog_id: string;
+  manifest_sha256: string;
+  source_catalog_root: string;
+  destination_id: string;
+  destination_root: string;
+  host_binding_json: string;
+  status: ManagedWorkImportStatus["status"];
+  accepted_at: string;
+  updated_at: string;
+  preparation_receipt_json: string | null;
+  preparation_receipt_sha256: string | null;
+  error_code: string | null;
 };
 type WorkspaceRelocationRow = {
   request_id: string;
@@ -608,6 +633,35 @@ function stableJson(value: unknown): string {
       .join(",")}}`;
   }
   return JSON.stringify(value);
+}
+
+function comparableCanonicalRoot(value: string): string {
+  if (value.includes("\0")) {
+    throw new FactoryError(400, "invalid_managed_work_import_host_binding");
+  }
+  const normalized = value.replaceAll("\\", "/").replace(/\/{2,}/g, "/");
+  const segments = normalized.split("/").filter(Boolean);
+  if (!normalized.startsWith("/") && !/^[A-Za-z]:\//.test(normalized)) {
+    throw new FactoryError(400, "invalid_managed_work_import_host_binding");
+  }
+  if (segments.some((segment) => segment === "." || segment === "..")) {
+    throw new FactoryError(400, "invalid_managed_work_import_host_binding");
+  }
+  let canonical = normalized.replace(/\/+$/, "") || "/";
+  if (/^[A-Za-z]:$/.test(canonical)) canonical += "/";
+  if (/^[A-Za-z]:\//.test(canonical)) {
+    canonical = canonical[0]!.toUpperCase() + canonical.slice(1).toLowerCase();
+  }
+  return canonical;
+}
+
+function canonicalRootsOverlap(left: string, right: string): boolean {
+  const a = comparableCanonicalRoot(left);
+  const b = comparableCanonicalRoot(right);
+  const contains = (root: string, candidate: string) =>
+    candidate === root ||
+    candidate.startsWith(root.endsWith("/") ? root : `${root}/`);
+  return contains(a, b) || contains(b, a);
 }
 
 export class FactoryService {
@@ -2204,6 +2258,274 @@ export class FactoryService {
       return persisted;
     });
     return this.#managedWorkCheckpointStatus(current);
+  }
+
+  /** Reject non-owner callers before the standalone host inspects configured paths. */
+  authorizeManagedWorkImport(session: FactorySession): void {
+    this.#requireManagedWorkImportOwner(session);
+  }
+
+  /** Native startup guard for every durable destination reservation, independent of current import config. */
+  assertManagedWorkImportReservationsDisjoint(
+    localRoots: readonly string[],
+  ): void {
+    const candidates = localRoots.map(comparableCanonicalRoot);
+    const reservations = this.database.all<{ destination_root: string }>(
+      "SELECT destination_root FROM managed_work_imports ORDER BY request_id",
+    );
+    if (
+      reservations.some((reservation) =>
+        candidates.some((candidate) =>
+          canonicalRootsOverlap(candidate, reservation.destination_root),
+        ),
+      )
+    ) {
+      throw conflict("managed_work_import_destination_reserved");
+    }
+  }
+
+  /** Admit an inactive import only after a trusted local host resolves configured IDs. */
+  requestManagedWorkImport(
+    session: FactorySession,
+    request: unknown,
+    hostBinding: unknown,
+  ): ManagedWorkImportStatus {
+    this.#requireManagedWorkImportOwner(session);
+    const input = managedWorkImportRequestSchema.parse(request);
+    const binding = managedWorkImportHostBindingSchema.parse(hostBinding);
+    this.#assertManagedWorkImportHostBinding(input, binding);
+    const sourceRoot = comparableCanonicalRoot(
+      binding.sourceCatalog.canonicalRoot,
+    );
+    const destinationRoot = comparableCanonicalRoot(
+      binding.destination.canonicalRoot,
+    );
+    if (canonicalRootsOverlap(sourceRoot, destinationRoot)) {
+      throw conflict("managed_work_import_source_destination_overlap");
+    }
+    const hostBindingJson = stableJson(binding);
+
+    const row = this.database.transaction(() => {
+      const ownerId = this.#requireManagedWorkImportOwner(session);
+      const existing = this.#managedWorkImportByRequest(input.requestId);
+      if (existing) {
+        if (
+          existing.owner_id !== ownerId ||
+          existing.actor_json !== encode(session.actor) ||
+          existing.source_catalog_id !== input.sourceCatalogId ||
+          existing.manifest_sha256 !== input.manifestSha256 ||
+          existing.destination_id !== input.destinationId ||
+          existing.host_binding_json !== hostBindingJson
+        ) {
+          throw conflict("managed_work_import_request_conflict");
+        }
+        return existing;
+      }
+
+      const reservations = this.database.all<ManagedWorkImportRow>(
+        "SELECT * FROM managed_work_imports ORDER BY request_id",
+      );
+      if (
+        reservations.some(
+          (reservation) =>
+            reservation.destination_id === input.destinationId ||
+            canonicalRootsOverlap(
+              destinationRoot,
+              reservation.destination_root,
+            ) ||
+            canonicalRootsOverlap(sourceRoot, reservation.destination_root) ||
+            canonicalRootsOverlap(
+              destinationRoot,
+              reservation.source_catalog_root,
+            ),
+        )
+      ) {
+        throw conflict("managed_work_import_destination_reserved");
+      }
+
+      const acceptedAt = now();
+      this.database.exec(
+        `INSERT INTO managed_work_imports(
+          request_id, owner_id, actor_json, source_catalog_id, manifest_sha256,
+          source_catalog_root, destination_id, destination_root,
+          host_binding_json, status, accepted_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'admitted', ?, ?)`,
+        [
+          input.requestId,
+          ownerId,
+          encode(session.actor),
+          input.sourceCatalogId,
+          input.manifestSha256,
+          binding.sourceCatalog.canonicalRoot,
+          input.destinationId,
+          binding.destination.canonicalRoot,
+          hostBindingJson,
+          acceptedAt,
+          acceptedAt,
+        ],
+      );
+      const created = this.#managedWorkImportByRequest(input.requestId);
+      if (!created) throw notFound("Managed-work import");
+      return created;
+    });
+    return this.#managedWorkImportStatus(row);
+  }
+
+  /** Persist the destructive restore boundary before the host calls the restore helper. */
+  beginManagedWorkImportPreparation(
+    session: FactorySession,
+    requestId: string,
+    hostBinding: unknown,
+  ): ManagedWorkImportStatus {
+    const binding = managedWorkImportHostBindingSchema.parse(hostBinding);
+    const row = this.database.transaction(() => {
+      this.#requireManagedWorkImportOwner(session);
+      const current = this.#managedWorkImportByRequest(requestId);
+      if (!current) throw notFound("Managed-work import");
+      if (current.actor_json !== encode(session.actor)) throw forbidden();
+      this.#assertManagedWorkImportBinding(current, binding);
+      if (current.status !== "admitted") {
+        throw conflict("managed_work_import_stage_conflict");
+      }
+      this.database.exec(
+        "UPDATE managed_work_imports SET status = 'preparing', updated_at = ? WHERE request_id = ? AND status = 'admitted'",
+        [now(), requestId],
+      );
+      const updated = this.#managedWorkImportByRequest(requestId);
+      if (!updated) throw notFound("Managed-work import");
+      return updated;
+    });
+    return this.#managedWorkImportStatus(row);
+  }
+
+  /** Persist only host-verified output; uncertainty never replaces a prior receipt. */
+  async recordManagedWorkImportOutcome(
+    session: FactorySession,
+    requestId: string,
+    hostBinding: unknown,
+    outcome: unknown,
+  ): Promise<ManagedWorkImportStatus> {
+    const binding = managedWorkImportHostBindingSchema.parse(hostBinding);
+    const parsedOutcome = managedWorkImportOutcomeSchema.parse(outcome);
+    this.#requireManagedWorkImportOwner(session);
+    const initial = this.#managedWorkImportByRequest(requestId);
+    if (!initial) throw notFound("Managed-work import");
+    if (initial.actor_json !== encode(session.actor)) throw forbidden();
+    this.#assertManagedWorkImportBinding(initial, binding);
+    if (
+      parsedOutcome.status === "prepared-inactive" &&
+      parsedOutcome.preparationReceipt.manifestReference !==
+        initial.manifest_sha256
+    ) {
+      throw conflict("managed_work_import_receipt_binding_mismatch");
+    }
+    const receiptHash =
+      parsedOutcome.status === "prepared-inactive"
+        ? await sha256(
+            stableJson({
+              purpose: "managed-work-import-prepared-inactive-v1",
+              requestId: initial.request_id,
+              ownerId: initial.owner_id,
+              actor: parseActor(initial.actor_json),
+              sourceCatalogId: initial.source_catalog_id,
+              manifestSha256: initial.manifest_sha256,
+              destinationId: initial.destination_id,
+              hostBinding: binding,
+              preparationReceipt: parsedOutcome.preparationReceipt,
+            }),
+          )
+        : undefined;
+
+    const row = this.database.transaction(() => {
+      this.#requireManagedWorkImportOwner(session);
+      const current = this.#managedWorkImportByRequest(requestId);
+      if (!current) throw notFound("Managed-work import");
+      if (current.actor_json !== encode(session.actor)) throw forbidden();
+      this.#assertManagedWorkImportBinding(current, binding);
+
+      if (parsedOutcome.status === "prepared-inactive") {
+        const receiptJson = stableJson(parsedOutcome.preparationReceipt);
+        if (current.status === "prepared-inactive") {
+          if (
+            current.preparation_receipt_json !== receiptJson ||
+            current.preparation_receipt_sha256 !== receiptHash
+          ) {
+            throw conflict("managed_work_import_preparation_conflict");
+          }
+          return current;
+        }
+        if (
+          current.status !== "preparing" &&
+          !(
+            current.status === "uncertain" &&
+            current.preparation_receipt_json === null
+          )
+        ) {
+          throw conflict("managed_work_import_stage_conflict");
+        }
+        this.database.exec(
+          `UPDATE managed_work_imports
+           SET status = 'prepared-inactive', updated_at = ?,
+               preparation_receipt_json = ?, preparation_receipt_sha256 = ?,
+               error_code = NULL
+           WHERE request_id = ?`,
+          [now(), receiptJson, receiptHash!, requestId],
+        );
+      } else if (parsedOutcome.status === "blocked") {
+        if (current.status === "blocked") {
+          if (current.error_code !== parsedOutcome.errorCode) {
+            throw conflict("managed_work_import_outcome_conflict");
+          }
+          return current;
+        }
+        if (current.status !== "admitted") {
+          throw conflict("managed_work_import_stage_conflict");
+        }
+        this.database.exec(
+          "UPDATE managed_work_imports SET status = 'blocked', updated_at = ?, error_code = ? WHERE request_id = ?",
+          [now(), parsedOutcome.errorCode, requestId],
+        );
+      } else {
+        if (current.status === "uncertain") {
+          if (current.error_code !== parsedOutcome.errorCode) {
+            throw conflict("managed_work_import_outcome_conflict");
+          }
+          return current;
+        }
+        if (
+          current.status !== "preparing" &&
+          current.status !== "prepared-inactive"
+        ) {
+          throw conflict("managed_work_import_stage_conflict");
+        }
+        this.database.exec(
+          "UPDATE managed_work_imports SET status = 'uncertain', updated_at = ?, error_code = ? WHERE request_id = ?",
+          [now(), parsedOutcome.errorCode, requestId],
+        );
+      }
+      const updated = this.#managedWorkImportByRequest(requestId);
+      if (!updated) throw notFound("Managed-work import");
+      return updated;
+    });
+    return this.#managedWorkImportStatus(row);
+  }
+
+  /** Owner-only journal read; it reports committed evidence, not live disk verification. */
+  getManagedWorkImportStatus(
+    session: FactorySession,
+    requestId: string,
+  ): ManagedWorkImportStatus {
+    this.#requireManagedWorkImportOwner(session);
+    const row = this.#managedWorkImportByRequest(requestId);
+    if (!row) throw notFound("Managed-work import");
+    if (
+      session.actor.kind !== "human" ||
+      row.owner_id !== session.actor.userId ||
+      row.actor_json !== encode(session.actor)
+    ) {
+      throw forbidden();
+    }
+    return this.#managedWorkImportStatus(row);
   }
 
   /** Admit one owner-bound destination reservation against an available coherent checkpoint. */
@@ -6284,6 +6606,15 @@ export class FactoryService {
     };
   }
 
+  #managedWorkImportByRequest(
+    requestId: string,
+  ): ManagedWorkImportRow | undefined {
+    return this.database.all<ManagedWorkImportRow>(
+      "SELECT * FROM managed_work_imports WHERE request_id = ?",
+      [requestId],
+    )[0];
+  }
+
   #managedWorkCheckpointByRequest(
     requestId: string,
   ): ManagedWorkCheckpointRow | undefined {
@@ -6998,6 +7329,71 @@ export class FactoryService {
         "Destination report does not match its immutable relocation assignment",
       );
     }
+  }
+
+  #requireManagedWorkImportOwner(session: FactorySession): string {
+    const ownerId = this.#requireOwner(session);
+    if (session.actor.kind !== "human" || session.actor.userId !== ownerId) {
+      throw forbidden();
+    }
+    return ownerId;
+  }
+
+  #assertManagedWorkImportHostBinding(
+    request: ManagedWorkImportRequest,
+    binding: ManagedWorkImportHostBinding,
+  ): void {
+    if (
+      binding.sourceCatalog.sourceCatalogId !== request.sourceCatalogId ||
+      binding.destination.destinationId !== request.destinationId
+    ) {
+      throw conflict("managed_work_import_host_binding_mismatch");
+    }
+    comparableCanonicalRoot(binding.sourceCatalog.canonicalRoot);
+    comparableCanonicalRoot(binding.destination.canonicalRoot);
+  }
+
+  #assertManagedWorkImportBinding(
+    row: ManagedWorkImportRow,
+    binding: ManagedWorkImportHostBinding,
+  ): void {
+    if (
+      row.host_binding_json !== stableJson(binding) ||
+      row.source_catalog_id !== binding.sourceCatalog.sourceCatalogId ||
+      row.source_catalog_root !== binding.sourceCatalog.canonicalRoot ||
+      row.destination_id !== binding.destination.destinationId ||
+      row.destination_root !== binding.destination.canonicalRoot
+    ) {
+      throw conflict("managed_work_import_host_binding_mismatch");
+    }
+  }
+
+  #managedWorkImportStatus(row: ManagedWorkImportRow): ManagedWorkImportStatus {
+    const preparationReceipt = row.preparation_receipt_json
+      ? managedWorkImportPreparationReceiptSchema.parse(
+          JSON.parse(row.preparation_receipt_json),
+        )
+      : undefined;
+    return managedWorkImportStatusSchema.parse({
+      contractVersion: CONTRACT_VERSION,
+      requestId: row.request_id,
+      ownerId: row.owner_id,
+      actor: parseActor(row.actor_json),
+      sourceCatalogId: row.source_catalog_id,
+      manifestSha256: row.manifest_sha256,
+      destinationId: row.destination_id,
+      hostBinding: managedWorkImportHostBindingSchema.parse(
+        JSON.parse(row.host_binding_json),
+      ),
+      status: row.status,
+      acceptedAt: row.accepted_at,
+      updatedAt: row.updated_at,
+      ...(preparationReceipt ? { preparationReceipt } : {}),
+      ...(row.preparation_receipt_sha256
+        ? { preparationReceiptSha256: row.preparation_receipt_sha256 }
+        : {}),
+      ...(row.error_code ? { errorCode: row.error_code } : {}),
+    });
   }
 
   #managedWorkCheckpointStatus(

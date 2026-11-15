@@ -181,6 +181,412 @@ describe("persistent Factory behavior over Bun SQLite", () => {
     });
   });
 
+  test("local Owner import admission reserves exact configured descriptors across retries and reopen", async () => {
+    const fixture = await provisionFixture(false);
+    const request = {
+      contractVersion: 1,
+      requestId: "import:offline-one",
+      sourceCatalogId: "catalog:offline",
+      manifestSha256: "a".repeat(64),
+      destinationId: "destination:private-one",
+    };
+    const binding = {
+      hostDescriptor: "bun-standalone:/var/lib/uzina/factory.sqlite",
+      sourceCatalog: {
+        sourceCatalogId: request.sourceCatalogId,
+        canonicalRoot: "/var/lib/uzina/import-catalog",
+      },
+      destination: {
+        destinationId: request.destinationId,
+        canonicalRoot: "/var/lib/uzina/prepared/work-one",
+      },
+    };
+
+    const admitted = fixture.factory.requestManagedWorkImport(
+      fixture.owner,
+      request,
+      binding,
+    );
+    expect(admitted).toMatchObject({
+      requestId: request.requestId,
+      ownerId:
+        fixture.owner.actor.kind === "human" ? fixture.owner.actor.userId : "",
+      actor: fixture.owner.actor,
+      sourceCatalogId: request.sourceCatalogId,
+      manifestSha256: request.manifestSha256,
+      destinationId: request.destinationId,
+      hostBinding: binding,
+      status: "admitted",
+    });
+    expect(
+      fixture.factory.requestManagedWorkImport(fixture.owner, request, binding),
+    ).toEqual(admitted);
+    expect(() =>
+      fixture.factory.assertManagedWorkImportReservationsDisjoint([
+        "/var/lib/uzina/prepared/work-one/nested/database.sqlite",
+      ]),
+    ).toThrow("managed_work_import_destination_reserved");
+    expect(() =>
+      fixture.factory.assertManagedWorkImportReservationsDisjoint([
+        "/var/lib/uzina/ordinary-runtime",
+      ]),
+    ).not.toThrow();
+    expect(
+      fixture.factory.database.all<{
+        request_id: string;
+        owner_id: string;
+        source_catalog_root: string;
+        destination_root: string;
+        status: string;
+      }>(
+        "SELECT request_id, owner_id, source_catalog_root, destination_root, status FROM managed_work_imports WHERE request_id = ?",
+        [request.requestId],
+      )[0],
+    ).toMatchObject({
+      request_id: request.requestId,
+      owner_id: admitted.ownerId,
+      source_catalog_root: binding.sourceCatalog.canonicalRoot,
+      destination_root: binding.destination.canonicalRoot,
+      status: "admitted",
+    });
+
+    expect(() =>
+      fixture.factory.requestManagedWorkImport(
+        fixture.nodeSession,
+        { ...request, requestId: "import:node-denied" },
+        {
+          ...binding,
+          destination: {
+            ...binding.destination,
+            destinationId: "destination:node",
+          },
+        },
+      ),
+    ).toThrow("This credential kind cannot perform that operation");
+
+    expect(() =>
+      fixture.factory.requestManagedWorkImport(fixture.owner, request, {
+        ...binding,
+        destination: {
+          ...binding.destination,
+          canonicalRoot: "/var/lib/uzina/prepared/work-one/child",
+        },
+      }),
+    ).toThrow("managed_work_import_request_conflict");
+    const aliasRequest = {
+      ...request,
+      requestId: "import:destination-alias",
+    };
+    expect(() =>
+      fixture.factory.requestManagedWorkImport(
+        fixture.owner,
+        aliasRequest,
+        binding,
+      ),
+    ).toThrow("managed_work_import_destination_reserved");
+
+    const nestedRequest = {
+      ...request,
+      requestId: "import:nested-destination",
+      destinationId: "destination:nested",
+    };
+    const nestedBinding = {
+      ...binding,
+      destination: {
+        destinationId: nestedRequest.destinationId,
+        canonicalRoot: "/var/lib/uzina/prepared/work-one/nested",
+      },
+    };
+    expect(() =>
+      fixture.factory.requestManagedWorkImport(
+        fixture.owner,
+        nestedRequest,
+        nestedBinding,
+      ),
+    ).toThrow("managed_work_import_destination_reserved");
+
+    const persisted = fixture.factory.getManagedWorkImportStatus(
+      fixture.owner,
+      request.requestId,
+    );
+    const database = reopenFixtureDatabase(fixture.directory, fixture.database);
+    const reopened = new FactoryService(database, bootstrapSecret);
+    const owner = await reopened.authenticate(
+      fixture.ownerCredential.credential,
+    );
+    expect(
+      reopened.getManagedWorkImportStatus(owner, request.requestId),
+    ).toEqual(persisted);
+    expect(
+      database.all<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM managed_work_imports WHERE destination_id = ?",
+        [request.destinationId],
+      )[0]?.count,
+    ).toBe(1);
+  });
+
+  test("managed-work import preparation boundary is claimed once", async () => {
+    const fixture = await provisionFixture(false);
+    const request = {
+      contractVersion: 1,
+      requestId: "import:preparation-claim",
+      sourceCatalogId: "catalog:offline",
+      manifestSha256: "c".repeat(64),
+      destinationId: "destination:claim",
+    };
+    const binding = {
+      hostDescriptor: "bun-standalone:/var/lib/uzina/factory.sqlite",
+      sourceCatalog: {
+        sourceCatalogId: request.sourceCatalogId,
+        canonicalRoot: "/var/lib/uzina/import-catalog",
+      },
+      destination: {
+        destinationId: request.destinationId,
+        canonicalRoot: "/var/lib/uzina/prepared/claim",
+      },
+    };
+    fixture.factory.requestManagedWorkImport(fixture.owner, request, binding);
+    expect(
+      fixture.factory.beginManagedWorkImportPreparation(
+        fixture.owner,
+        request.requestId,
+        binding,
+      ).status,
+    ).toBe("preparing");
+    expect(() =>
+      fixture.factory.beginManagedWorkImportPreparation(
+        fixture.owner,
+        request.requestId,
+        binding,
+      ),
+    ).toThrow("managed_work_import_stage_conflict");
+    expect(
+      fixture.factory.getManagedWorkImportStatus(
+        fixture.owner,
+        request.requestId,
+      ).status,
+    ).toBe("preparing");
+  });
+
+  test("HTTP import admission refuses without local host capability and accepts only resolved descriptors", async () => {
+    const fixture = await provisionFixture(false);
+    const request = {
+      contractVersion: 1,
+      requestId: "import:http-one",
+      sourceCatalogId: "catalog:http",
+      manifestSha256: "b".repeat(64),
+      destinationId: "destination:http",
+    };
+    const headers = {
+      authorization: `Bearer ${fixture.ownerCredential.credential}`,
+      "content-type": "application/json",
+    };
+    const unavailable = await createFactoryHttpHandler(fixture.factory)(
+      new Request("https://factory.test/v1/managed-work-imports", {
+        method: "POST",
+        headers,
+        body: JSON.stringify(request),
+      }),
+    );
+    expect(unavailable.status).toBe(503);
+    expect(await unavailable.json()).toMatchObject({
+      error: "managed_work_import_host_unavailable",
+    });
+    expect(
+      fixture.database.all<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM managed_work_imports",
+      )[0]?.count,
+    ).toBe(0);
+
+    const binding = {
+      hostDescriptor: "bun-standalone:/var/lib/uzina/http-factory.sqlite",
+      sourceCatalog: {
+        sourceCatalogId: request.sourceCatalogId,
+        canonicalRoot: "/var/lib/uzina/http-catalog",
+      },
+      destination: {
+        destinationId: request.destinationId,
+        canonicalRoot: "/var/lib/uzina/http-prepared",
+      },
+    };
+    let resolved: unknown;
+    const handler = createFactoryHttpHandler(
+      fixture.factory,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        async run(input, journal) {
+          resolved = input;
+          journal.admit(input, binding);
+        },
+      },
+    );
+    const nonOwner = await handler(
+      new Request("https://factory.test/v1/managed-work-imports", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${fixture.nodeCredential.credential}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(request),
+      }),
+    );
+    expect(nonOwner.status).toBe(403);
+    expect(resolved).toBeUndefined();
+    expect(
+      fixture.database.all<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM managed_work_imports",
+      )[0]?.count,
+    ).toBe(0);
+
+    const admitted = await handler(
+      new Request("https://factory.test/v1/managed-work-imports", {
+        method: "POST",
+        headers,
+        body: JSON.stringify(request),
+      }),
+    );
+    expect(admitted.status).toBe(202);
+    expect(await admitted.json()).toMatchObject({
+      requestId: request.requestId,
+      status: "admitted",
+      hostBinding: binding,
+    });
+    expect(resolved).toEqual(request);
+
+    const status = await handler(
+      new Request(
+        `https://factory.test/v1/managed-work-imports/${request.requestId}`,
+        { headers: { authorization: headers.authorization } },
+      ),
+    );
+    expect(status.status).toBe(200);
+    expect(await status.json()).toMatchObject({
+      requestId: request.requestId,
+      status: "admitted",
+      manifestSha256: request.manifestSha256,
+    });
+  });
+
+  test("HTTP import rechecks the current local Owner after asynchronous host resolution", async () => {
+    const fixture = await provisionFixture(false);
+    const temporaryOwner = await fixture.factory.provisionCredential(
+      fixture.owner,
+      "human",
+      "Temporary owner credential",
+    );
+    const request = {
+      contractVersion: 1,
+      requestId: "import:owner-revoked-during-resolution",
+      sourceCatalogId: "catalog:revoked-owner",
+      manifestSha256: "d".repeat(64),
+      destinationId: "destination:revoked-owner",
+    };
+    const binding = {
+      hostDescriptor: "bun-standalone:/var/lib/uzina/factory.sqlite",
+      sourceCatalog: {
+        sourceCatalogId: request.sourceCatalogId,
+        canonicalRoot: "/var/lib/uzina/revoked-catalog",
+      },
+      destination: {
+        destinationId: request.destinationId,
+        canonicalRoot: "/var/lib/uzina/revoked-destination",
+      },
+    };
+    const handler = createFactoryHttpHandler(
+      fixture.factory,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        async run(input, journal) {
+          await fixture.factory.revokeCredential(
+            fixture.owner,
+            temporaryOwner.credentialId,
+          );
+          journal.admit(input, binding);
+        },
+      },
+    );
+    const response = await handler(
+      new Request("https://factory.test/v1/managed-work-imports", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${temporaryOwner.credential}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(request),
+      }),
+    );
+    expect(response.status).toBe(401);
+    expect(
+      fixture.database.all<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM managed_work_imports WHERE request_id = ?",
+        [request.requestId],
+      )[0]?.count,
+    ).toBe(0);
+    const status = await handler(
+      new Request(
+        `https://factory.test/v1/managed-work-imports/${request.requestId}`,
+        {
+          headers: {
+            authorization: `Bearer ${fixture.ownerCredential.credential}`,
+          },
+        },
+      ),
+    );
+    expect(status.status).toBe(404);
+  });
+
+  test("legacy databases acquire the additive import journal without rewriting existing authority", async () => {
+    const fixture = await provisionFixture(false);
+    const accepted = await fixture.factory.submitInput(
+      fixture.owner,
+      fixture.thread.threadId,
+      "request:before-import-migration",
+      "Keep existing work unchanged",
+    );
+    const beforeReceipt = fixture.database.all(
+      "SELECT request_id, job_id FROM command_receipts WHERE request_id = ?",
+      [accepted.requestId],
+    );
+    const beforeIntent = fixture.database.all(
+      "SELECT request_id, job_id, ownership_generation FROM dispatch_intents WHERE request_id = ?",
+      [accepted.requestId],
+    );
+    fixture.database.exec("DROP TABLE managed_work_imports");
+
+    const database = reopenFixtureDatabase(fixture.directory, fixture.database);
+    const reopened = new FactoryService(database, bootstrapSecret);
+    const owner = await reopened.authenticate(
+      fixture.ownerCredential.credential,
+    );
+    expect(
+      database
+        .all<{ name: string }>("PRAGMA table_info(managed_work_imports)")
+        .map((column) => column.name),
+    ).toContain("host_binding_json");
+    expect(
+      database.all(
+        "SELECT request_id, job_id FROM command_receipts WHERE request_id = ?",
+        [accepted.requestId],
+      ),
+    ).toEqual(beforeReceipt);
+    expect(
+      database.all(
+        "SELECT request_id, job_id, ownership_generation FROM dispatch_intents WHERE request_id = ?",
+        [accepted.requestId],
+      ),
+    ).toEqual(beforeIntent);
+    expect(reopened.getReceipt(owner, accepted.requestId)).toMatchObject({
+      requestId: accepted.requestId,
+      jobId: accepted.jobId,
+    });
+  });
+
   test("legacy workspace generations migrate once and new provisioning ignores the legacy singleton", async () => {
     const fixture = await provisionFixture(true);
     const oldInput = await fixture.factory.submitInput(

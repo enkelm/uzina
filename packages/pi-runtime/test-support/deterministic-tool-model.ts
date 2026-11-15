@@ -6,10 +6,14 @@ export function deterministicToolModels(options: {
   toolName: string;
   arguments: JsonObject;
   answer?: string;
+  providerId?: string;
+  modelId?: string;
 }) {
   let requests = 0;
+  const providerId = options.providerId ?? "uzina-test";
+  const modelId = options.modelId ?? "fixed-model";
   const provider = createProvider({
-    id: "uzina-test",
+    id: providerId,
     name: "Uzina deterministic tool test adapter",
     auth: {
       apiKey: {
@@ -21,10 +25,10 @@ export function deterministicToolModels(options: {
     },
     models: [
       {
-        id: "fixed-model",
+        id: modelId,
         name: "Fixed model",
-        provider: "uzina-test",
-        api: "uzina-test-api",
+        provider: providerId,
+        api: `${providerId}-api`,
         baseUrl: "https://test.invalid",
         input: ["text"],
         reasoning: false,
@@ -35,10 +39,10 @@ export function deterministicToolModels(options: {
     ],
     api: {
       stream() {
-        return responseStream(++requests, options);
+        return responseStream(++requests, options, providerId, modelId);
       },
       streamSimple() {
-        return responseStream(++requests, options);
+        return responseStream(++requests, options, providerId, modelId);
       },
     },
   });
@@ -50,6 +54,8 @@ export function deterministicToolModels(options: {
 function responseStream(
   request: number,
   options: { toolName: string; arguments: JsonObject; answer?: string },
+  providerId: string,
+  modelId: string,
 ) {
   const stream = createAssistantMessageEventStream();
   stream.end({
@@ -65,9 +71,9 @@ function responseStream(
             },
           ]
         : [{ type: "text", text: options.answer ?? "remote tool settled" }],
-    api: "uzina-test-api",
-    provider: "uzina-test",
-    model: "fixed-model",
+    api: `${providerId}-api`,
+    provider: providerId,
+    model: modelId,
     usage: {
       input: 1,
       output: 1,

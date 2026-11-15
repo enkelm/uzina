@@ -757,17 +757,25 @@ export async function prepareManagedWorkCheckpointArtifact(
   return { checkpoint, bytes };
 }
 
+function settledValue<T>(result: PromiseSettledResult<T>): T {
+  if (result.status === "rejected") throw result.reason;
+  return result.value;
+}
+
 async function scanPagesAtMost<T>(
   expectedCount: number,
   scan: (limit: number, cursor?: Cursor) => Promise<Page<T, Cursor>>,
+  beforeAndAfterEffect?: () => Promise<void>,
 ): Promise<T[]> {
   const items: T[] = [];
   let cursor: Cursor | undefined;
   do {
+    await beforeAndAfterEffect?.();
     const page = await scan(
       Math.max(1, Math.min(PAGE_SIZE, expectedCount + 1 - items.length)),
       cursor,
     );
+    await beforeAndAfterEffect?.();
     items.push(...page.items);
     if (items.length > expectedCount) {
       throw new Error("Prepared managed-work runtime has unexpected records");
@@ -781,33 +789,49 @@ async function scanPagesAtMost<T>(
 export async function verifyManagedWorkCheckpointStorage(
   storage: Storage,
   value: unknown,
+  beforeAndAfterEffect?: () => Promise<void>,
 ): Promise<void> {
   const expected = await validateManagedWorkCheckpoint(value);
-  const [conversations, tasks, submissions, sessionDocuments] =
-    await Promise.all([
-      scanPagesAtMost(expected.conversations.length, (limit, cursor) =>
+  const scans = await Promise.allSettled([
+    scanPagesAtMost(
+      expected.conversations.length,
+      (limit, cursor) =>
         storage.scanConversations(
           { order: "ascending" },
           limit,
           cursor,
           BACKGROUND_CONTEXT,
         ),
-      ),
-      scanPagesAtMost(expected.tasks.length, (limit, cursor) =>
+      beforeAndAfterEffect,
+    ),
+    scanPagesAtMost(
+      expected.tasks.length,
+      (limit, cursor) =>
         storage.scanTasks({}, limit, cursor, BACKGROUND_CONTEXT),
-      ),
-      scanPagesAtMost(expected.submissions.length, (limit, cursor) =>
+      beforeAndAfterEffect,
+    ),
+    scanPagesAtMost(
+      expected.submissions.length,
+      (limit, cursor) =>
         storage.scanSubmissions({}, limit, cursor, BACKGROUND_CONTEXT),
-      ),
-      scanPagesAtMost(0, (limit, cursor) =>
+      beforeAndAfterEffect,
+    ),
+    scanPagesAtMost(
+      0,
+      (limit, cursor) =>
         storage.scanDocuments(
           { scope: { kind: "session" }, at: "current" },
           limit,
           cursor,
           BACKGROUND_CONTEXT,
         ),
-      ),
-    ]);
+      beforeAndAfterEffect,
+    ),
+  ]);
+  const conversations = settledValue(scans[0]!);
+  const tasks = settledValue(scans[1]!);
+  const submissions = settledValue(scans[2]!);
+  const sessionDocuments = settledValue(scans[3]!);
   conversations.sort((left, right) => Number(left.id) - Number(right.id));
   tasks.sort((left, right) => Number(left.id) - Number(right.id));
   submissions.sort((left, right) => Number(left.id) - Number(right.id));
@@ -815,13 +839,16 @@ export async function verifyManagedWorkCheckpointStorage(
   for (const conversation of conversations) {
     const remaining = expected.entries.length - entries.length;
     entries.push(
-      ...(await scanPagesAtMost(remaining, (limit, cursor) =>
-        storage.scanEntries(
-          { conversationId: conversation.id, order: "ascending" },
-          limit,
-          cursor,
-          BACKGROUND_CONTEXT,
-        ),
+      ...(await scanPagesAtMost(
+        remaining,
+        (limit, cursor) =>
+          storage.scanEntries(
+            { conversationId: conversation.id, order: "ascending" },
+            limit,
+            cursor,
+            BACKGROUND_CONTEXT,
+          ),
+        beforeAndAfterEffect,
       )),
     );
   }
@@ -855,20 +882,25 @@ export async function verifyManagedWorkCheckpointStorage(
       | { kind: "task"; taskId: TaskId },
   ) => {
     const remaining = expected.documents.length - documents.length;
-    const records = await scanPagesAtMost(remaining, (limit, cursor) =>
-      storage.scanDocuments(
-        { scope, at: "current" },
-        limit,
-        cursor,
-        BACKGROUND_CONTEXT,
-      ),
+    const records = await scanPagesAtMost(
+      remaining,
+      (limit, cursor) =>
+        storage.scanDocuments(
+          { scope, at: "current" },
+          limit,
+          cursor,
+          BACKGROUND_CONTEXT,
+        ),
+      beforeAndAfterEffect,
     );
     for (const record of records) {
+      await beforeAndAfterEffect?.();
       const document = await storage.document(
         record.id,
         "current",
         BACKGROUND_CONTEXT,
       );
+      await beforeAndAfterEffect?.();
       if (!document) {
         throw new Error("Prepared managed-work document disappeared");
       }
@@ -901,13 +933,34 @@ export async function verifyManagedWorkCheckpointStorage(
   ) {
     throw new Error("Prepared managed-work runtime does not match bundle");
   }
+  await beforeAndAfterEffect?.();
+}
+
+async function guardedStorageEffect<T>(
+  beforeAndAfterEffect: (() => Promise<void>) | undefined,
+  operation: () => Promise<T>,
+): Promise<T> {
+  if (!beforeAndAfterEffect) return operation();
+  await beforeAndAfterEffect();
+  let result: T;
+  try {
+    result = await operation();
+  } catch (error) {
+    await beforeAndAfterEffect?.();
+    throw error;
+  }
+  await beforeAndAfterEffect?.();
+  return result;
 }
 
 async function assertFreshStorage(
   storage: Storage,
   context: Context,
+  beforeAndAfterEffect?: () => Promise<void>,
 ): Promise<void> {
-  const firstMintedId = await storage.mintId<ConversationId>();
+  const firstMintedId = await guardedStorageEffect(beforeAndAfterEffect, () =>
+    storage.mintId<ConversationId>(),
+  );
   if (firstMintedId !== Number(ROOT_CONVERSATION_ID) + 1) {
     throw new Error(
       "Checkpoint import requires a fresh, never-used destination storage",
@@ -915,13 +968,28 @@ async function assertFreshStorage(
   }
 
   const reservedId = Number(ROOT_CONVERSATION_ID);
-  const [conversation, entry, task, submission, document] = await Promise.all([
-    storage.conversation(ROOT_CONVERSATION_ID, context),
-    storage.entry(reservedId as EntryId, context),
-    storage.task(reservedId as TaskId, context),
-    storage.submission(reservedId as SubmissionId, context),
-    storage.document(reservedId as DocumentId, "current", context),
+  const reservedReads = await Promise.allSettled([
+    guardedStorageEffect(beforeAndAfterEffect, () =>
+      storage.conversation(ROOT_CONVERSATION_ID, context),
+    ),
+    guardedStorageEffect(beforeAndAfterEffect, () =>
+      storage.entry(reservedId as EntryId, context),
+    ),
+    guardedStorageEffect(beforeAndAfterEffect, () =>
+      storage.task(reservedId as TaskId, context),
+    ),
+    guardedStorageEffect(beforeAndAfterEffect, () =>
+      storage.submission(reservedId as SubmissionId, context),
+    ),
+    guardedStorageEffect(beforeAndAfterEffect, () =>
+      storage.document(reservedId as DocumentId, "current", context),
+    ),
   ]);
+  const conversation = settledValue(reservedReads[0]!);
+  const entry = settledValue(reservedReads[1]!);
+  const task = settledValue(reservedReads[2]!);
+  const submission = settledValue(reservedReads[3]!);
+  const document = settledValue(reservedReads[4]!);
   if (conversation || entry || task || submission || document) {
     throw new Error(
       "Checkpoint import requires a fresh, never-used destination storage",
@@ -932,14 +1000,16 @@ async function assertFreshStorage(
 /**
  * Import logical records into a fresh, exclusively held destination without opening or resuming a Harness.
  * Once the freshness guard runs, do not retry on that storage instance: it consumes its initial minted ID.
+ * The optional guard brackets each Storage effect; already-started freshness reads settle before failure escapes.
  */
 export async function importManagedWorkCheckpoint(
   storage: Storage,
   value: unknown,
   context: Context = BACKGROUND_CONTEXT,
+  beforeAndAfterEffect?: () => Promise<void>,
 ): Promise<{ rootConversationId: ConversationId; imported: number }> {
   const checkpoint = await validateManagedWorkCheckpoint(value);
-  await assertFreshStorage(storage, context);
+  await assertFreshStorage(storage, context, beforeAndAfterEffect);
 
   const writes: StorageWrite[] = [
     ...checkpoint.conversations.map((record) => ({
@@ -968,7 +1038,9 @@ export async function importManagedWorkCheckpoint(
       },
     })),
   ];
-  await storage.commit(writes, context);
+  await guardedStorageEffect(beforeAndAfterEffect, () =>
+    storage.commit(writes, context),
+  );
   return {
     rootConversationId: checkpoint.rootConversationId,
     imported: writes.length,

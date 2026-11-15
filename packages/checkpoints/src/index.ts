@@ -66,6 +66,7 @@ const HARD_LIMITS = {
   attachmentBytes: PORTABLE_WORKSPACE_ATTACHMENT_MAX_BYTES,
 } as const;
 const MINIMUM_GIT_VERSION = "2.20.0";
+const WORKSPACE_FILE_READ_CHUNK_BYTES = 64 * 1024;
 export const WORKSPACE_CHECKPOINT_MANIFEST_MAX_BYTES =
   HARD_LIMITS.manifestBytes;
 export const WORKSPACE_CHECKPOINT_ATTACHMENT_MAX_BYTES =
@@ -242,6 +243,26 @@ export interface CheckpointValidationOptions {
   supportedRuntimeRequirements?: readonly string[];
   supportedCapabilities?: readonly string[];
   limits?: CaptureLimits;
+  beforeAndAfterEffect?: () => Promise<void>;
+}
+
+type CheckpointEffectGuard =
+  CheckpointValidationOptions["beforeAndAfterEffect"];
+
+async function checkpointGuardedEffect<T>(
+  guard: CheckpointEffectGuard,
+  operation: () => T | Promise<T>,
+): Promise<T> {
+  await guard?.();
+  let result: T;
+  try {
+    result = await operation();
+  } catch (error) {
+    await guard?.();
+    throw error;
+  }
+  await guard?.();
+  return result;
 }
 
 export interface CheckpointValidation {
@@ -258,6 +279,7 @@ export interface RestoreWorkspaceOptions extends CheckpointValidationOptions {
   manifest: WorkspaceCheckpointManifest;
   transport: BlobTransport;
   destinationPath: string;
+  beforeAndAfterEffect?: () => Promise<void>;
 }
 
 export interface RestoredWorkspaceCheckpoint {
@@ -268,7 +290,6 @@ export interface RestoredWorkspaceCheckpoint {
 
 interface LoadedCheckpoint {
   validation: CheckpointValidation;
-  workspaceContents: Map<string, Uint8Array>;
   bundleBytes: Uint8Array;
   stagedPatchBytes: Uint8Array;
   runtimeBytes: Uint8Array | null;
@@ -554,26 +575,62 @@ export async function restoreWorkspaceCheckpoint(
       `Checkpoint validation failed: ${loaded.validation.issues.join("; ")}`,
     );
   }
-  const { candidate, existing } = await inspectEmptyDestination(
-    options.destinationPath,
+  const guardedEffect = async <T>(operation: () => Promise<T>): Promise<T> => {
+    await options.beforeAndAfterEffect?.();
+    const result = await operation();
+    await options.beforeAndAfterEffect?.();
+    return result;
+  };
+  const guardedAcquire = async <T>(
+    operation: () => Promise<T>,
+    takeOwnership: (resource: T) => void,
+  ): Promise<T> => {
+    await options.beforeAndAfterEffect?.();
+    const resource = await operation();
+    takeOwnership(resource);
+    await options.beforeAndAfterEffect?.();
+    return resource;
+  };
+  const { candidate, existing } = await guardedEffect(() =>
+    inspectEmptyDestination(
+      options.destinationPath,
+      options.beforeAndAfterEffect,
+    ),
   );
-  const staging = await mkdtemp(join(dirname(candidate), ".uzina-restore-"));
+  let staging: string | undefined;
   try {
-    await restoreIntoStaging(staging, options.manifest, loaded);
+    const ownedStaging = await guardedAcquire(
+      () => mkdtemp(join(dirname(candidate), ".uzina-restore-")),
+      (resource) => {
+        staging = resource;
+      },
+    );
+    await restoreIntoStaging(
+      ownedStaging,
+      options.manifest,
+      loaded,
+      options.transport,
+      options.beforeAndAfterEffect,
+    );
     if (existing) {
-      const current = await lstatIfPresent(candidate);
+      const current = await guardedEffect(() => lstatIfPresent(candidate));
+      const currentEntries = current
+        ? await guardedEffect(() => readdir(candidate))
+        : [];
       if (
         !current?.isDirectory() ||
         current.isSymbolicLink() ||
-        (await readdir(candidate)).length > 0
+        currentEntries.length > 0
       ) {
         throw new Error("Restore destination changed during preparation");
       }
-      await rm(candidate, { recursive: true });
+      await guardedEffect(() => rm(candidate, { recursive: true }));
     }
-    await rename(staging, candidate);
+    await guardedEffect(() => rename(ownedStaging, candidate));
   } catch (error) {
-    await rm(staging, { recursive: true, force: true });
+    if (staging) {
+      await rm(staging, { recursive: true, force: true });
+    }
     throw error;
   }
   return {
@@ -591,33 +648,44 @@ export async function verifyRestoredWorkspaceCheckpoint(
   manifest: WorkspaceCheckpointManifest,
   transport: BlobTransport,
   destinationPath: string,
+  beforeAndAfterEffect?: () => Promise<void>,
 ): Promise<void> {
+  const guarded = <T>(operation: () => T | Promise<T>) =>
+    checkpointGuardedEffect(beforeAndAfterEffect, operation);
   const loaded = await loadAndValidate(manifest, transport, {
     supportedRuntimeFormats: manifest.runtimeArtifact
       ? [manifest.runtimeArtifact.formatVersion]
       : [],
     supportedRuntimeRequirements:
       manifest.runtimeArtifact?.compatibilityRequirements ?? [],
+    beforeAndAfterEffect,
   });
   if (!loaded.validation.valid) {
     throw new Error(
       `Checkpoint validation failed: ${loaded.validation.issues.join("; ")}`,
     );
   }
-  const root = await realpath(destinationPath);
-  const gitRoot = await realpath(
+  const root = await guarded(() => realpath(destinationPath));
+  const gitTopLevel = await guarded(() =>
     restoreGitText(root, ["rev-parse", "--show-toplevel"]),
   );
+  const gitRoot = await guarded(() => realpath(gitTopLevel));
   if (gitRoot !== root) {
     throw new Error("Prepared workspace is not its Git worktree root");
   }
-  const gitDirectory = await lstat(join(root, ".git"));
+  const gitDirectory = await guarded(() => lstat(join(root, ".git")));
   if (!gitDirectory.isDirectory() || gitDirectory.isSymbolicLink()) {
     throw new Error("Prepared workspace Git metadata is not a directory");
   }
-  rejectUnsupportedIndex(root);
+  await rejectUnsupportedIndexGuarded(root, beforeAndAfterEffect);
 
-  const actual = await collectWorkspaceFiles(root, null, [], resolveLimits());
+  const actual = await collectWorkspaceFiles(
+    root,
+    null,
+    [],
+    resolveLimits(),
+    beforeAndAfterEffect,
+  );
   if (actual.omissions.length > 0) {
     throw new Error("Prepared workspace contains omitted entries");
   }
@@ -640,7 +708,7 @@ export async function verifyRestoredWorkspaceCheckpoint(
     }
     const bytes =
       file.kind === "file"
-        ? await readSafeWorkspaceFile(file)
+        ? await readSafeWorkspaceFile(file, beforeAndAfterEffect)
         : Buffer.from(file.linkTarget, "utf8");
     if (sha256(bytes) !== expected.sha256) {
       throw new Error(
@@ -668,30 +736,34 @@ export async function verifyRestoredWorkspaceCheckpoint(
     manifest,
     loaded.bundleBytes,
     loaded.stagedPatchBytes,
+    beforeAndAfterEffect,
   );
-  const actualHead = restoreGitText(root, ["rev-parse", "--verify", "HEAD"]);
-  const actualBranch = restoreGitTryText(root, [
-    "symbolic-ref",
-    "-q",
-    "--short",
-    "HEAD",
-  ]);
-  const actualRefs = restoreGitRawText(root, [
-    "for-each-ref",
-    "--format=%(refname) %(objectname)",
-  ]);
-  const actualIndex = restoreGitRawText(root, ["ls-files", "--stage", "-z"]);
-  const actualStagedPaths = restoreGitRawText(root, [
-    "diff",
-    "--cached",
-    "--name-only",
-    "-z",
-    "--no-renames",
-    "HEAD",
-  ])
-    .split("\0")
-    .filter(Boolean)
-    .sort();
+  const actualHead = await guarded(() =>
+    restoreGitText(root, ["rev-parse", "--verify", "HEAD"]),
+  );
+  const actualBranch = await guarded(() =>
+    restoreGitTryText(root, ["symbolic-ref", "-q", "--short", "HEAD"]),
+  );
+  const actualRefs = await guarded(() =>
+    restoreGitRawText(root, [
+      "for-each-ref",
+      "--format=%(refname) %(objectname)",
+    ]),
+  );
+  const actualIndex = await guarded(() =>
+    restoreGitRawText(root, ["ls-files", "--stage", "-z"]),
+  );
+  const stagedPathBytes = await guarded(() =>
+    restoreGitRawText(root, [
+      "diff",
+      "--cached",
+      "--name-only",
+      "-z",
+      "--no-renames",
+      "HEAD",
+    ]),
+  );
+  const actualStagedPaths = stagedPathBytes.split("\0").filter(Boolean).sort();
   if (
     actualHead !== manifest.source.head ||
     actualBranch !== manifest.source.branch ||
@@ -708,71 +780,107 @@ async function expectedGitCheckpointState(
   manifest: WorkspaceCheckpointManifest,
   bundleBytes: Uint8Array,
   stagedPatchBytes: Uint8Array,
+  beforeAndAfterEffect?: CheckpointEffectGuard,
 ): Promise<{ refs: string; index: string }> {
-  const temporary = await mkdtemp(join(tmpdir(), "uzina-checkpoint-verify-"));
-  const checkout = join(temporary, "checkout");
-  const bundlePath = join(temporary, "workspace.bundle");
+  let temporary: string | undefined;
   try {
-    await mkdir(checkout);
-    await mkdir(join(temporary, "empty-template"));
-    await writeFile(bundlePath, bundleBytes, { flag: "wx" });
-    restoreGitText(checkout, [
-      "init",
-      "--quiet",
-      `--template=${join(temporary, "empty-template")}`,
-    ]);
-    restoreGitText(checkout, [
-      "fetch",
-      "--quiet",
-      "--no-tags",
-      bundlePath,
-      "+refs/*:refs/*",
-    ]);
-    restoreGitSetHeadAndIndex(
+    await beforeAndAfterEffect?.();
+    temporary = await mkdtemp(join(tmpdir(), "uzina-checkpoint-verify-"));
+    await beforeAndAfterEffect?.();
+    const checkout = join(temporary, "checkout");
+    const bundlePath = join(temporary, "workspace.bundle");
+    await checkpointGuardedEffect(beforeAndAfterEffect, () => mkdir(checkout));
+    await checkpointGuardedEffect(beforeAndAfterEffect, () =>
+      mkdir(join(temporary!, "empty-template")),
+    );
+    await checkpointGuardedEffect(beforeAndAfterEffect, () =>
+      writeFile(bundlePath, bundleBytes, { flag: "wx" }),
+    );
+    await checkpointGuardedEffect(beforeAndAfterEffect, () =>
+      restoreGitText(checkout, [
+        "init",
+        "--quiet",
+        `--template=${join(temporary!, "empty-template")}`,
+      ]),
+    );
+    await checkpointGuardedEffect(beforeAndAfterEffect, () =>
+      restoreGitText(checkout, [
+        "fetch",
+        "--quiet",
+        "--no-tags",
+        bundlePath,
+        "+refs/*:refs/*",
+      ]),
+    );
+    await restoreGitSetHeadAndIndexGuarded(
       checkout,
       manifest.source.head,
       manifest.source.branch,
+      beforeAndAfterEffect,
     );
     if (stagedPatchBytes.byteLength > 0) {
-      execFileSync(
-        "git",
-        ["apply", "--cached", "--binary", "--whitespace=nowarn", "-"],
-        {
-          cwd: checkout,
-          input: stagedPatchBytes,
-          maxBuffer: HARD_LIMITS.checkpointBytes,
-          env: safeRestoreEnvironment(),
-        },
+      await checkpointGuardedEffect(beforeAndAfterEffect, () =>
+        execFileSync(
+          "git",
+          ["apply", "--cached", "--binary", "--whitespace=nowarn", "-"],
+          {
+            cwd: checkout,
+            input: stagedPatchBytes,
+            maxBuffer: HARD_LIMITS.checkpointBytes,
+            env: safeRestoreEnvironment(),
+          },
+        ),
       );
     }
     return {
-      refs: restoreGitRawText(checkout, [
-        "for-each-ref",
-        "--format=%(refname) %(objectname)",
-      ]),
-      index: restoreGitRawText(checkout, ["ls-files", "--stage", "-z"]),
+      refs: await checkpointGuardedEffect(beforeAndAfterEffect, () =>
+        restoreGitRawText(checkout, [
+          "for-each-ref",
+          "--format=%(refname) %(objectname)",
+        ]),
+      ),
+      index: await checkpointGuardedEffect(beforeAndAfterEffect, () =>
+        restoreGitRawText(checkout, ["ls-files", "--stage", "-z"]),
+      ),
     };
   } finally {
-    await rm(temporary, { recursive: true, force: true });
+    if (temporary) {
+      await rm(temporary, { recursive: true, force: true });
+    }
   }
 }
 
-async function inspectEmptyDestination(destinationPath: string): Promise<{
+async function inspectEmptyDestination(
+  destinationPath: string,
+  beforeAndAfterEffect?: () => Promise<void>,
+): Promise<{
   candidate: string;
   existing: Awaited<ReturnType<typeof lstatIfPresent>>;
 }> {
+  const guarded = async <T>(operation: () => Promise<T>): Promise<T> => {
+    await beforeAndAfterEffect?.();
+    let result: T;
+    try {
+      result = await operation();
+    } catch (error) {
+      await beforeAndAfterEffect?.();
+      throw error;
+    }
+    await beforeAndAfterEffect?.();
+    return result;
+  };
   const destination = resolve(destinationPath);
   const parentPath = dirname(destination);
-  const realParent = await realpath(parentPath);
+  const realParent = await guarded(() => realpath(parentPath));
   const candidate = join(realParent, basename(destination));
   if (candidate === realParent || candidate === resolve(realParent)) {
     throw new Error("Destination must be a child of an existing directory");
   }
-  const existing = await lstatIfPresent(candidate);
+  const existing = await guarded(() => lstatIfPresent(candidate));
   if (existing && (!existing.isDirectory() || existing.isSymbolicLink())) {
     throw new Error("Restore destination must be a directory or not exist");
   }
-  if (existing && (await readdir(candidate)).length > 0) {
+  if (existing && (await guarded(() => readdir(candidate))).length > 0) {
     throw new Error("Restore destination must be empty");
   }
   return { candidate, existing };
@@ -784,6 +892,20 @@ async function loadAndValidate(
   options: CheckpointValidationOptions,
 ): Promise<LoadedCheckpoint> {
   const issues: string[] = [];
+  let guardFailed = false;
+  let guardFailure: unknown;
+  const beforeAndAfterEffect: CheckpointEffectGuard =
+    options.beforeAndAfterEffect
+      ? async () => {
+          try {
+            await options.beforeAndAfterEffect?.();
+          } catch (error) {
+            guardFailed = true;
+            guardFailure = error;
+            throw error;
+          }
+        }
+      : undefined;
   const limits = resolveLimits(options.limits);
   const shapeError = validateManifestShape(manifest, limits);
   if (shapeError) issues.push(shapeError);
@@ -813,7 +935,11 @@ async function loadAndValidate(
       issues.push(`unsupported checkpoint capability: ${capability}`);
     }
   }
-  const localGitVersion = localGitVersionOrNull();
+  const localGitVersion = beforeAndAfterEffect
+    ? await checkpointGuardedEffect(beforeAndAfterEffect, () =>
+        localGitVersionOrNull(),
+      )
+    : localGitVersionOrNull();
   if (
     !localGitVersion ||
     !versionIsAtLeast(localGitVersion, manifest.requirements.minimumGitVersion)
@@ -839,7 +965,6 @@ async function loadAndValidate(
     }
   }
 
-  const workspaceContents = new Map<string, Uint8Array>();
   let totalBytes = 0;
   const readBlob = async (
     blob: CheckpointBlob,
@@ -849,7 +974,9 @@ async function loadAndValidate(
     assertBlobReference(blob.reference);
     if (blob.size > maxBytes)
       throw new Error(`${label} exceeds its size limit`);
-    const bytes = await transport.getBlob(blob.reference);
+    const bytes = await checkpointGuardedEffect(beforeAndAfterEffect, () =>
+      transport.getBlob(blob.reference),
+    );
     if (bytes.byteLength > maxBytes)
       throw new Error(`${label} exceeds its size limit`);
     if (
@@ -894,7 +1021,6 @@ async function loadAndValidate(
       ) {
         throw new Error(`symlink target integrity mismatch for ${entry.path}`);
       }
-      workspaceContents.set(entry.path, bytes);
     }
     if (manifest.runtimeArtifact) {
       runtimeBytes = await readBlob(
@@ -914,8 +1040,14 @@ async function loadAndValidate(
       });
     }
     validateStagedPatchPaths(stagedPatchBytes, manifest.git.stagedPaths);
-    await verifyGitPayload(manifest, bundleBytes, stagedPatchBytes);
+    await verifyGitPayload(
+      manifest,
+      bundleBytes,
+      stagedPatchBytes,
+      beforeAndAfterEffect,
+    );
   } catch (error) {
+    if (guardFailed && error === guardFailure) throw error;
     issues.push(
       error instanceof Error
         ? error.message
@@ -955,7 +1087,6 @@ async function loadAndValidate(
   };
   return {
     validation: { valid: issues.length === 0, issues, preview },
-    workspaceContents,
     bundleBytes,
     stagedPatchBytes,
     runtimeBytes,
@@ -967,73 +1098,98 @@ async function verifyGitPayload(
   manifest: WorkspaceCheckpointManifest,
   bundleBytes: Uint8Array,
   stagedPatchBytes: Uint8Array,
+  beforeAndAfterEffect?: CheckpointEffectGuard,
 ): Promise<void> {
-  const temporary = await mkdtemp(join(tmpdir(), "uzina-checkpoint-validate-"));
-  const checkout = join(temporary, "checkout");
-  const bundlePath = join(temporary, "workspace.bundle");
-  const emptyTemplate = join(temporary, "empty-template");
+  let temporary: string | undefined;
   try {
-    await mkdir(checkout);
-    await mkdir(emptyTemplate);
-    await writeFile(bundlePath, bundleBytes, { flag: "wx" });
-    restoreGitText(checkout, [
-      "init",
-      "--quiet",
-      `--template=${emptyTemplate}`,
-    ]);
-    restoreGitText(checkout, [
-      "fetch",
-      "--quiet",
-      "--no-tags",
-      bundlePath,
-      "+refs/*:refs/*",
-    ]);
-    const bundledHead = restoreGitText(checkout, [
-      "rev-parse",
-      "--verify",
-      `${manifest.source.head}^{commit}`,
-    ]);
+    await beforeAndAfterEffect?.();
+    temporary = await mkdtemp(join(tmpdir(), "uzina-checkpoint-validate-"));
+    await beforeAndAfterEffect?.();
+    const checkout = join(temporary, "checkout");
+    const bundlePath = join(temporary, "workspace.bundle");
+    const emptyTemplate = join(temporary, "empty-template");
+    await checkpointGuardedEffect(beforeAndAfterEffect, () => mkdir(checkout));
+    await checkpointGuardedEffect(beforeAndAfterEffect, () =>
+      mkdir(emptyTemplate),
+    );
+    await checkpointGuardedEffect(beforeAndAfterEffect, () =>
+      writeFile(bundlePath, bundleBytes, { flag: "wx" }),
+    );
+    await checkpointGuardedEffect(beforeAndAfterEffect, () =>
+      restoreGitText(checkout, [
+        "init",
+        "--quiet",
+        `--template=${emptyTemplate}`,
+      ]),
+    );
+    await checkpointGuardedEffect(beforeAndAfterEffect, () =>
+      restoreGitText(checkout, [
+        "fetch",
+        "--quiet",
+        "--no-tags",
+        bundlePath,
+        "+refs/*:refs/*",
+      ]),
+    );
+    const bundledHead = await checkpointGuardedEffect(
+      beforeAndAfterEffect,
+      () =>
+        restoreGitText(checkout, [
+          "rev-parse",
+          "--verify",
+          `${manifest.source.head}^{commit}`,
+        ]),
+    );
     if (bundledHead !== manifest.source.head)
       throw new Error("Git bundle does not contain the declared HEAD");
     if (manifest.source.branch) {
-      const branchHead = restoreGitText(checkout, [
-        "rev-parse",
-        "--verify",
-        `refs/heads/${manifest.source.branch}^{commit}`,
-      ]);
+      const branchHead = await checkpointGuardedEffect(
+        beforeAndAfterEffect,
+        () =>
+          restoreGitText(checkout, [
+            "rev-parse",
+            "--verify",
+            `refs/heads/${manifest.source.branch}^{commit}`,
+          ]),
+      );
       if (branchHead !== manifest.source.head)
         throw new Error(
           "Git bundle branch does not point at the declared HEAD",
         );
     }
-    restoreGitSetHeadAndIndex(
+    await restoreGitSetHeadAndIndexGuarded(
       checkout,
       manifest.source.head,
       manifest.source.branch,
+      beforeAndAfterEffect,
     );
     if (stagedPatchBytes.byteLength > 0) {
-      execFileSync(
-        "git",
-        ["apply", "--cached", "--binary", "--whitespace=nowarn", "-"],
-        {
-          cwd: checkout,
-          input: stagedPatchBytes,
-          maxBuffer: HARD_LIMITS.checkpointBytes,
-          env: safeRestoreEnvironment(),
-        },
+      await checkpointGuardedEffect(beforeAndAfterEffect, () =>
+        execFileSync(
+          "git",
+          ["apply", "--cached", "--binary", "--whitespace=nowarn", "-"],
+          {
+            cwd: checkout,
+            input: stagedPatchBytes,
+            maxBuffer: HARD_LIMITS.checkpointBytes,
+            env: safeRestoreEnvironment(),
+          },
+        ),
       );
     }
-    const stagedPaths = restoreGitRawText(checkout, [
-      "diff",
-      "--cached",
-      "--name-only",
-      "-z",
-      "--no-renames",
-      "HEAD",
-    ])
-      .split("\0")
-      .filter(Boolean)
-      .sort();
+    const stagedPathBytes = await checkpointGuardedEffect(
+      beforeAndAfterEffect,
+      () =>
+        restoreGitRawText(checkout, [
+          "diff",
+          "--cached",
+          "--name-only",
+          "-z",
+          "--no-renames",
+          "HEAD",
+        ]),
+    );
+    const stagedPaths = stagedPathBytes.split("\0").filter(Boolean).sort();
     if (
       JSON.stringify(stagedPaths) !==
       JSON.stringify([...manifest.git.stagedPaths].sort())
@@ -1041,7 +1197,9 @@ async function verifyGitPayload(
       throw new Error("Staged patch paths do not match the manifest");
     }
   } finally {
-    await rm(temporary, { recursive: true, force: true });
+    if (temporary) {
+      await rm(temporary, { recursive: true, force: true });
+    }
   }
 }
 
@@ -1049,13 +1207,40 @@ async function restoreIntoStaging(
   staging: string,
   manifest: WorkspaceCheckpointManifest,
   loaded: LoadedCheckpoint,
+  transport: BlobTransport,
+  beforeAndAfterEffect?: () => Promise<void>,
 ): Promise<void> {
-  const temp = await mkdtemp(join(tmpdir(), "uzina-bundle-"));
-  const bundlePath = join(temp, "workspace.bundle");
+  const guardedEffect = async <T>(operation: () => Promise<T>): Promise<T> => {
+    await beforeAndAfterEffect?.();
+    const result = await operation();
+    await beforeAndAfterEffect?.();
+    return result;
+  };
+  const guardedAcquire = async <T>(
+    operation: () => Promise<T>,
+    takeOwnership: (resource: T) => void,
+  ): Promise<T> => {
+    await beforeAndAfterEffect?.();
+    const resource = await operation();
+    takeOwnership(resource);
+    await beforeAndAfterEffect?.();
+    return resource;
+  };
+  let temporary: string | undefined;
   try {
-    await writeFile(bundlePath, loaded.bundleBytes, { flag: "wx" });
+    const temp = await guardedAcquire(
+      () => mkdtemp(join(tmpdir(), "uzina-bundle-")),
+      (resource) => {
+        temporary = resource;
+      },
+    );
+    const bundlePath = join(temp, "workspace.bundle");
+    await guardedEffect(() =>
+      writeFile(bundlePath, loaded.bundleBytes, { flag: "wx" }),
+    );
     const emptyTemplate = join(temp, "empty-template");
-    await mkdir(emptyTemplate);
+    await guardedEffect(() => mkdir(emptyTemplate));
+    await beforeAndAfterEffect?.();
     restoreGitText(staging, ["init", "--quiet", `--template=${emptyTemplate}`]);
     restoreGitText(staging, [
       "fetch",
@@ -1082,12 +1267,15 @@ async function restoreIntoStaging(
           "Git bundle branch does not point at the declared HEAD",
         );
     }
+    await beforeAndAfterEffect?.();
     restoreGitSetHeadAndIndex(
       staging,
       manifest.source.head,
       manifest.source.branch,
     );
+    await beforeAndAfterEffect?.();
     if (loaded.stagedPatchBytes.byteLength > 0) {
+      await beforeAndAfterEffect?.();
       execFileSync(
         "git",
         ["apply", "--cached", "--binary", "--whitespace=nowarn", "-"],
@@ -1098,7 +1286,9 @@ async function restoreIntoStaging(
           env: safeRestoreEnvironment(),
         },
       );
+      await beforeAndAfterEffect?.();
     }
+    await beforeAndAfterEffect?.();
     const restoredStagedPaths = restoreGitRawText(staging, [
       "diff",
       "--cached",
@@ -1116,28 +1306,48 @@ async function restoreIntoStaging(
     ) {
       throw new Error("Staged patch paths do not match the manifest");
     }
-    for (const [path, bytes] of loaded.workspaceContents) {
-      const absolutePath = safeDestinationPath(staging, path);
-      await mkdir(dirname(absolutePath), { recursive: true });
-      const entry = manifest.workspace.entries.find(
-        (candidate) => candidate.path === path,
+    let restoredBytes = 0;
+    for (const entry of manifest.workspace.entries) {
+      const bytes = await transport.getBlob(entry.sha256);
+      if (
+        bytes.byteLength !== entry.size ||
+        entry.size > HARD_LIMITS.fileBytes ||
+        sha256(bytes) !== entry.sha256 ||
+        restoredBytes + bytes.byteLength > HARD_LIMITS.checkpointBytes
+      ) {
+        throw new Error(`Workspace entry integrity mismatch for ${entry.path}`);
+      }
+      restoredBytes += bytes.byteLength;
+      if (
+        entry.kind === "symlink" &&
+        Buffer.from(bytes).toString("utf8") !== entry.linkTarget
+      ) {
+        throw new Error(`symlink target integrity mismatch for ${entry.path}`);
+      }
+      const absolutePath = safeDestinationPath(staging, entry.path);
+      await guardedEffect(() =>
+        mkdir(dirname(absolutePath), { recursive: true }),
       );
-      if (!entry)
-        throw new Error(`Missing workspace entry metadata for ${path}`);
       if (entry.kind === "symlink") {
         const target = entry.linkTarget!;
-        assertSymlinkContained(staging, path, target);
-        await symlink(target, absolutePath);
+        assertSymlinkContained(staging, entry.path, target);
+        await guardedEffect(() => symlink(target, absolutePath));
       } else {
-        await writeFile(absolutePath, bytes, {
-          flag: "wx",
-          mode: entry.executable ? 0o755 : 0o644,
-        });
-        await chmod(absolutePath, entry.executable ? 0o755 : 0o644);
+        await guardedEffect(() =>
+          writeFile(absolutePath, bytes, {
+            flag: "wx",
+            mode: entry.executable ? 0o755 : 0o644,
+          }),
+        );
+        await guardedEffect(() =>
+          chmod(absolutePath, entry.executable ? 0o755 : 0o644),
+        );
       }
     }
   } finally {
-    await rm(temp, { recursive: true, force: true });
+    if (temporary) {
+      await rm(temporary, { recursive: true, force: true });
+    }
   }
 }
 
@@ -1148,6 +1358,8 @@ interface CapturedFile {
   executable: boolean;
   linkTarget: string;
   absolutePath: string;
+  dev: number;
+  ino: number;
 }
 
 async function collectWorkspaceFiles(
@@ -1155,6 +1367,7 @@ async function collectWorkspaceFiles(
   includeGlobs: string[] | null,
   excludeGlobs: string[],
   limits: ReturnType<typeof resolveLimits>,
+  beforeAndAfterEffect?: CheckpointEffectGuard,
 ): Promise<{
   files: CapturedFile[];
   directories: string[];
@@ -1175,11 +1388,15 @@ async function collectWorkspaceFiles(
     omissions.push({ path, reason });
     omittedPaths.add(path);
   };
+  const guarded = <T>(operation: () => T | Promise<T>) =>
+    checkpointGuardedEffect(beforeAndAfterEffect, operation);
   const visit = async (
     directory: string,
     relativeDirectory: string,
   ): Promise<void> => {
-    const children = await readdir(directory, { encoding: "buffer" });
+    const children = await guarded(() =>
+      readdir(directory, { encoding: "buffer" }),
+    );
     children.sort((left, right) => Buffer.compare(left, right));
     for (const child of children) {
       const name = child.toString("utf8");
@@ -1195,7 +1412,7 @@ async function collectWorkspaceFiles(
       const pathError = validateRelativePath(path);
       if (pathError) throw new Error(pathError);
       const absolutePath = join(directory, name);
-      const stat = await lstat(absolutePath);
+      const stat = await guarded(() => lstat(absolutePath));
       if (matchesAny(path, excludeGlobs)) {
         recordOmission(path, "excluded");
         continue;
@@ -1219,7 +1436,7 @@ async function collectWorkspaceFiles(
         directories.push(path);
         await visit(absolutePath, path);
       } else if (stat.isSymbolicLink()) {
-        const target = await readlinkString(absolutePath);
+        const target = await guarded(() => readlinkString(absolutePath));
         assertSymlinkContained(root, path, target);
         const size = Buffer.byteLength(target, "utf8");
         if (size > limits.maxFileBytes) {
@@ -1232,6 +1449,8 @@ async function collectWorkspaceFiles(
             executable: false,
             linkTarget: target,
             absolutePath,
+            dev: stat.dev,
+            ino: stat.ino,
           });
         }
       } else if (stat.isFile()) {
@@ -1245,6 +1464,8 @@ async function collectWorkspaceFiles(
             executable: (stat.mode & 0o111) !== 0,
             linkTarget: "",
             absolutePath,
+            dev: stat.dev,
+            ino: stat.ino,
           });
         }
       } else {
@@ -1554,7 +1775,6 @@ function validateStagedPatchPaths(patch: Uint8Array, paths: string[]): void {
 function emptyLoaded(validation: CheckpointValidation): LoadedCheckpoint {
   return {
     validation,
-    workspaceContents: new Map(),
     bundleBytes: new Uint8Array(),
     stagedPatchBytes: new Uint8Array(),
     runtimeBytes: null,
@@ -1694,6 +1914,43 @@ function rejectUnsupportedIndex(root: string): void {
     throw new Error("Sparse checkouts are not supported");
   }
   if (gitTryText(root, ["config", "--bool", "core.splitIndex"]) === "true") {
+    throw new Error("Split Git indexes are not supported");
+  }
+}
+
+async function rejectUnsupportedIndexGuarded(
+  root: string,
+  beforeAndAfterEffect?: CheckpointEffectGuard,
+): Promise<void> {
+  const taggedPathBytes = await checkpointGuardedEffect(
+    beforeAndAfterEffect,
+    () => gitRawText(root, ["ls-files", "-v", "-z"]),
+  );
+  const taggedPaths = taggedPathBytes.split("\0").filter(Boolean);
+  if (taggedPaths.some((entry) => /^[a-z]/.test(entry) || entry[0] === "S")) {
+    throw new Error(
+      "Assume-unchanged and skip-worktree index entries are not supported",
+    );
+  }
+  const debug = await checkpointGuardedEffect(beforeAndAfterEffect, () =>
+    gitText(root, ["ls-files", "--debug"]),
+  );
+  for (const match of debug.matchAll(/flags:\s*([0-9a-f]+)/gi)) {
+    if ((Number.parseInt(match[1]!, 16) & 0x20000000) !== 0) {
+      throw new Error("Git intent-to-add index entries are not supported");
+    }
+  }
+  const sparseCheckout = await checkpointGuardedEffect(
+    beforeAndAfterEffect,
+    () => gitTryText(root, ["config", "--bool", "core.sparseCheckout"]),
+  );
+  if (sparseCheckout === "true") {
+    throw new Error("Sparse checkouts are not supported");
+  }
+  const splitIndex = await checkpointGuardedEffect(beforeAndAfterEffect, () =>
+    gitTryText(root, ["config", "--bool", "core.splitIndex"]),
+  );
+  if (splitIndex === "true") {
     throw new Error("Split Git indexes are not supported");
   }
 }
@@ -1845,6 +2102,26 @@ function restoreGitSetHeadAndIndex(
   restoreGitText(cwd, ["read-tree", head]);
 }
 
+async function restoreGitSetHeadAndIndexGuarded(
+  cwd: string,
+  head: string,
+  branch: string | null,
+  beforeAndAfterEffect?: CheckpointEffectGuard,
+): Promise<void> {
+  if (branch) {
+    await checkpointGuardedEffect(beforeAndAfterEffect, () =>
+      restoreGitText(cwd, ["symbolic-ref", "HEAD", `refs/heads/${branch}`]),
+    );
+  } else {
+    await checkpointGuardedEffect(beforeAndAfterEffect, () =>
+      restoreGitText(cwd, ["update-ref", "--no-deref", "HEAD", head]),
+    );
+  }
+  await checkpointGuardedEffect(beforeAndAfterEffect, () =>
+    restoreGitText(cwd, ["read-tree", head]),
+  );
+}
+
 function restoreGitTryText(cwd: string, args: string[]): string | null {
   try {
     return restoreGitText(cwd, args);
@@ -1961,21 +2238,84 @@ async function assertFileTransportOutsideWorkspace(
   }
 }
 
-async function readSafeWorkspaceFile(file: CapturedFile): Promise<Buffer> {
+async function readSafeWorkspaceFile(
+  file: CapturedFile,
+  beforeAndAfterEffect?: CheckpointEffectGuard,
+): Promise<Buffer> {
+  if (!constants.O_NOFOLLOW) {
+    throw new Error("This host cannot safely read workspace files");
+  }
+  if (
+    !Number.isSafeInteger(file.size) ||
+    file.size < 0 ||
+    file.size > HARD_LIMITS.fileBytes
+  ) {
+    throw new Error(`Workspace file exceeds its safe read limit: ${file.path}`);
+  }
+  await beforeAndAfterEffect?.();
   const handle = await open(
     file.absolutePath,
-    constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+    constants.O_RDONLY | constants.O_NOFOLLOW | (constants.O_NONBLOCK ?? 0),
   );
   try {
-    const metadata = await handle.stat();
+    await beforeAndAfterEffect?.();
+    const opened = await checkpointGuardedEffect(beforeAndAfterEffect, () =>
+      handle.stat(),
+    );
     if (
-      !metadata.isFile() ||
-      metadata.size !== file.size ||
-      ((metadata.mode & 0o111) !== 0) !== file.executable
+      !opened.isFile() ||
+      opened.dev !== file.dev ||
+      opened.ino !== file.ino ||
+      opened.size !== file.size ||
+      ((opened.mode & 0o111) !== 0) !== file.executable
     ) {
       throw new Error(`Workspace file changed during capture: ${file.path}`);
     }
-    return await handle.readFile();
+
+    const bytes = Buffer.allocUnsafe(file.size);
+    let offset = 0;
+    while (offset < file.size) {
+      const length = Math.min(
+        WORKSPACE_FILE_READ_CHUNK_BYTES,
+        file.size - offset,
+      );
+      const { bytesRead } = await checkpointGuardedEffect(
+        beforeAndAfterEffect,
+        () => handle.read(bytes, offset, length, offset),
+      );
+      if (bytesRead === 0) {
+        throw new Error(`Workspace file changed during capture: ${file.path}`);
+      }
+      offset += bytesRead;
+    }
+    const extra = Buffer.allocUnsafe(1);
+    const extraRead = await checkpointGuardedEffect(beforeAndAfterEffect, () =>
+      handle.read(extra, 0, 1, file.size),
+    );
+    const final = await checkpointGuardedEffect(beforeAndAfterEffect, () =>
+      handle.stat(),
+    );
+    const pathAfter = await checkpointGuardedEffect(beforeAndAfterEffect, () =>
+      lstat(file.absolutePath),
+    );
+    if (
+      offset !== file.size ||
+      extraRead.bytesRead !== 0 ||
+      final.dev !== opened.dev ||
+      final.ino !== opened.ino ||
+      final.size !== opened.size ||
+      final.mtimeMs !== opened.mtimeMs ||
+      final.ctimeMs !== opened.ctimeMs ||
+      !pathAfter.isFile() ||
+      pathAfter.isSymbolicLink() ||
+      pathAfter.dev !== opened.dev ||
+      pathAfter.ino !== opened.ino ||
+      pathAfter.size !== opened.size ||
+      ((pathAfter.mode & 0o111) !== 0) !== file.executable
+    ) {
+      throw new Error(`Workspace file changed during capture: ${file.path}`);
+    }
+    return bytes;
   } finally {
     await handle.close();
   }

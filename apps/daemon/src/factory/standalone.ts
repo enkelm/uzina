@@ -31,6 +31,7 @@ import type { FactoryQueueJob } from "@uzina/contracts/factory";
 import { openLocalManagedPiWork } from "../runtime/managed-work";
 import { assertLoopbackHostname } from "../loopback";
 import { BunPrivateAssistantStore } from "./private-assistant-store";
+import { createStandaloneManagedWorkImportHost } from "./managed-work-import";
 
 export interface StandaloneFactoryServer {
   server: ReturnType<typeof Bun.serve>;
@@ -56,6 +57,10 @@ export type StandaloneFactoryOptions = {
   hostname?: string;
   /** Trusted local mappings; capture refuses ambiguous physical workspace aliases. */
   workspaceDirectories?: Readonly<Record<string, string>>;
+  /** Operator-configured offline content-addressed catalog IDs; never request paths. */
+  managedWorkImportCatalogs?: Readonly<Record<string, string>>;
+  /** Operator-configured inactive destination IDs; never request paths. */
+  managedWorkImportDestinations?: Readonly<Record<string, string>>;
   /** Must durably quiesce the selected local/remote writer and supported Rex activity. */
   workspaceCaptureQuiescence?: {
     acquire(
@@ -90,6 +95,29 @@ function workspaceRootsOverlap(left: string, right: string): boolean {
   return contains(left, right) || contains(right, left);
 }
 
+async function projectedPhysicalPath(path: string): Promise<string> {
+  let cursor = resolve(path);
+  const suffix: string[] = [];
+  while (true) {
+    try {
+      return resolve(await realpath(cursor), ...suffix.reverse());
+    } catch (error) {
+      if (
+        typeof error !== "object" ||
+        error === null ||
+        !("code" in error) ||
+        (error as { code?: string }).code !== "ENOENT"
+      ) {
+        throw error;
+      }
+      const parent = dirname(cursor);
+      if (parent === cursor) throw error;
+      suffix.push(cursor.slice(parent.length + (parent === sep ? 0 : 1)));
+      cursor = parent;
+    }
+  }
+}
+
 export function localFactoryDefaults() {
   const data = join(homedir(), ".local", "share", "uzina");
   return {
@@ -114,7 +142,6 @@ export async function createStandaloneFactoryServer(
   const snapshotStorageDirectory = resolve(
     options.snapshotStorageDirectory ?? `${databasePath}.workspace-checkpoints`,
   );
-  mkdirSync(runtimeDirectory, { recursive: true });
   const canonicalWorkspaces = Object.values(
     options.workspaceDirectories ?? {},
   ).map((mappedDirectory) => realpathSync(mappedDirectory));
@@ -127,12 +154,8 @@ export async function createStandaloneFactoryServer(
       "Workspace snapshot storage must be outside every selected workspace root",
     );
   }
-  let storageAncestor = snapshotStorageDirectory;
-  while (!existsSync(storageAncestor))
-    storageAncestor = dirname(storageAncestor);
-  const projectedStorage = resolve(
-    realpathSync(storageAncestor),
-    relative(storageAncestor, snapshotStorageDirectory),
+  const projectedStorage = await projectedPhysicalPath(
+    snapshotStorageDirectory,
   );
   if (
     canonicalWorkspaces.some((workspace) =>
@@ -143,33 +166,109 @@ export async function createStandaloneFactoryServer(
       "Workspace snapshot storage must be outside every selected workspace root",
     );
   }
-  mkdirSync(snapshotStorageDirectory, { recursive: true, mode: 0o700 });
-  const canonicalSnapshotStorage = realpathSync(snapshotStorageDirectory);
-  if (
-    canonicalWorkspaces.some((workspace) =>
-      workspaceRootsOverlap(canonicalSnapshotStorage, workspace),
-    )
-  ) {
+  const hasImportCatalogs = options.managedWorkImportCatalogs !== undefined;
+  const hasImportDestinations =
+    options.managedWorkImportDestinations !== undefined;
+  if (hasImportCatalogs !== hasImportDestinations) {
     throw new Error(
-      "Workspace snapshot storage must be outside every selected workspace root",
+      "Offline managed-work imports require both configured catalogs and destinations",
     );
   }
-  const snapshotStorage = new FileWorkspaceSnapshotStorage(
-    snapshotStorageDirectory,
-  );
   if (!options.models.getModel(options.modelProvider, options.modelId)) {
     throw new Error(
       "Standalone Factory model is absent from the configured provider catalog",
     );
   }
+
+  const databasePaths = [
+    databasePath,
+    `${databasePath}-wal`,
+    `${databasePath}-shm`,
+    `${databasePath}-journal`,
+  ];
+  const privateAssistantPath = join(runtimeDirectory, "private-assistant");
+  const configuredLocalPaths = [
+    ...databasePaths,
+    runtimeDirectory,
+    privateAssistantPath,
+    snapshotStorageDirectory,
+    ...Object.values(options.workspaceDirectories ?? {}),
+  ];
+  const projectedLocalPaths = await Promise.all(
+    configuredLocalPaths.map((path) => projectedPhysicalPath(path)),
+  );
+  const reservationGuardRoots = [
+    ...configuredLocalPaths,
+    ...projectedLocalPaths,
+  ];
+
   const database = new BunFactoryDatabase(databasePath);
-  const factory = new FactoryService(database, options.bootstrapSecret);
+  let factory: FactoryService;
+  try {
+    factory = new FactoryService(database, options.bootstrapSecret);
+    factory.assertManagedWorkImportReservationsDisjoint(reservationGuardRoots);
+  } catch (error) {
+    database.close();
+    throw error;
+  }
+
+  let managedWorkImportHost:
+    | Awaited<ReturnType<typeof createStandaloneManagedWorkImportHost>>
+    | undefined;
+  let snapshotStorage: FileWorkspaceSnapshotStorage;
+  try {
+    if (hasImportCatalogs) {
+      const supportedToolNames = MANAGED_REMOTE_TOOL_REQUIREMENTS.map(
+        (requirement) => requirement.slice(5, requirement.lastIndexOf(":")),
+      );
+      managedWorkImportHost = await createStandaloneManagedWorkImportHost({
+        catalogs: options.managedWorkImportCatalogs!,
+        destinations: options.managedWorkImportDestinations!,
+        localRoots: reservationGuardRoots,
+        supportedRuntimeRequirements: [
+          `model:${options.modelProvider}/${options.modelId}`,
+          ...MANAGED_REMOTE_TOOL_REQUIREMENTS,
+        ],
+        supportedModel: {
+          provider: options.modelProvider,
+          modelId: options.modelId,
+        },
+        supportedToolNames,
+      });
+    }
+    mkdirSync(runtimeDirectory, { recursive: true });
+    mkdirSync(snapshotStorageDirectory, { recursive: true, mode: 0o700 });
+    const canonicalSnapshotStorage = realpathSync(snapshotStorageDirectory);
+    if (
+      canonicalWorkspaces.some((workspace) =>
+        workspaceRootsOverlap(canonicalSnapshotStorage, workspace),
+      )
+    ) {
+      throw new Error(
+        "Workspace snapshot storage must be outside every selected workspace root",
+      );
+    }
+    factory.assertManagedWorkImportReservationsDisjoint([
+      ...reservationGuardRoots,
+      realpathSync(runtimeDirectory),
+      canonicalSnapshotStorage,
+    ]);
+    snapshotStorage = new FileWorkspaceSnapshotStorage(
+      snapshotStorageDirectory,
+    );
+  } catch (error) {
+    await managedWorkImportHost?.close();
+    database.close();
+    throw error;
+  }
+
   const work = new Map<string, ManagedPiWork>();
   const opening = new Map<string, Promise<ManagedPiWork>>();
   let dispatching: Promise<void> | undefined;
   let drainRequested = false;
   let activeCaptures = 0;
   let closing = false;
+  let closePromise: Promise<void> | undefined;
   const captureWaiters: Array<() => void> = [];
 
   const openWork = async (
@@ -229,7 +328,6 @@ export async function createStandaloneFactoryServer(
   let privateAssistant: PrivateAssistantRuntime | undefined;
   let privateAssistantStore: BunPrivateAssistantStore | undefined;
   let privateAssistantOpening: Promise<PrivateAssistantRuntime> | undefined;
-  const privateAssistantPath = join(runtimeDirectory, "private-assistant");
   const openPrivateAssistant = async (): Promise<PrivateAssistantRuntime> => {
     if (privateAssistant) return privateAssistant;
     if (privateAssistantOpening) return privateAssistantOpening;
@@ -358,6 +456,8 @@ export async function createStandaloneFactoryServer(
       },
     },
     snapshotStorage,
+    undefined,
+    managedWorkImportHost,
   );
 
   const dispatch = async (input: FactoryQueueJob) => {
@@ -420,32 +520,38 @@ export async function createStandaloneFactoryServer(
     });
   };
 
-  server = Bun.serve({
-    port: options.port ?? 8788,
-    hostname,
-    async fetch(request) {
-      const response = await handler(request);
-      const path = new URL(request.url).pathname;
-      if (
-        response.ok &&
-        request.method === "POST" &&
-        /^\/v1\/nodes\/[^/]+\/(?:register|heartbeat)$/.test(path)
-      ) {
-        startDrain();
-      }
-      if (
-        request.method === "POST" &&
-        /^\/v1\/threads\/[^/]+\/inputs$/.test(path) &&
-        response.status === 202
-      ) {
-        const receipt = (await response.clone().json()) as {
-          dispatchStatus?: string;
-        };
-        if (receipt.dispatchStatus === "queued") startDrain();
-      }
-      return response;
-    },
-  });
+  try {
+    server = Bun.serve({
+      port: options.port ?? 8788,
+      hostname,
+      async fetch(request) {
+        const response = await handler(request);
+        const path = new URL(request.url).pathname;
+        if (
+          response.ok &&
+          request.method === "POST" &&
+          /^\/v1\/nodes\/[^/]+\/(?:register|heartbeat)$/.test(path)
+        ) {
+          startDrain();
+        }
+        if (
+          request.method === "POST" &&
+          /^\/v1\/threads\/[^/]+\/inputs$/.test(path) &&
+          response.status === 202
+        ) {
+          const receipt = (await response.clone().json()) as {
+            dispatchStatus?: string;
+          };
+          if (receipt.dispatchStatus === "queued") startDrain();
+        }
+        return response;
+      },
+    });
+  } catch (error) {
+    await managedWorkImportHost?.close();
+    database.close();
+    throw error;
+  }
 
   startDrain();
   try {
@@ -551,28 +657,39 @@ export async function createStandaloneFactoryServer(
         }
       }
     },
-    async close(force = true) {
+    close(force = true) {
+      if (closePromise) return closePromise;
       closing = true;
-      server.stop(force);
-      while (activeCaptures > 0) {
-        await new Promise<void>((resolveCapture) =>
-          captureWaiters.push(resolveCapture),
-        );
-      }
-      while (dispatching) await dispatching.catch(() => {});
-      await Promise.all(
-        [...opening.values()].map((pending) =>
-          pending.then(
-            () => undefined,
-            () => undefined,
+      closePromise = (async () => {
+        server.stop(force);
+        let importCloseError: unknown;
+        try {
+          await managedWorkImportHost?.close();
+        } catch (error) {
+          importCloseError = error;
+        }
+        while (activeCaptures > 0) {
+          await new Promise<void>((resolveCapture) =>
+            captureWaiters.push(resolveCapture),
+          );
+        }
+        while (dispatching) await dispatching.catch(() => {});
+        await Promise.all(
+          [...opening.values()].map((pending) =>
+            pending.then(
+              () => undefined,
+              () => undefined,
+            ),
           ),
-        ),
-      );
-      await Promise.all([...work.values()].map((managed) => managed.close()));
-      work.clear();
-      if (privateAssistant) await privateAssistant.close().catch(() => {});
-      privateAssistantStore?.close();
-      database.close();
+        );
+        await Promise.all([...work.values()].map((managed) => managed.close()));
+        work.clear();
+        if (privateAssistant) await privateAssistant.close().catch(() => {});
+        privateAssistantStore?.close();
+        database.close();
+        if (importCloseError !== undefined) throw importCloseError;
+      })();
+      return closePromise;
     },
   };
 }

@@ -87,6 +87,11 @@ export interface ManagedWorkBundleMetadataVerificationOptions {
   runtimeArtifactBytes: Uint8Array;
 }
 
+export type ManagedWorkBundleMetadataPreflightOptions = Omit<
+  ManagedWorkBundleMetadataVerificationOptions,
+  "runtimeArtifactBytes"
+>;
+
 export interface CapturedManagedWorkBundle {
   manifest: ManagedWorkBundleManifest;
   manifestReference: string;
@@ -247,9 +252,9 @@ export function parseManagedWorkBundleManifestBytes(
   return value;
 }
 
-export async function verifyManagedWorkBundleMetadata(
-  options: ManagedWorkBundleMetadataVerificationOptions,
-): Promise<ManagedWorkBundleMetadataVerification> {
+export function preflightManagedWorkBundleMetadata(
+  options: ManagedWorkBundleMetadataPreflightOptions,
+): ManagedWorkBundleMetadataVerification {
   const manifest = parseManagedWorkBundleManifestBytes(
     options.manifestBytes,
     options.manifestReference,
@@ -279,6 +284,14 @@ export async function verifyManagedWorkBundleMetadata(
       "Managed-work runtime requirements do not match the source",
     );
   }
+  if (
+    !/^[a-f0-9]{64}$/.test(manifest.workspaceManifestReference) ||
+    options.innerWorkspaceManifestBytes.byteLength > MANIFEST_MAX_BYTES ||
+    sha256(options.innerWorkspaceManifestBytes) !==
+      manifest.workspaceManifestReference
+  ) {
+    throw new Error("Managed-work inner workspace manifest is invalid");
+  }
   let sourceWorkspace: unknown;
   let innerWorkspace: unknown;
   try {
@@ -295,24 +308,20 @@ export async function verifyManagedWorkBundleMetadata(
   } catch {
     throw new Error("Workspace manifest is not valid JSON");
   }
-  const sourceWorkspaceReferences = portableWorkspaceBlobReferences(
-    sourceWorkspace,
-    options.sourceWorkspaceManifestReference,
-    options.sourceWorkspaceManifestBytes.byteLength,
-  );
   if (
-    !/^[a-f0-9]{64}$/.test(manifest.workspaceManifestReference) ||
-    options.innerWorkspaceManifestBytes.byteLength > MANIFEST_MAX_BYTES ||
-    sha256(options.innerWorkspaceManifestBytes) !==
-      manifest.workspaceManifestReference ||
     canonicalManagedWorkJson(innerWorkspace) !==
-      canonicalManagedWorkJson(manifest.workspace)
+    canonicalManagedWorkJson(manifest.workspace)
   ) {
     throw new Error("Managed-work inner workspace manifest is invalid");
   }
   if (!isRecord(manifest.workspace)) {
     throw new Error("Managed-work bundle workspace manifest is malformed");
   }
+  const sourceWorkspaceReferences = portableWorkspaceBlobReferences(
+    sourceWorkspace,
+    options.sourceWorkspaceManifestReference,
+    options.sourceWorkspaceManifestBytes.byteLength,
+  );
   const workspace = manifest.workspace as unknown as Record<string, unknown>;
   if (
     !isRecord(workspace.runtimeArtifact) ||
@@ -344,30 +353,9 @@ export async function verifyManagedWorkBundleMetadata(
     runtimeArtifact.sha256 !== runtimeArtifact.reference ||
     !Number.isSafeInteger(runtimeArtifact.size) ||
     (runtimeArtifact.size as number) < 0 ||
-    (runtimeArtifact.size as number) > PORTABLE_WORKSPACE_RUNTIME_MAX_BYTES ||
-    options.runtimeArtifactBytes.byteLength !== runtimeArtifact.size ||
-    options.runtimeArtifactBytes.byteLength >
-      PORTABLE_WORKSPACE_RUNTIME_MAX_BYTES ||
-    sha256(options.runtimeArtifactBytes) !== runtimeArtifact.reference
+    (runtimeArtifact.size as number) > PORTABLE_WORKSPACE_RUNTIME_MAX_BYTES
   ) {
-    throw new Error("Managed-work runtime artifact content is invalid");
-  }
-  let runtimeValue: unknown;
-  try {
-    runtimeValue = JSON.parse(
-      new TextDecoder("utf-8", { fatal: true }).decode(
-        options.runtimeArtifactBytes,
-      ),
-    );
-  } catch {
-    throw new Error("Managed-work runtime artifact is not valid JSON");
-  }
-  const checkpoint = await validateManagedWorkCheckpoint(runtimeValue);
-  if (
-    checkpoint.profile !== MANAGED_WORK_PROFILE ||
-    checkpoint.rootConversationId !== ROOT_CONVERSATION_ID
-  ) {
-    throw new Error("Managed-work runtime profile does not match its bundle");
+    throw new Error("Managed-work runtime artifact metadata is invalid");
   }
   const sourceWithoutRuntime: Record<string, unknown> = {
     ...workspace,
@@ -461,6 +449,49 @@ export async function verifyManagedWorkBundleMetadata(
     sourceWorkspaceReferences,
     privateArtifacts,
   };
+}
+
+export async function verifyManagedWorkBundleRuntimeArtifact(
+  metadata: ManagedWorkBundleMetadataVerification,
+  runtimeArtifactBytes: Uint8Array,
+): Promise<void> {
+  const workspace = metadata.manifest.workspace as unknown as Record<
+    string,
+    unknown
+  >;
+  const runtimeArtifact = (workspace.runtimeArtifact as Record<string, unknown>)
+    .artifact as Record<string, unknown>;
+  if (
+    runtimeArtifactBytes.byteLength !== runtimeArtifact.size ||
+    runtimeArtifactBytes.byteLength > PORTABLE_WORKSPACE_RUNTIME_MAX_BYTES ||
+    sha256(runtimeArtifactBytes) !== runtimeArtifact.reference
+  ) {
+    throw new Error("Managed-work runtime artifact content is invalid");
+  }
+  let runtimeValue: unknown;
+  try {
+    runtimeValue = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(runtimeArtifactBytes),
+    );
+  } catch {
+    throw new Error("Managed-work runtime artifact is not valid JSON");
+  }
+  const checkpoint = await validateManagedWorkCheckpoint(runtimeValue);
+  if (
+    checkpoint.profile !== MANAGED_WORK_PROFILE ||
+    checkpoint.rootConversationId !== ROOT_CONVERSATION_ID
+  ) {
+    throw new Error("Managed-work runtime profile does not match its bundle");
+  }
+}
+
+export async function verifyManagedWorkBundleMetadata(
+  options: ManagedWorkBundleMetadataVerificationOptions,
+): Promise<ManagedWorkBundleMetadataVerification> {
+  const { runtimeArtifactBytes, ...metadataOptions } = options;
+  const metadata = preflightManagedWorkBundleMetadata(metadataOptions);
+  await verifyManagedWorkBundleRuntimeArtifact(metadata, runtimeArtifactBytes);
+  return metadata;
 }
 
 function resolveLimits(limits: CaptureLimits = {}): ResolvedCaptureLimits {

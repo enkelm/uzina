@@ -294,6 +294,140 @@ export const managedWorkCheckpointRequestSchema = z
     workspaceSnapshotRequestId: identifier,
   })
   .strict();
+export const managedWorkImportRequestSchema = z
+  .object({
+    ...versioned,
+    requestId: identifier,
+    sourceCatalogId: identifier,
+    manifestSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    destinationId: identifier,
+  })
+  .strict();
+export const managedWorkImportHostBindingSchema = z
+  .object({
+    hostDescriptor: z.string().min(1).max(4096),
+    sourceCatalog: z
+      .object({
+        sourceCatalogId: identifier,
+        canonicalRoot: z.string().min(1).max(4096),
+      })
+      .strict(),
+    destination: z
+      .object({
+        destinationId: identifier,
+        canonicalRoot: z.string().min(1).max(4096),
+      })
+      .strict(),
+  })
+  .strict();
+export const managedWorkImportPreparationReceiptSchema = z
+  .object({
+    format: z.literal("uzina-prepared-managed-work-restore"),
+    version: z.literal(1),
+    status: z.literal("prepared-inactive"),
+    receiptId: z.string().regex(/^[a-f0-9]{64}$/),
+    manifestReference: z.string().regex(/^[a-f0-9]{64}$/),
+    preparedAt: z.string().datetime(),
+    workspacePath: z.literal("workspace"),
+    runtimePath: z.literal("managed-work.sqlite"),
+    attachmentNames: z.array(z.string().min(1).max(1024)).max(100_000),
+  })
+  .strict();
+export const managedWorkImportStatusSchema = z
+  .object({
+    ...versioned,
+    requestId: identifier,
+    ownerId: identifier,
+    actor: factoryActorSchema,
+    sourceCatalogId: identifier,
+    manifestSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    destinationId: identifier,
+    hostBinding: managedWorkImportHostBindingSchema,
+    status: z.enum([
+      "admitted",
+      "preparing",
+      "prepared-inactive",
+      "blocked",
+      "uncertain",
+    ]),
+    acceptedAt: z.string().datetime(),
+    updatedAt: z.string().datetime(),
+    preparationReceipt: managedWorkImportPreparationReceiptSchema.optional(),
+    preparationReceiptSha256: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
+    errorCode: z
+      .string()
+      .regex(/^[a-z0-9][a-z0-9._-]{0,127}$/)
+      .optional(),
+  })
+  .strict()
+  .superRefine((status, context) => {
+    const hasReceipt = status.preparationReceipt !== undefined;
+    const hasReceiptHash = status.preparationReceiptSha256 !== undefined;
+    const terminalError =
+      status.status === "blocked" || status.status === "uncertain";
+    if (
+      status.hostBinding.sourceCatalog.sourceCatalogId !==
+        status.sourceCatalogId ||
+      status.hostBinding.destination.destinationId !== status.destinationId
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["hostBinding"],
+        message:
+          "Host descriptors must bind the configured catalog and destination IDs",
+      });
+    }
+    if (
+      (status.status === "prepared-inactive" &&
+        !(hasReceipt && hasReceiptHash)) ||
+      hasReceipt !== hasReceiptHash ||
+      ((status.status === "admitted" ||
+        status.status === "preparing" ||
+        status.status === "blocked") &&
+        hasReceipt)
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["preparationReceipt"],
+        message: "Preparation evidence must match the import state",
+      });
+    }
+    if (terminalError !== (status.errorCode !== undefined)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["errorCode"],
+        message:
+          "Blocked and uncertain imports require a normalized error code",
+      });
+    }
+    if (
+      status.preparationReceipt &&
+      status.preparationReceipt.manifestReference !== status.manifestSha256
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["preparationReceipt", "manifestReference"],
+        message: "Preparation receipt must bind the requested manifest",
+      });
+    }
+  });
+export const managedWorkImportOutcomeSchema = z.discriminatedUnion("status", [
+  z
+    .object({
+      status: z.literal("prepared-inactive"),
+      preparationReceipt: managedWorkImportPreparationReceiptSchema,
+    })
+    .strict(),
+  z
+    .object({
+      status: z.enum(["blocked", "uncertain"]),
+      errorCode: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,127}$/),
+    })
+    .strict(),
+]);
 export const managedWorkCheckpointStageSchema = z.enum([
   "admitted",
   "runtime-export-started",
@@ -999,6 +1133,21 @@ export type ManagedWorkCheckpointStage = z.infer<
 >;
 export type ManagedWorkCheckpointStatus = z.infer<
   typeof managedWorkCheckpointStatusSchema
+>;
+export type ManagedWorkImportRequest = z.infer<
+  typeof managedWorkImportRequestSchema
+>;
+export type ManagedWorkImportHostBinding = z.infer<
+  typeof managedWorkImportHostBindingSchema
+>;
+export type ManagedWorkImportPreparationReceipt = z.infer<
+  typeof managedWorkImportPreparationReceiptSchema
+>;
+export type ManagedWorkImportStatus = z.infer<
+  typeof managedWorkImportStatusSchema
+>;
+export type ManagedWorkImportOutcome = z.infer<
+  typeof managedWorkImportOutcomeSchema
 >;
 export type WorkspaceSnapshotClaim = z.infer<
   typeof workspaceSnapshotClaimSchema

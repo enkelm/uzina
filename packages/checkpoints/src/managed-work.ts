@@ -5,7 +5,6 @@ import {
   mkdir,
   open,
   mkdtemp,
-  readFile,
   readdir,
   rename,
   rm,
@@ -86,6 +85,11 @@ export interface RestoreManagedWorkBundleOptions {
   manifestReference: string;
   transport: BlobTransport;
   destinationPath: string;
+  /** Recovery may verify an existing output but must never start a fresh restore. */
+  allowFreshRestore?: boolean;
+  /** A first local journal admission may not adopt any preexisting output root. */
+  requireFreshDestination?: boolean;
+  beforeAndAfterEffect?: () => Promise<void>;
   supportedRuntimeRequirements?: readonly string[];
   openStorage(path: string): Promise<ManagedWorkRestoreStorage>;
 }
@@ -105,6 +109,82 @@ function sha256(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+async function readPreparedReceipt(
+  path: string,
+  beforeAndAfterEffect?: () => Promise<void>,
+): Promise<unknown> {
+  if (!constants.O_NOFOLLOW) {
+    throw new Error("This host cannot safely read a prepared receipt");
+  }
+  const guarded = <T>(operation: () => Promise<T>) =>
+    guardedRestoreEffect(beforeAndAfterEffect, operation);
+  const before = await guarded(() => lstat(path));
+  if (!before.isFile() || before.isSymbolicLink()) {
+    throw new Error("Prepared receipt is not a regular file");
+  }
+  await beforeAndAfterEffect?.();
+  let file: Awaited<ReturnType<typeof open>>;
+  try {
+    file = await open(
+      path,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+  } catch (error) {
+    await beforeAndAfterEffect?.();
+    throw error;
+  }
+  try {
+    await beforeAndAfterEffect?.();
+    const opened = await guarded(() => file.stat());
+    if (
+      !opened.isFile() ||
+      !Number.isSafeInteger(opened.size) ||
+      opened.size < 1 ||
+      opened.size > WORKSPACE_CHECKPOINT_MANIFEST_MAX_BYTES ||
+      opened.dev !== before.dev ||
+      opened.ino !== before.ino ||
+      opened.size !== before.size
+    ) {
+      throw new Error("Prepared receipt exceeds its bounded read limit");
+    }
+    const bytes = Buffer.allocUnsafe(opened.size);
+    let offset = 0;
+    while (offset < opened.size) {
+      const end = Math.min(offset + 64 * 1024, opened.size);
+      const { bytesRead } = await guarded(() =>
+        file.read(bytes, offset, end - offset, offset),
+      );
+      if (bytesRead === 0) {
+        throw new Error("Prepared receipt was truncated during read");
+      }
+      offset += bytesRead;
+    }
+    const extra = Buffer.allocUnsafe(1);
+    const extraRead = await guarded(() => file.read(extra, 0, 1, opened.size));
+    const final = await guarded(() => file.stat());
+    const after = await guarded(() => lstat(path));
+    if (
+      offset !== opened.size ||
+      extraRead.bytesRead !== 0 ||
+      final.dev !== opened.dev ||
+      final.ino !== opened.ino ||
+      final.size !== opened.size ||
+      final.mtimeMs !== opened.mtimeMs ||
+      final.ctimeMs !== opened.ctimeMs ||
+      !after.isFile() ||
+      after.isSymbolicLink() ||
+      after.dev !== opened.dev ||
+      after.ino !== opened.ino ||
+      after.size !== opened.size
+    ) {
+      throw new Error("Prepared receipt changed during read");
+    }
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } finally {
+    await file.close();
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -112,17 +192,20 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 async function readBundle(
   manifestReference: string,
   transport: BlobTransport,
+  beforeAndAfterEffect?: () => Promise<void>,
 ): Promise<ManagedWorkBundleManifest> {
   if (!/^[a-f0-9]{64}$/.test(manifestReference)) {
     throw new Error("Managed-work bundle reference is not a SHA-256 digest");
   }
-  const bytes = await transport.getBlob(manifestReference);
+  const bytes = await guardedRestoreEffect(beforeAndAfterEffect, () =>
+    transport.getBlob(manifestReference),
+  );
   if (bytes.byteLength > WORKSPACE_CHECKPOINT_MANIFEST_MAX_BYTES) {
     throw new Error("Managed-work bundle manifest exceeds its size limit");
   }
   const value = parseManagedWorkBundleManifestBytes(bytes, manifestReference);
-  const workspaceBytes = await transport.getBlob(
-    value.workspaceManifestReference,
+  const workspaceBytes = await guardedRestoreEffect(beforeAndAfterEffect, () =>
+    transport.getBlob(value.workspaceManifestReference),
   );
   if (workspaceBytes.byteLength > WORKSPACE_CHECKPOINT_MANIFEST_MAX_BYTES) {
     throw new Error("Workspace manifest exceeds its size limit");
@@ -153,6 +236,7 @@ async function validateBundleResources(
   manifest: ManagedWorkBundleManifest,
   transport: BlobTransport,
   supportedRuntimeRequirements: readonly string[] = RUNTIME_REQUIREMENTS,
+  beforeAndAfterEffect?: () => Promise<void>,
 ): Promise<ManagedWorkCheckpoint> {
   const supported = assertSupportedBundleRequirements(
     manifest,
@@ -164,6 +248,7 @@ async function validateBundleResources(
     {
       supportedRuntimeFormats: [1],
       supportedRuntimeRequirements: [...supported],
+      beforeAndAfterEffect,
     },
   );
   if (!validation.valid) {
@@ -175,6 +260,7 @@ async function validateBundleResources(
     manifest,
     transport,
     supportedRuntimeRequirements,
+    beforeAndAfterEffect,
   );
 }
 
@@ -201,6 +287,7 @@ async function validateBundleRuntime(
   manifest: ManagedWorkBundleManifest,
   transport: BlobTransport,
   supportedRuntimeRequirements: readonly string[] = RUNTIME_REQUIREMENTS,
+  beforeAndAfterEffect?: () => Promise<void>,
 ): Promise<ManagedWorkCheckpoint> {
   assertSupportedBundleRequirements(manifest, supportedRuntimeRequirements);
   const artifact = manifest.workspace.runtimeArtifact;
@@ -215,7 +302,9 @@ async function validateBundleRuntime(
       "Managed-work bundle has no compatible Pi runtime artifact",
     );
   }
-  const bytes = await transport.getBlob(artifact.artifact.reference);
+  const bytes = await guardedRestoreEffect(beforeAndAfterEffect, () =>
+    transport.getBlob(artifact.artifact.reference),
+  );
   if (
     bytes.byteLength !== artifact.artifact.size ||
     sha256(bytes) !== artifact.artifact.sha256
@@ -268,16 +357,24 @@ export async function captureManagedWorkBundle(
 export async function validateManagedWorkBundle(
   manifestReference: string,
   transport: BlobTransport,
-  options: { supportedRuntimeRequirements?: readonly string[] } = {},
+  options: {
+    supportedRuntimeRequirements?: readonly string[];
+    beforeAndAfterEffect?: () => Promise<void>;
+  } = {},
 ): Promise<{
   manifest: ManagedWorkBundleManifest;
   managedWork: ManagedWorkCheckpoint;
 }> {
-  const manifest = await readBundle(manifestReference, transport);
+  const manifest = await readBundle(
+    manifestReference,
+    transport,
+    options.beforeAndAfterEffect,
+  );
   const managedWork = await validateBundleResources(
     manifest,
     transport,
     options.supportedRuntimeRequirements,
+    options.beforeAndAfterEffect,
   );
   return { manifest, managedWork };
 }
@@ -285,19 +382,37 @@ export async function validateManagedWorkBundle(
 async function preparedReceipt(
   destinationPath: string,
   manifestReference: string,
+  beforeAndAfterEffect?: () => Promise<void>,
 ): Promise<PreparedManagedWorkRestoreReceipt | undefined> {
+  let guardFailed = false;
+  let guardFailure: unknown;
+  const trackedGuard = beforeAndAfterEffect
+    ? async () => {
+        try {
+          await beforeAndAfterEffect();
+        } catch (error) {
+          guardFailed = true;
+          guardFailure = error;
+          throw error;
+        }
+      }
+    : undefined;
+  const guarded = <T>(operation: () => Promise<T>) =>
+    guardedRestoreEffect(trackedGuard, operation);
   try {
-    const destination = await lstat(destinationPath);
+    const destination = await guarded(() => lstat(destinationPath));
     if (!destination.isDirectory() || destination.isSymbolicLink()) {
       return undefined;
     }
-    const metadataDirectory = await lstat(join(destinationPath, ".uzina"));
+    const metadataDirectory = await guarded(() =>
+      lstat(join(destinationPath, ".uzina")),
+    );
     const receiptPath = join(
       destinationPath,
       ".uzina",
       "prepared-restore.json",
     );
-    const receipt = await lstat(receiptPath);
+    const receipt = await guarded(() => lstat(receiptPath));
     if (
       !metadataDirectory.isDirectory() ||
       metadataDirectory.isSymbolicLink() ||
@@ -306,7 +421,7 @@ async function preparedReceipt(
     ) {
       return undefined;
     }
-    const value = JSON.parse(await readFile(receiptPath, "utf8")) as unknown;
+    const value = await readPreparedReceipt(receiptPath, trackedGuard);
     if (
       !isRecord(value) ||
       value.format !== PREPARED_RECEIPT_FORMAT ||
@@ -333,8 +448,12 @@ async function preparedReceipt(
     ) {
       return undefined;
     }
-    const workspace = await lstat(join(destinationPath, "workspace"));
-    const runtime = await lstat(join(destinationPath, "managed-work.sqlite"));
+    const workspace = await guarded(() =>
+      lstat(join(destinationPath, "workspace")),
+    );
+    const runtime = await guarded(() =>
+      lstat(join(destinationPath, "managed-work.sqlite")),
+    );
     if (
       !workspace.isDirectory() ||
       workspace.isSymbolicLink() ||
@@ -344,8 +463,8 @@ async function preparedReceipt(
       return undefined;
     }
     if (value.attachmentNames.length) {
-      const attachmentDirectory = await lstat(
-        join(destinationPath, ".uzina", "attachments"),
+      const attachmentDirectory = await guarded(() =>
+        lstat(join(destinationPath, ".uzina", "attachments")),
       );
       if (
         !attachmentDirectory.isDirectory() ||
@@ -354,8 +473,8 @@ async function preparedReceipt(
         return undefined;
       }
       for (const name of value.attachmentNames) {
-        const attachment = await lstat(
-          join(destinationPath, ".uzina", "attachments", name as string),
+        const attachment = await guarded(() =>
+          lstat(join(destinationPath, ".uzina", "attachments", name as string)),
         );
         if (!attachment.isFile() || attachment.isSymbolicLink()) {
           return undefined;
@@ -363,22 +482,61 @@ async function preparedReceipt(
       }
     }
     return value as unknown as PreparedManagedWorkRestoreReceipt;
-  } catch {
+  } catch (error) {
+    if (guardFailed && error === guardFailure) throw error;
     return undefined;
   }
+}
+
+type RestoreEffectGuard =
+  RestoreManagedWorkBundleOptions["beforeAndAfterEffect"];
+
+async function guardedRestoreEffect<T>(
+  guard: RestoreEffectGuard,
+  operation: () => Promise<T>,
+): Promise<T> {
+  await guard?.();
+  let result: T;
+  try {
+    result = await operation();
+  } catch (error) {
+    await guard?.();
+    throw error;
+  }
+  await guard?.();
+  return result;
+}
+
+async function guardedRestoreAcquire<T>(
+  guard: RestoreEffectGuard,
+  operation: () => Promise<T>,
+  takeOwnership: (resource: T) => void,
+): Promise<T> {
+  await guard?.();
+  const resource = await operation();
+  takeOwnership(resource);
+  await guard?.();
+  return resource;
 }
 
 async function hashPreparedAttachment(
   path: string,
   expectedSize: number,
   name: string,
+  beforeAndAfterEffect: RestoreEffectGuard,
 ): Promise<string> {
-  const file = await open(
-    path,
-    constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
-  );
+  let file: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    const opened = await file.stat();
+    file = await guardedRestoreAcquire(
+      beforeAndAfterEffect,
+      () => open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)),
+      (resource) => {
+        file = resource;
+      },
+    );
+    const opened = await guardedRestoreEffect(beforeAndAfterEffect, () =>
+      file!.stat(),
+    );
     if (
       !opened.isFile() ||
       opened.size !== expectedSize ||
@@ -390,20 +548,30 @@ async function hashPreparedAttachment(
     const buffer = Buffer.alloc(64 * 1024);
     let totalBytes = 0;
     while (totalBytes < expectedSize) {
-      const { bytesRead } = await file.read(
-        buffer,
-        0,
-        Math.min(buffer.byteLength, expectedSize - totalBytes),
-        totalBytes,
+      const { bytesRead } = await guardedRestoreEffect(
+        beforeAndAfterEffect,
+        () =>
+          file!.read(
+            buffer,
+            0,
+            Math.min(buffer.byteLength, expectedSize - totalBytes),
+            totalBytes,
+          ),
       );
       if (bytesRead === 0) break;
       digest.update(buffer.subarray(0, bytesRead));
       totalBytes += bytesRead;
     }
     const extraByte = Buffer.alloc(1);
-    const extra = await file.read(extraByte, 0, 1, expectedSize);
-    const finalStat = await file.stat();
-    const pathStat = await lstat(path);
+    const extra = await guardedRestoreEffect(beforeAndAfterEffect, () =>
+      file!.read(extraByte, 0, 1, expectedSize),
+    );
+    const finalStat = await guardedRestoreEffect(beforeAndAfterEffect, () =>
+      file!.stat(),
+    );
+    const pathStat = await guardedRestoreEffect(beforeAndAfterEffect, () =>
+      lstat(path),
+    );
     if (
       totalBytes !== expectedSize ||
       extra.bytesRead > 0 ||
@@ -416,7 +584,7 @@ async function hashPreparedAttachment(
     }
     return digest.digest("hex");
   } finally {
-    await file.close();
+    await file?.close();
   }
 }
 
@@ -427,11 +595,15 @@ async function verifyPreparedDestination(
   managedWork: ManagedWorkCheckpoint,
   transport: BlobTransport,
   openStorage: RestoreManagedWorkBundleOptions["openStorage"],
+  beforeAndAfterEffect: RestoreEffectGuard,
 ): Promise<void> {
-  await verifyRestoredWorkspaceCheckpoint(
-    manifest.workspace,
-    transport,
-    join(destinationPath, receipt.workspacePath),
+  await guardedRestoreEffect(beforeAndAfterEffect, () =>
+    verifyRestoredWorkspaceCheckpoint(
+      manifest.workspace,
+      transport,
+      join(destinationPath, receipt.workspacePath),
+      beforeAndAfterEffect,
+    ),
   );
   const expectedAttachmentNames = manifest.workspace.attachments.map(
     ({ name }) => name,
@@ -446,8 +618,20 @@ async function verifyPreparedDestination(
   }
   let runtime: ManagedWorkRestoreStorage | undefined;
   try {
-    runtime = await openStorage(join(destinationPath, receipt.runtimePath));
-    await verifyManagedWorkCheckpointStorage(runtime.storage, managedWork);
+    await guardedRestoreAcquire(
+      beforeAndAfterEffect,
+      () => openStorage(join(destinationPath, receipt.runtimePath)),
+      (resource) => {
+        runtime = resource;
+      },
+    );
+    await guardedRestoreEffect(beforeAndAfterEffect, () =>
+      verifyManagedWorkCheckpointStorage(
+        runtime!.storage,
+        managedWork,
+        beforeAndAfterEffect,
+      ),
+    );
   } finally {
     await runtime?.close();
   }
@@ -455,18 +639,26 @@ async function verifyPreparedDestination(
   const attachmentDirectory = join(destinationPath, ".uzina", "attachments");
   if (expectedAttachmentNames.length === 0) {
     try {
-      await lstat(attachmentDirectory);
+      await guardedRestoreEffect(beforeAndAfterEffect, () =>
+        lstat(attachmentDirectory),
+      );
       throw new Error("Prepared restore has unexpected attachments");
     } catch (error) {
       if (!isMissingFile(error)) throw error;
     }
     return;
   }
-  const directory = await lstat(attachmentDirectory);
+  const directory = await guardedRestoreEffect(beforeAndAfterEffect, () =>
+    lstat(attachmentDirectory),
+  );
   if (!directory.isDirectory() || directory.isSymbolicLink()) {
     throw new Error("Prepared restore attachments are unavailable");
   }
-  const actualNames = (await readdir(attachmentDirectory)).sort();
+  const actualNames = (
+    await guardedRestoreEffect(beforeAndAfterEffect, () =>
+      readdir(attachmentDirectory),
+    )
+  ).sort();
   if (
     JSON.stringify(actualNames) !==
     JSON.stringify([...expectedAttachmentNames].sort())
@@ -475,7 +667,9 @@ async function verifyPreparedDestination(
   }
   for (const attachment of manifest.workspace.attachments) {
     const path = join(attachmentDirectory, attachment.name);
-    const details = await lstat(path);
+    const details = await guardedRestoreEffect(beforeAndAfterEffect, () =>
+      lstat(path),
+    );
     if (!details.isFile() || details.isSymbolicLink()) {
       throw new Error(
         `Prepared attachment is not a regular file: ${attachment.name}`,
@@ -491,6 +685,7 @@ async function verifyPreparedDestination(
       path,
       attachment.blob.size,
       attachment.name,
+      beforeAndAfterEffect,
     );
     if (actualDigest !== attachment.blob.sha256) {
       throw new Error(
@@ -500,15 +695,33 @@ async function verifyPreparedDestination(
   }
 }
 
-async function assertEmptyOrMissingDestination(path: string): Promise<void> {
+async function assertMissingDestination(path: string): Promise<void> {
   try {
-    const details = await lstat(path);
+    await lstat(path);
+    throw new Error("Fresh managed-work import destination already exists");
+  } catch (error) {
+    if (isMissingFile(error)) return;
+    throw error;
+  }
+}
+
+async function assertEmptyOrMissingDestination(
+  path: string,
+  beforeAndAfterEffect?: RestoreEffectGuard,
+): Promise<void> {
+  try {
+    const details = await guardedRestoreEffect(beforeAndAfterEffect, () =>
+      lstat(path),
+    );
     if (!details.isDirectory() || details.isSymbolicLink()) {
       throw new Error(
         "Restore destination must be an empty inactive directory",
       );
     }
-    if ((await readdir(path)).length > 0) {
+    if (
+      (await guardedRestoreEffect(beforeAndAfterEffect, () => readdir(path)))
+        .length > 0
+    ) {
       throw new Error(
         "Restore destination is not empty and has no matching prepared receipt",
       );
@@ -536,33 +749,77 @@ export async function restoreManagedWorkBundle(
   options: RestoreManagedWorkBundleOptions,
 ): Promise<RestoredManagedWorkBundle> {
   const destinationPath = resolve(options.destinationPath);
-  const manifest = await readBundle(
-    options.manifestReference,
-    options.transport,
-  );
-  const existingReceipt = await preparedReceipt(
-    destinationPath,
-    options.manifestReference,
-  );
-  const managedWork = existingReceipt
-    ? await validateBundleRuntime(
-        manifest,
-        options.transport,
-        options.supportedRuntimeRequirements,
-      )
-    : await validateBundleResources(
-        manifest,
-        options.transport,
-        options.supportedRuntimeRequirements,
+  const guardedEffect = <T>(operation: () => Promise<T>) =>
+    guardedRestoreEffect(options.beforeAndAfterEffect, operation);
+  const guardedAcquire = <T>(
+    operation: () => Promise<T>,
+    takeOwnership: (resource: T) => void,
+  ) =>
+    guardedRestoreAcquire(
+      options.beforeAndAfterEffect,
+      operation,
+      takeOwnership,
+    );
+  if (options.requireFreshDestination) {
+    await guardedEffect(() => assertMissingDestination(destinationPath));
+  }
+  let existingReceipt: PreparedManagedWorkRestoreReceipt | undefined;
+  if (options.allowFreshRestore === false) {
+    existingReceipt = await guardedEffect(() =>
+      preparedReceipt(
+        destinationPath,
+        options.manifestReference,
+        options.beforeAndAfterEffect,
+      ),
+    );
+    if (!existingReceipt) {
+      throw new Error(
+        "A prior restore was recorded, but its exact prepared output is unavailable",
       );
-  if (existingReceipt) {
-    await verifyPreparedDestination(
-      destinationPath,
-      existingReceipt,
-      manifest,
-      managedWork,
+    }
+  }
+  const manifest = await guardedEffect(() =>
+    readBundle(
+      options.manifestReference,
       options.transport,
-      options.openStorage,
+      options.beforeAndAfterEffect,
+    ),
+  );
+  if (!options.requireFreshDestination) {
+    existingReceipt ??= await guardedEffect(() =>
+      preparedReceipt(
+        destinationPath,
+        options.manifestReference,
+        options.beforeAndAfterEffect,
+      ),
+    );
+  }
+  const managedWork = await guardedEffect(() =>
+    existingReceipt
+      ? validateBundleRuntime(
+          manifest,
+          options.transport,
+          options.supportedRuntimeRequirements,
+          options.beforeAndAfterEffect,
+        )
+      : validateBundleResources(
+          manifest,
+          options.transport,
+          options.supportedRuntimeRequirements,
+          options.beforeAndAfterEffect,
+        ),
+  );
+  if (existingReceipt) {
+    await guardedEffect(() =>
+      verifyPreparedDestination(
+        destinationPath,
+        existingReceipt,
+        manifest,
+        managedWork,
+        options.transport,
+        options.openStorage,
+        options.beforeAndAfterEffect,
+      ),
     );
     return {
       receipt: existingReceipt,
@@ -572,56 +829,82 @@ export async function restoreManagedWorkBundle(
       provenanceAttachments: [],
     };
   }
-  await assertEmptyOrMissingDestination(destinationPath);
+  await guardedEffect(() =>
+    options.requireFreshDestination
+      ? assertMissingDestination(destinationPath)
+      : assertEmptyOrMissingDestination(
+          destinationPath,
+          options.beforeAndAfterEffect,
+        ),
+  );
 
   const parent = dirname(destinationPath);
-  await mkdir(parent, { recursive: true });
-  const stagingRoot = await mkdtemp(join(parent, ".uzina-prepared-restore-"));
-  const stagedWorkspace = join(stagingRoot, "workspace");
-  const stagedRuntime = join(stagingRoot, "managed-work.sqlite");
+  await guardedEffect(() => mkdir(parent, { recursive: true }));
+  let stagingRoot: string | undefined;
   let restoredAttachments: RestoredManagedWorkBundle["provenanceAttachments"] =
     [];
   try {
-    const restored = await restoreWorkspaceCheckpoint({
-      manifest: manifest.workspace,
-      transport: options.transport,
-      destinationPath: stagedWorkspace,
-      supportedRuntimeFormats: [1],
-      supportedRuntimeRequirements: [
-        ...new Set([
-          ...RUNTIME_REQUIREMENTS,
-          ...(options.supportedRuntimeRequirements ?? []),
-        ]),
-      ],
-    });
-    if (!restored.runtimeArtifact) {
+    const ownedStagingRoot = await guardedAcquire(
+      () => mkdtemp(join(parent, ".uzina-prepared-restore-")),
+      (resource) => {
+        stagingRoot = resource;
+      },
+    );
+    const stagedWorkspace = join(ownedStagingRoot, "workspace");
+    const stagedRuntime = join(ownedStagingRoot, "managed-work.sqlite");
+    const restored = await guardedEffect(() =>
+      restoreWorkspaceCheckpoint({
+        manifest: manifest.workspace,
+        transport: options.transport,
+        destinationPath: stagedWorkspace,
+        supportedRuntimeFormats: [1],
+        supportedRuntimeRequirements: [
+          ...new Set([
+            ...RUNTIME_REQUIREMENTS,
+            ...(options.supportedRuntimeRequirements ?? []),
+          ]),
+        ],
+        beforeAndAfterEffect: options.beforeAndAfterEffect,
+      }),
+    );
+    const runtimeArtifact = restored.runtimeArtifact;
+    if (!runtimeArtifact) {
       throw new Error("Managed-work bundle runtime artifact is missing");
     }
     let runtime: ManagedWorkRestoreStorage | undefined;
     try {
-      runtime = await options.openStorage(stagedRuntime);
-      await importManagedWorkCheckpoint(
-        runtime.storage,
-        JSON.parse(
-          Buffer.from(restored.runtimeArtifact.bytes).toString("utf8"),
+      runtime = await guardedAcquire(
+        () => options.openStorage(stagedRuntime),
+        (resource) => {
+          runtime = resource;
+        },
+      );
+      await guardedEffect(() =>
+        importManagedWorkCheckpoint(
+          runtime!.storage,
+          JSON.parse(Buffer.from(runtimeArtifact.bytes).toString("utf8")),
+          undefined,
+          options.beforeAndAfterEffect,
         ),
       );
     } finally {
       await runtime?.close();
     }
     restoredAttachments = restored.attachments;
-    const metadataDirectory = join(stagingRoot, ".uzina");
-    await mkdir(metadataDirectory, { recursive: true });
+    const metadataDirectory = join(ownedStagingRoot, ".uzina");
+    await guardedEffect(() => mkdir(metadataDirectory, { recursive: true }));
     const attachmentDirectory = join(metadataDirectory, "attachments");
     if (restoredAttachments.length) {
-      await mkdir(attachmentDirectory, { recursive: true });
+      await guardedEffect(() =>
+        mkdir(attachmentDirectory, { recursive: true }),
+      );
       for (const item of restoredAttachments) {
-        await writeFile(
-          join(attachmentDirectory, item.attachment.name),
-          item.bytes,
-          {
-            flag: "wx",
-          },
+        await guardedEffect(() =>
+          writeFile(
+            join(attachmentDirectory, item.attachment.name),
+            item.bytes,
+            { flag: "wx" },
+          ),
         );
       }
     }
@@ -641,33 +924,46 @@ export async function restoreManagedWorkBundle(
         ({ attachment }) => attachment.name,
       ),
     };
-    await writeFile(
-      join(metadataDirectory, "prepared-restore.json"),
-      JSON.stringify(receipt),
-      { flag: "wx" },
+    await guardedEffect(() =>
+      writeFile(
+        join(metadataDirectory, "prepared-restore.json"),
+        JSON.stringify(receipt),
+        { flag: "wx" },
+      ),
     );
-    await rename(stagingRoot, destinationPath);
+    if (options.requireFreshDestination) {
+      await guardedEffect(() => assertMissingDestination(destinationPath));
+    }
+    await guardedEffect(() => rename(ownedStagingRoot, destinationPath));
     return {
       receipt,
       destinationPath,
-      workspacePath: stagedWorkspace.replace(stagingRoot, destinationPath),
-      runtimePath: stagedRuntime.replace(stagingRoot, destinationPath),
+      workspacePath: stagedWorkspace.replace(ownedStagingRoot, destinationPath),
+      runtimePath: stagedRuntime.replace(ownedStagingRoot, destinationPath),
       provenanceAttachments: restoredAttachments,
     };
   } catch (error) {
-    await rm(stagingRoot, { recursive: true, force: true });
-    const racedReceipt = await preparedReceipt(
-      destinationPath,
-      options.manifestReference,
+    if (stagingRoot) {
+      await rm(stagingRoot, { recursive: true, force: true });
+    }
+    const racedReceipt = await guardedEffect(() =>
+      preparedReceipt(
+        destinationPath,
+        options.manifestReference,
+        options.beforeAndAfterEffect,
+      ),
     );
     if (racedReceipt) {
-      await verifyPreparedDestination(
-        destinationPath,
-        racedReceipt,
-        manifest,
-        managedWork,
-        options.transport,
-        options.openStorage,
+      await guardedEffect(() =>
+        verifyPreparedDestination(
+          destinationPath,
+          racedReceipt,
+          manifest,
+          managedWork,
+          options.transport,
+          options.openStorage,
+          options.beforeAndAfterEffect,
+        ),
       );
       return {
         receipt: racedReceipt,

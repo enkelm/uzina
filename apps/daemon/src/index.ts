@@ -27,6 +27,30 @@ function workspaceMappings(value: string): WorkspaceMapping[] {
   return parsed as WorkspaceMapping[];
 }
 
+function optionalPathMappings(
+  name: string,
+): Readonly<Record<string, string>> | undefined {
+  const value = Bun.env[name];
+  if (value === undefined) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error(`${name} must be valid JSON`);
+  }
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    Array.isArray(parsed) ||
+    Object.values(parsed).some((path) => typeof path !== "string")
+  ) {
+    throw new Error(
+      `${name} must be a JSON object mapping configured IDs to paths`,
+    );
+  }
+  return parsed as Record<string, string>;
+}
+
 const mode = Bun.env.UZINA_MODE ?? "local";
 const port = Number(Bun.env.PORT ?? "8788");
 const hostname = Bun.env.HOST ?? "127.0.0.1";
@@ -41,6 +65,12 @@ async function startLocalFactory(): Promise<void> {
   const server = await createStandaloneFactoryServer({
     databasePath: Bun.env.UZINA_FACTORY_DATABASE_PATH,
     runtimeDirectory: Bun.env.UZINA_MANAGED_WORK_DIRECTORY,
+    managedWorkImportCatalogs: optionalPathMappings(
+      "UZINA_MANAGED_WORK_IMPORT_CATALOGS",
+    ),
+    managedWorkImportDestinations: optionalPathMappings(
+      "UZINA_MANAGED_WORK_IMPORT_DESTINATIONS",
+    ),
     bootstrapSecret: required("UZINA_BOOTSTRAP_SECRET"),
     models,
     modelProvider: modelConfig.provider,

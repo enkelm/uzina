@@ -16,6 +16,11 @@ import {
   submitInputRequestSchema,
   workspaceSnapshotRequestSchema,
   managedWorkCheckpointRequestSchema,
+  managedWorkImportRequestSchema,
+  type ManagedWorkImportHostBinding,
+  type ManagedWorkImportOutcome,
+  type ManagedWorkImportRequest,
+  type ManagedWorkImportStatus,
   workspaceSnapshotClaimRequestSchema,
   workspaceSnapshotClaimResponseSchema,
   workspaceSnapshotReportSchema,
@@ -109,6 +114,34 @@ export interface ManagedWorkQueries {
   }): Promise<unknown>;
 }
 
+export interface ManagedWorkImportJournal {
+  admit(
+    request: ManagedWorkImportRequest,
+    binding: ManagedWorkImportHostBinding,
+  ): ManagedWorkImportStatus;
+  beginPreparation(
+    requestId: string,
+    binding: ManagedWorkImportHostBinding,
+  ): ManagedWorkImportStatus;
+  recordOutcome(
+    requestId: string,
+    binding: ManagedWorkImportHostBinding,
+    outcome: ManagedWorkImportOutcome,
+  ): Promise<ManagedWorkImportStatus>;
+  status(requestId: string): ManagedWorkImportStatus;
+}
+
+export interface ManagedWorkImportHost {
+  /**
+   * Resolve configured IDs only; call journal.admit before source reads, call
+   * beginPreparation before restoreManagedWorkBundle, and record only verified output.
+   */
+  run(
+    request: ManagedWorkImportRequest,
+    journal: ManagedWorkImportJournal,
+  ): Promise<void>;
+}
+
 export interface PrivateAssistantQueries {
   context(): Promise<unknown>;
   status(): Promise<unknown>;
@@ -124,6 +157,7 @@ export function createFactoryHttpHandler(
   checkpointPrivateStorage?: (
     requestId: string,
   ) => Pick<ManagedWorkCheckpointPrivateStorage, "getBlobStream">,
+  managedWorkImportHost?: ManagedWorkImportHost,
 ): (request: Request) => Promise<Response> {
   const mcp = createFactoryMcpHandler(factory, managedWork);
   return async (request) => {
@@ -171,6 +205,78 @@ export function createFactoryHttpHandler(
         );
       const session = await factory.authenticate(credential);
       const path = url.pathname;
+
+      if (request.method === "POST" && path === "/v1/managed-work-imports") {
+        factory.authorizeManagedWorkImport(session);
+        if (!managedWorkImportHost) {
+          throw new FactoryError(503, "managed_work_import_host_unavailable");
+        }
+        const input = await body(request, managedWorkImportRequestSchema);
+        const journal: ManagedWorkImportJournal = {
+          admit: (candidate, binding) => {
+            const parsed = managedWorkImportRequestSchema.parse(candidate);
+            if (JSON.stringify(parsed) !== JSON.stringify(input)) {
+              throw new FactoryError(
+                409,
+                "managed_work_import_request_conflict",
+              );
+            }
+            return factory.requestManagedWorkImport(session, parsed, binding);
+          },
+          beginPreparation: (requestId, binding) => {
+            if (requestId !== input.requestId) {
+              throw new FactoryError(
+                409,
+                "managed_work_import_request_conflict",
+              );
+            }
+            return factory.beginManagedWorkImportPreparation(
+              session,
+              requestId,
+              binding,
+            );
+          },
+          recordOutcome: (requestId, binding, outcome) => {
+            if (requestId !== input.requestId) {
+              throw new FactoryError(
+                409,
+                "managed_work_import_request_conflict",
+              );
+            }
+            return factory.recordManagedWorkImportOutcome(
+              session,
+              requestId,
+              binding,
+              outcome,
+            );
+          },
+          status: (requestId) => {
+            if (requestId !== input.requestId) {
+              throw new FactoryError(
+                409,
+                "managed_work_import_request_conflict",
+              );
+            }
+            return factory.getManagedWorkImportStatus(session, requestId);
+          },
+        };
+        await managedWorkImportHost.run(input, journal);
+        return json(
+          factory.getManagedWorkImportStatus(session, input.requestId),
+          202,
+        );
+      }
+      const managedWorkImportStatusMatch = path.match(
+        /^\/v1\/managed-work-imports\/([^/]+)$/,
+      );
+      if (request.method === "GET" && managedWorkImportStatusMatch) {
+        return json(
+          factory.getManagedWorkImportStatus(
+            session,
+            decodeURIComponent(managedWorkImportStatusMatch[1]!),
+          ),
+        );
+      }
 
       if (request.method === "GET" && path === "/v1/me")
         return json({
