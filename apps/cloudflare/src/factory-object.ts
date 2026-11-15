@@ -738,6 +738,7 @@ export class FactoryController {
             assembly.sourceWorkspaceManifestReference,
           authoritativeWorkspaceReferences:
             assembly.authoritativeWorkspaceReferences,
+          authorizedCommandPlacements: assembly.authorizedCommandPlacements,
           manifestReference: outer.reference,
           expectedRuntimeRequirements: runtimeRequirements,
           expectedEvidence: assembly.evidence,

@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -12,8 +14,21 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  captureWorkspaceCheckpoint,
+  type BlobTransport,
+} from "@uzina/checkpoints";
+import { portableWorkspaceBlobReferences } from "@uzina/checkpoints/portable";
+import {
+  executionCaptureControlSchema,
+  executionJobSchema,
+} from "@uzina/contracts/execution";
+import {
+  workspaceRelocationActivationCommandSchema,
+  workspaceRelocationActivationPreflightSchema,
+  workspaceRelocationClaimSchema,
+} from "@uzina/contracts/factory";
 import { ExecutionDaemon } from "../src/execution/daemon";
-import { executionCaptureControlSchema } from "@uzina/contracts/execution";
 import { executionPayloadSha256 } from "../src/execution/payload";
 
 const fixtures: Array<{ root: string; daemon?: ExecutionDaemon }> = [];
@@ -54,6 +69,152 @@ function captureControl(
   return executionCaptureControlSchema.parse({
     ...binding,
     payloadSha256: executionPayloadSha256(binding),
+  });
+}
+
+function git(directory: string, ...args: string[]): string {
+  return execFileSync("git", args, {
+    cwd: directory,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+    },
+  });
+}
+
+async function preparedWorkspaceRelocation(label: string) {
+  const root = mkdtempSync(join(tmpdir(), `uzina-local-activation-${label}-`));
+  const source = join(root, "source");
+  const destination = join(root, "destination");
+  mkdirSync(source);
+  mkdirSync(destination);
+  git(source, "init", "--initial-branch=main");
+  git(source, "config", "user.name", "Activation fixture");
+  git(source, "config", "user.email", "activation@example.invalid");
+  writeFileSync(join(source, "tracked.txt"), "base\n");
+  git(source, "add", "tracked.txt");
+  git(source, "commit", "-m", "base");
+  writeFileSync(join(source, "tracked.txt"), "staged\n");
+  git(source, "add", "tracked.txt");
+  writeFileSync(join(source, "tracked.txt"), "working\n");
+  writeFileSync(join(source, "binary"), Buffer.from([0, 255, 19, 128]));
+  chmodSync(join(source, "binary"), 0o755);
+
+  const blobs = new Map<string, Uint8Array>();
+  const transport: BlobTransport = {
+    async putBlob(bytes) {
+      const reference = createHash("sha256").update(bytes).digest("hex");
+      blobs.set(reference, Uint8Array.from(bytes));
+      return reference;
+    },
+    async getBlob(reference) {
+      const bytes = blobs.get(reference);
+      if (!bytes) throw new Error("activation fixture blob is missing");
+      return Uint8Array.from(bytes);
+    },
+  };
+  const captured = await captureWorkspaceCheckpoint({
+    workspacePath: source,
+    transport,
+  });
+  const claim = workspaceRelocationClaimSchema.parse({
+    contractVersion: 1,
+    relocationId: `relocation:${label}`,
+    requestId: `request:${label}`,
+    checkpointRequestId: `checkpoint:${label}`,
+    captureRequestId: `capture-request:${label}`,
+    captureId: `capture:${label}`,
+    workspaceSnapshotRequestId: `snapshot-request:${label}`,
+    snapshotId: `snapshot:${label}`,
+    threadId: `thread:${label}`,
+    source: { nodeId: "node:source", workspaceId: "workspace:source" },
+    destination: {
+      nodeId: "node:destination",
+      workspaceId: "workspace:destination",
+    },
+    ownershipGeneration: 4,
+    destinationOwnershipGeneration: 2,
+    manifestReference: captured.manifestReference,
+  });
+  const daemon = new ExecutionDaemon({
+    databasePath: join(root, "node.sqlite"),
+    nodeId: "node:destination",
+    nodeCredential: "destination-fixture-secret",
+    workspaces: [
+      {
+        workspaceId: claim.destination.workspaceId,
+        directory: destination,
+        ownershipGeneration: claim.destinationOwnershipGeneration,
+      },
+    ],
+  });
+  fixtures.push({ root, daemon });
+  const references = portableWorkspaceBlobReferences(
+    captured.manifest,
+    captured.manifestReference,
+    captured.manifestBytes.byteLength,
+  );
+  const prepared = await daemon.executeWorkspaceRelocation(
+    claim,
+    async (_relocationId, reference) => {
+      const bytes = blobs.get(reference);
+      if (!bytes)
+        throw new Error(`activation fixture blob not found: ${reference}`);
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(Uint8Array.from(bytes));
+          controller.close();
+        },
+      });
+      const expected = references.find((item) => item.reference === reference);
+      if (!expected || expected.size !== bytes.byteLength) {
+        throw new Error("activation fixture blob metadata mismatch");
+      }
+      return { body: stream, size: expected.size };
+    },
+  );
+  return { root, destination, daemon, claim, prepared };
+}
+
+function activationPreflight(
+  claim: ReturnType<typeof workspaceRelocationClaimSchema.parse>,
+  preparedReceiptSha256: string,
+) {
+  return workspaceRelocationActivationPreflightSchema.parse({
+    contractVersion: 1,
+    relocationId: claim.relocationId,
+    requestId: claim.requestId,
+    checkpointRequestId: claim.checkpointRequestId,
+    captureRequestId: claim.captureRequestId,
+    captureId: claim.captureId,
+    workspaceSnapshotRequestId: claim.workspaceSnapshotRequestId,
+    snapshotId: claim.snapshotId,
+    threadId: claim.threadId,
+    source: claim.source,
+    destination: claim.destination,
+    sourceOwnershipGeneration: claim.ownershipGeneration,
+    destinationOwnershipGeneration:
+      claim.destinationOwnershipGeneration ?? claim.ownershipGeneration,
+    manifestReference: claim.manifestReference,
+    sourceProofSha256: "a".repeat(64),
+    preparedReceiptSha256,
+  });
+}
+
+function activationCommand(
+  preflight: ReturnType<
+    typeof workspaceRelocationActivationPreflightSchema.parse
+  >,
+  readinessReceiptSha256: string,
+  ownershipGeneration: number,
+) {
+  return workspaceRelocationActivationCommandSchema.parse({
+    ...preflight,
+    ownershipGeneration,
+    readinessReceiptSha256,
+    committedAt: new Date().toISOString(),
   });
 }
 
@@ -130,6 +291,268 @@ describe("persistent execution daemon", () => {
       contentBase64: Buffer.from("sample bytes").toString("base64"),
       bytes: 12,
     });
+  });
+
+  test("activates only the authorized destination epoch and reopens without rechecking changed live work", async () => {
+    const local = await preparedWorkspaceRelocation("different-epochs");
+    expect(local.prepared).toMatchObject({ status: "prepared-inactive" });
+    expect(local.prepared.receiptSha256).toMatch(/^[a-f0-9]{64}$/);
+    local.daemon.markWorkspaceRelocationReported(
+      local.claim.relocationId,
+      local.prepared,
+    );
+
+    const preflight = activationPreflight(
+      local.claim,
+      local.prepared.receiptSha256,
+    );
+    const readiness =
+      await local.daemon.prepareWorkspaceRelocationActivation(preflight);
+    expect(readiness).toMatchObject({
+      relocationId: local.claim.relocationId,
+      sourceOwnershipGeneration: 4,
+      destinationOwnershipGeneration: 2,
+      preparedReceiptSha256: local.prepared.receiptSha256,
+    });
+    if (!readiness) throw new Error("Expected local readiness evidence");
+
+    const command = activationCommand(
+      preflight,
+      readiness.readinessReceiptSha256,
+      5,
+    );
+    const report = await local.daemon.activateWorkspaceRelocation(command);
+    expect(report).toMatchObject({
+      status: "activated",
+      command: { ownershipGeneration: 5 },
+    });
+    expect(await local.daemon.activateWorkspaceRelocation(command)).toEqual(
+      report,
+    );
+    expect(git(local.destination, "status", "--porcelain").trim()).toBe(
+      "MM tracked.txt\n?? binary",
+    );
+    expect(readFileSync(join(local.destination, "tracked.txt"), "utf8")).toBe(
+      "working\n",
+    );
+
+    const record = fixtures.find((item) => item.root === local.root);
+    if (!record) throw new Error("Local activation fixture disappeared");
+    local.daemon.close();
+    let reopened = new ExecutionDaemon({
+      databasePath: join(local.root, "node.sqlite"),
+      nodeId: local.claim.destination.nodeId,
+      nodeCredential: "destination-fixture-secret",
+      workspaces: [
+        {
+          workspaceId: local.claim.destination.workspaceId,
+          directory: local.destination,
+          ownershipGeneration: 2,
+        },
+      ],
+    });
+    record.daemon = reopened;
+    await reopened.reconcileWorkspaceRelocations();
+    expect(reopened.pendingWorkspaceRelocationReports()).toEqual([]);
+    expect(reopened.pendingWorkspaceRelocationActivationReports()).toEqual([
+      report,
+    ]);
+    expect(reopened.registerRequest().workspaces as unknown).toEqual([
+      {
+        workspaceId: local.claim.destination.workspaceId,
+        ownershipGeneration: 5,
+        state: "active",
+      },
+    ]);
+    await expect(
+      reopened.executeJob(
+        executionJobSchema.parse(
+          job({
+            jobId: "job:before-core-finalization",
+            nodeId: local.claim.destination.nodeId,
+            target: local.claim.destination,
+            ownershipGeneration: 5,
+          }),
+        ),
+      ),
+    ).rejects.toThrow("workspace_relocation_reserved");
+    reopened.markWorkspaceRelocationActivationReported(
+      local.claim.relocationId,
+      report,
+    );
+    const continuation = await reopened.executeJob(
+      executionJobSchema.parse(
+        job({
+          jobId: "job:after-core-finalization",
+          nodeId: local.claim.destination.nodeId,
+          target: local.claim.destination,
+          ownershipGeneration: 5,
+          path: "after-activation.txt",
+        }),
+      ),
+    );
+    expect(continuation.status).toBe("completed");
+    writeFileSync(
+      join(local.destination, "tracked.txt"),
+      "legitimate later work\n",
+    );
+
+    reopened.close();
+    reopened = new ExecutionDaemon({
+      databasePath: join(local.root, "node.sqlite"),
+      nodeId: local.claim.destination.nodeId,
+      nodeCredential: "destination-fixture-secret",
+      workspaces: [
+        {
+          workspaceId: local.claim.destination.workspaceId,
+          directory: local.destination,
+          ownershipGeneration: 2,
+        },
+        {
+          workspaceId: "workspace:post-move-alias",
+          directory: local.destination,
+        },
+      ],
+    });
+    record.daemon = reopened;
+    await reopened.reconcileWorkspaceRelocations();
+    expect(reopened.pendingWorkspaceRelocationReports()).toEqual([]);
+    expect(reopened.pendingWorkspaceRelocationActivationReports()).toEqual([]);
+    expect(reopened.registerRequest().workspaces as unknown).toEqual([
+      {
+        workspaceId: local.claim.destination.workspaceId,
+        ownershipGeneration: 5,
+        state: "active",
+      },
+      {
+        workspaceId: "workspace:post-move-alias",
+        ownershipGeneration: 0,
+        state: "active",
+      },
+    ]);
+    await expect(
+      reopened.executeJob(
+        executionJobSchema.parse(
+          job({
+            jobId: "job:post-move-alias",
+            nodeId: local.claim.destination.nodeId,
+            target: {
+              nodeId: local.claim.destination.nodeId,
+              workspaceId: "workspace:post-move-alias",
+            },
+            ownershipGeneration: 0,
+          }),
+        ),
+      ),
+    ).rejects.toThrow("workspace_relocation_reserved");
+    expect(readFileSync(join(local.destination, "tracked.txt"), "utf8")).toBe(
+      "legitimate later work\n",
+    );
+    expect(
+      (
+        await reopened.executeJob(
+          executionJobSchema.parse(
+            job({
+              jobId: "job:after-reopen",
+              nodeId: local.claim.destination.nodeId,
+              target: local.claim.destination,
+              ownershipGeneration: 5,
+              path: "after-reopen.txt",
+            }),
+          ),
+        )
+      ).status,
+    ).toBe("completed");
+  });
+
+  test("parks a changed prepared tree as activation-uncertain without rewriting its preparation receipt", async () => {
+    const local = await preparedWorkspaceRelocation("changed-after-readiness");
+    local.daemon.markWorkspaceRelocationReported(
+      local.claim.relocationId,
+      local.prepared,
+    );
+    const preflight = activationPreflight(
+      local.claim,
+      local.prepared.receiptSha256,
+    );
+    const readiness =
+      await local.daemon.prepareWorkspaceRelocationActivation(preflight);
+    if (!readiness) throw new Error("Expected local readiness evidence");
+    const command = activationCommand(
+      preflight,
+      readiness.readinessReceiptSha256,
+      5,
+    );
+    const changed = "changed after Core authorization\n";
+    writeFileSync(join(local.destination, "tracked.txt"), changed);
+
+    const report = await local.daemon.activateWorkspaceRelocation(command);
+    expect(report).toMatchObject({
+      status: "uncertain",
+      errorCode: "workspace_relocation_activation_unverified",
+    });
+    expect(readFileSync(join(local.destination, "tracked.txt"), "utf8")).toBe(
+      changed,
+    );
+    expect(local.daemon.pendingWorkspaceRelocationReports()).toEqual([]);
+    expect(local.daemon.pendingWorkspaceRelocationActivationReports()).toEqual([
+      report,
+    ]);
+    expect(local.daemon.registerRequest().workspaces as unknown).toEqual([
+      {
+        workspaceId: local.claim.destination.workspaceId,
+        ownershipGeneration: 2,
+        state: "fenced",
+      },
+    ]);
+    local.daemon.markWorkspaceRelocationActivationReported(
+      local.claim.relocationId,
+      report,
+    );
+    await expect(
+      local.daemon.executeJob(
+        executionJobSchema.parse(
+          job({
+            jobId: "job:uncertain-destination",
+            nodeId: local.claim.destination.nodeId,
+            target: local.claim.destination,
+            ownershipGeneration: 2,
+          }),
+        ),
+      ),
+    ).rejects.toThrow("workspace_fenced");
+  });
+
+  test("keeps a source CONTROL fence effective through a post-capture workspace alias", async () => {
+    const local = fixture();
+    const report = local.daemon.executeCaptureControl(captureControl());
+    expect(report.status).toBe("source-capture-fenced");
+    local.daemon.close();
+    const reopened = new ExecutionDaemon({
+      databasePath: join(local.root, "node.sqlite"),
+      nodeId: "node:test",
+      nodeCredential: "node-secret-fixture",
+      workspaces: [
+        { workspaceId: "workspace:test", directory: local.workspace },
+        { workspaceId: "workspace:alias", directory: local.workspace },
+      ],
+    });
+    const record = fixtures.find((item) => item.root === local.root);
+    if (!record) throw new Error("Source alias fixture disappeared");
+    record.daemon = reopened;
+    await expect(
+      reopened.executeJob(
+        executionJobSchema.parse(
+          job({
+            jobId: "job:source-alias",
+            target: {
+              nodeId: "node:test",
+              workspaceId: "workspace:alias",
+            },
+          }),
+        ),
+      ),
+    ).rejects.toThrow("workspace_capture_active");
   });
 
   test("migrates pre-control local capture fences without changing their cleanup behavior", async () => {

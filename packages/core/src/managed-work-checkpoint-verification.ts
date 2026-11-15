@@ -51,6 +51,11 @@ export interface VerifyManagedWorkCheckpointClosureOptions {
     reference: string;
     size: number;
   }[];
+  authorizedCommandPlacements: readonly {
+    nodeId: string;
+    workspaceId: string;
+    ownershipGeneration: number;
+  }[];
   manifestReference: string;
   expectedRuntimeRequirements: readonly string[];
   expectedEvidence: FactoryProvenanceEvidence;
@@ -78,6 +83,12 @@ export interface ManagedWorkCheckpointClosurePublicationBinding {
     reference: string;
     size: number;
   }[];
+  authorizedCommandPlacements: readonly {
+    nodeId: string;
+    workspaceId: string;
+    ownershipGeneration: number;
+  }[];
+  expectedEvidence: FactoryProvenanceEvidence;
   expectedRuntimeRequirements: readonly string[];
   privateArtifacts: readonly ManagedWorkCheckpointArtifactReference[];
 }
@@ -91,6 +102,11 @@ interface ManagedWorkCheckpointClosureProof {
   authoritativeWorkspaceReferences: readonly {
     reference: string;
     size: number;
+  }[];
+  authorizedCommandPlacements: readonly {
+    nodeId: string;
+    workspaceId: string;
+    ownershipGeneration: number;
   }[];
   privateArtifacts: readonly ManagedWorkCheckpointArtifactReference[];
   // Bind verifier-only expectations that Core does not rederive at publication.
@@ -116,6 +132,9 @@ export async function verifyManagedWorkCheckpointClosure(
       inputOptions.authoritativeWorkspaceReferences.map((reference) => ({
         ...reference,
       })),
+    authorizedCommandPlacements: inputOptions.authorizedCommandPlacements.map(
+      (placement) => ({ ...placement }),
+    ),
     expectedRuntimeRequirements: [...inputOptions.expectedRuntimeRequirements],
     privateArtifacts: inputOptions.privateArtifacts.map((artifact) => ({
       ...artifact,
@@ -277,7 +296,7 @@ export async function verifyManagedWorkCheckpointClosure(
       "Managed-work provenance evidence does not match current Core authority",
     );
   }
-  assertSettledProvenance(evidence);
+  assertSettledProvenance(evidence, options.authorizedCommandPlacements);
 
   const expectedPrivateByReference = new Map<string, number>();
   for (const artifact of expectedArtifacts) {
@@ -357,6 +376,11 @@ export async function verifyManagedWorkCheckpointClosure(
       authoritativeWorkspaceReferences: Object.freeze(
         sourceReferences.map((reference) => Object.freeze({ ...reference })),
       ),
+      authorizedCommandPlacements: Object.freeze(
+        normalizeAuthorizedCommandPlacements(
+          options.authorizedCommandPlacements,
+        ).map((placement) => Object.freeze({ ...placement })),
+      ),
       privateArtifacts: Object.freeze(
         expectedArtifacts.map((artifact) => Object.freeze({ ...artifact })),
       ),
@@ -408,6 +432,13 @@ export function isVerifiedManagedWorkCheckpointClosure(
         canonicalManagedWorkJson(proof.authoritativeWorkspaceReferences) &&
       canonicalManagedWorkJson(expectedArtifacts) ===
         canonicalManagedWorkJson(proof.privateArtifacts) &&
+      canonicalManagedWorkJson(
+        normalizeAuthorizedCommandPlacements(
+          expected.authorizedCommandPlacements,
+        ),
+      ) === canonicalManagedWorkJson(proof.authorizedCommandPlacements) &&
+      canonicalManagedWorkJson(expected.expectedEvidence) ===
+        proof.expectedEvidenceJson &&
       JSON.stringify(expected.expectedRuntimeRequirements) ===
         JSON.stringify(proof.expectedRuntimeRequirements)
     );
@@ -589,13 +620,93 @@ async function verifyPrivateObjectStream(
   }
 }
 
-function assertSettledProvenance(evidence: FactoryProvenanceEvidence): void {
+function normalizeAuthorizedCommandPlacements(
+  placements: readonly {
+    nodeId: string;
+    workspaceId: string;
+    ownershipGeneration: number;
+  }[],
+): Array<{
+  nodeId: string;
+  workspaceId: string;
+  ownershipGeneration: number;
+}> {
+  if (placements.length === 0 || placements.length > 100_000) {
+    throw new Error("Authorized execution placement count is invalid");
+  }
+  const unique = new Map<string, (typeof placements)[number]>();
+  for (const placement of placements) {
+    if (
+      !IDENTIFIER.test(placement.nodeId) ||
+      !IDENTIFIER.test(placement.workspaceId) ||
+      !Number.isSafeInteger(placement.ownershipGeneration) ||
+      placement.ownershipGeneration < 0
+    ) {
+      throw new Error("Authorized execution placement is invalid");
+    }
+    const key = canonicalManagedWorkJson(placement);
+    if (unique.has(key)) {
+      throw new Error("Authorized execution placement is duplicated");
+    }
+    unique.set(key, {
+      nodeId: placement.nodeId,
+      workspaceId: placement.workspaceId,
+      ownershipGeneration: placement.ownershipGeneration,
+    });
+  }
+  return [...unique.values()].sort(
+    (left, right) =>
+      left.nodeId.localeCompare(right.nodeId) ||
+      left.workspaceId.localeCompare(right.workspaceId) ||
+      left.ownershipGeneration - right.ownershipGeneration,
+  );
+}
+
+function assertSettledProvenance(
+  evidence: FactoryProvenanceEvidence,
+  authorizedCommandPlacements: readonly {
+    nodeId: string;
+    workspaceId: string;
+    ownershipGeneration: number;
+  }[],
+): void {
+  const placements = normalizeAuthorizedCommandPlacements(
+    authorizedCommandPlacements,
+  );
+  const placementKey = (
+    target: { nodeId: string; workspaceId: string },
+    ownershipGeneration: number,
+  ) =>
+    canonicalManagedWorkJson({
+      nodeId: target.nodeId,
+      workspaceId: target.workspaceId,
+      ownershipGeneration,
+    });
+  const authorized = new Set(
+    placements.map((placement) =>
+      placementKey(placement, placement.ownershipGeneration),
+    ),
+  );
+  if (
+    !authorized.has(
+      placementKey(
+        evidence.capture.target,
+        evidence.capture.ownershipGeneration,
+      ),
+    )
+  ) {
+    throw new Error(
+      "Current capture is outside its authorized execution lineage",
+    );
+  }
   for (const command of evidence.commands) {
+    const commandPlacement = placementKey(
+      command.target,
+      command.ownershipGeneration,
+    );
     if (
       command.threadId !== evidence.threadId ||
-      command.target.nodeId !== evidence.capture.target.nodeId ||
-      command.target.workspaceId !== evidence.capture.target.workspaceId ||
-      command.ownershipGeneration !== evidence.capture.ownershipGeneration ||
+      !authorized.has(commandPlacement) ||
       (command.dispatchStatus !== "completed" &&
         command.dispatchStatus !== "failed")
     ) {
@@ -603,9 +714,13 @@ function assertSettledProvenance(evidence: FactoryProvenanceEvidence): void {
     }
     for (const effect of command.executionEffects) {
       if (
-        effect.nodeId !== evidence.capture.target.nodeId ||
-        effect.target.workspaceId !== evidence.capture.target.workspaceId ||
-        effect.ownershipGeneration !== evidence.capture.ownershipGeneration ||
+        effect.nodeId !== command.target.nodeId ||
+        effect.target.nodeId !== command.target.nodeId ||
+        effect.target.workspaceId !== command.target.workspaceId ||
+        effect.ownershipGeneration !== command.ownershipGeneration ||
+        !authorized.has(
+          placementKey(effect.target, effect.ownershipGeneration),
+        ) ||
         (effect.status !== "completed" && effect.status !== "failed")
       ) {
         throw new Error("Factory execution-effect provenance is unsettled");

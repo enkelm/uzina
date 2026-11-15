@@ -1927,6 +1927,11 @@ describe("authenticated Factory execution controller protocol", () => {
           throw new Error("unexpected relocation blob fetch");
         },
         reportWorkspaceRelocation: async () => undefined,
+        claimWorkspaceRelocationActivation: async () => null,
+        reportWorkspaceRelocationActivationReadiness: async () => {
+          throw new Error("unexpected activation readiness report");
+        },
+        reportWorkspaceRelocationActivation: async () => undefined,
       },
       pollIntervalMs: 10,
       heartbeatIntervalMs: 20,
@@ -1961,6 +1966,11 @@ describe("authenticated Factory execution controller protocol", () => {
           throw new Error("unexpected relocation blob fetch");
         },
         reportWorkspaceRelocation: async () => undefined,
+        claimWorkspaceRelocationActivation: async () => null,
+        reportWorkspaceRelocationActivationReadiness: async () => {
+          throw new Error("unexpected activation readiness report");
+        },
+        reportWorkspaceRelocationActivation: async () => undefined,
       },
       pollIntervalMs: 10,
       heartbeatIntervalMs: 20,

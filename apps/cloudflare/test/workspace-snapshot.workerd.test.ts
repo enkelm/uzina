@@ -2707,6 +2707,91 @@ exec "$UZINA_RELOCATION_TEST_REAL_GIT" "$@"
     await destinationLoop?.catch(() => {});
     destinationLoop = undefined;
     destinationAbort = undefined;
+
+    const invalidActivationIntent = await call<{ error: string }>(
+      baseUrl,
+      `/v1/workspace-relocations/${relocationRequest.requestId}/activation-intent`,
+      {
+        credential: owner,
+        body: { contractVersion: 1, generation: 999 },
+      },
+    );
+    expect(invalidActivationIntent.response.status).toBe(400);
+    const activationIntent = await call<{
+      status: string;
+      activation: { status: string; preparedReceiptSha256: string };
+    }>(
+      baseUrl,
+      `/v1/workspace-relocations/${relocationRequest.requestId}/activation-intent`,
+      { credential: owner, body: { contractVersion: 1 } },
+    );
+    expect(activationIntent.response.status).toBe(202);
+    expect(activationIntent.value).toMatchObject({
+      status: "prepared-inactive",
+      activation: {
+        status: "intent",
+        preparedReceiptSha256: preparedRelocationStatus.value.receiptSha256,
+      },
+    });
+    const activationClaimPath = `/v1/nodes/${destinationNode.value.node.nodeId}/workspace-relocation-activations/claim`;
+    const activationClaim = await call<{
+      activation: {
+        phase: string;
+        assignment: Record<string, unknown>;
+      } | null;
+    }>(baseUrl, activationClaimPath, {
+      credential: destinationNode.value.credential,
+      body: {
+        contractVersion: 1,
+        nodeId: destinationNode.value.node.nodeId,
+      },
+    });
+    expect(activationClaim.response.status).toBe(200);
+    expect(activationClaim.value.activation).toMatchObject({
+      phase: "preflight",
+      assignment: {
+        relocationId: relocationAdmission.value.relocationId,
+        requestId: relocationRequest.requestId,
+        preparedReceiptSha256: preparedRelocationStatus.value.receiptSha256,
+        sourceOwnershipGeneration: thread.value.ownershipGeneration,
+        destinationOwnershipGeneration: 0,
+        manifestReference: status.value.manifestReference,
+      },
+    });
+    const preflight = activationClaim.value.activation?.assignment;
+    if (!preflight) throw new Error("Expected a destination preflight claim");
+    await evictFactory();
+    const repeatedActivationClaim = await call<{
+      activation: unknown;
+    }>(baseUrl, activationClaimPath, {
+      credential: destinationNode.value.credential,
+      body: {
+        contractVersion: 1,
+        nodeId: destinationNode.value.node.nodeId,
+      },
+    });
+    expect(repeatedActivationClaim.value.activation).toEqual(
+      activationClaim.value.activation,
+    );
+    const mismatchedReadiness = await call<{ error: string }>(
+      baseUrl,
+      `/v1/nodes/${destinationNode.value.node.nodeId}/workspace-relocations/${relocationAdmission.value.relocationId}/readiness`,
+      {
+        credential: destinationNode.value.credential,
+        body: {
+          ...preflight,
+          sourceOwnershipGeneration: thread.value.ownershipGeneration + 1,
+          readinessReceiptSha256: "a".repeat(64),
+          reportedAt: new Date().toISOString(),
+        },
+      },
+    );
+    expect(mismatchedReadiness.response.status).toBe(409);
+    const stillPreflight = await call<{
+      activation: { status: string };
+    }>(baseUrl, relocationStatusPath, { credential: owner });
+    expect(stillPreflight.value.activation.status).toBe("preflight-claimed");
+
     await destinationDaemon.reconcileWorkspaceRelocations();
     expect(destinationDaemon.pendingWorkspaceRelocationReports()).toEqual([]);
     expect(

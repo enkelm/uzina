@@ -23,28 +23,36 @@ function validateScopedWorkspaceAuthority(database: FactoryDatabase): void {
     node_id: string;
     provisioned_node_id: string | null;
     ownership_generation: unknown;
+    retired_at: string | null;
   }>(
     `SELECT workspaces.workspace_id, workspaces.node_id,
-       nodes.node_id AS provisioned_node_id, workspaces.ownership_generation
+       nodes.node_id AS provisioned_node_id, workspaces.ownership_generation,
+       workspaces.retired_at
      FROM workspaces LEFT JOIN nodes ON nodes.node_id = workspaces.node_id`,
   );
   const generations = new Map<string, number>();
+  const workspaceNodes = new Map<string, string>();
+  const workspaceRetirements = new Map<string, string | null>();
   for (const workspace of workspaces) {
     const generation = safeNonnegativeInteger(workspace.ownership_generation);
     if (!workspace.provisioned_node_id || generation === undefined) {
       throw new Error("Invalid scoped workspace ownership authority");
     }
     generations.set(workspace.workspace_id, generation);
+    workspaceNodes.set(workspace.workspace_id, workspace.node_id);
+    workspaceRetirements.set(workspace.workspace_id, workspace.retired_at);
   }
 
   const threads = database.all<{
     workspace_id: string;
     node_id: string;
     workspace_node_id: string | null;
+    workspace_retired_at: string | null;
     ownership_generation: unknown;
   }>(
     `SELECT threads.workspace_id, threads.node_id,
-       workspaces.node_id AS workspace_node_id, threads.ownership_generation
+       workspaces.node_id AS workspace_node_id,
+       workspaces.retired_at AS workspace_retired_at, threads.ownership_generation
      FROM threads LEFT JOIN workspaces ON workspaces.workspace_id = threads.workspace_id`,
   );
   for (const thread of threads) {
@@ -52,6 +60,7 @@ function validateScopedWorkspaceAuthority(database: FactoryDatabase): void {
     if (
       authorityGeneration === undefined ||
       thread.workspace_node_id !== thread.node_id ||
+      thread.workspace_retired_at !== null ||
       safeNonnegativeInteger(thread.ownership_generation) !==
         authorityGeneration
     ) {
@@ -64,22 +73,195 @@ function validateScopedWorkspaceAuthority(database: FactoryDatabase): void {
     node_id: string;
     workspace_node_id: string | null;
     ownership_generation: unknown;
+    pending_destination_generation: unknown;
   }>(
     `SELECT reported.workspace_id, reported.node_id,
-       workspaces.node_id AS workspace_node_id, reported.ownership_generation
+       workspaces.node_id AS workspace_node_id, reported.ownership_generation,
+       activation.destination_ownership_generation AS pending_destination_generation
      FROM execution_node_workspaces AS reported
-     LEFT JOIN workspaces ON workspaces.workspace_id = reported.workspace_id`,
+     LEFT JOIN workspaces ON workspaces.workspace_id = reported.workspace_id
+     LEFT JOIN workspace_relocation_activations AS activation
+       ON (activation.status = 'ownership-committed'
+           OR (activation.status = 'uncertain' AND activation.ownership_generation IS NOT NULL))
+      AND activation.destination_node_id = reported.node_id
+      AND activation.destination_workspace_id = reported.workspace_id`,
   );
   for (const observation of observations) {
     const authorityGeneration = generations.get(observation.workspace_id);
     if (
       authorityGeneration === undefined ||
       observation.workspace_node_id !== observation.node_id ||
-      safeNonnegativeInteger(observation.ownership_generation) !==
-        authorityGeneration
+      (safeNonnegativeInteger(observation.ownership_generation) !==
+        authorityGeneration &&
+        safeNonnegativeInteger(observation.ownership_generation) !==
+          safeNonnegativeInteger(observation.pending_destination_generation))
     ) {
       throw new Error(
         "Node workspace observation disagrees with workspace ownership",
+      );
+    }
+  }
+
+  const committedMoves = database.all<{
+    status: string;
+    thread_id: string;
+    source_node_id: string;
+    source_workspace_id: string;
+    destination_node_id: string;
+    destination_workspace_id: string;
+    ownership_generation: unknown;
+    destination_ownership_generation: unknown;
+    activation_generation: unknown;
+    source_retired_at: string | null;
+    destination_current_generation: unknown;
+    thread_node_id: string;
+    thread_workspace_id: string;
+    thread_generation: unknown;
+    capture_count: number;
+  }>(
+    `SELECT activation.status, relocation.thread_id,
+       relocation.source_node_id, relocation.source_workspace_id,
+       relocation.destination_node_id, relocation.destination_workspace_id,
+       relocation.ownership_generation,
+       activation.destination_ownership_generation,
+       activation.ownership_generation AS activation_generation,
+       source.retired_at AS source_retired_at,
+       destination.ownership_generation AS destination_current_generation,
+       thread.node_id AS thread_node_id,
+       thread.workspace_id AS thread_workspace_id,
+       thread.ownership_generation AS thread_generation,
+       (SELECT COUNT(*) FROM managed_work_captures capture
+        WHERE capture.capture_id = relocation.capture_id
+          AND capture.thread_id = relocation.thread_id
+          AND capture.workspace_id = relocation.source_workspace_id) AS capture_count
+     FROM workspace_relocation_activations activation
+     JOIN workspace_relocations relocation USING (relocation_id)
+     JOIN workspaces source ON source.workspace_id = relocation.source_workspace_id
+     JOIN workspaces destination ON destination.workspace_id = relocation.destination_workspace_id
+     JOIN threads thread ON thread.thread_id = relocation.thread_id
+     WHERE activation.status IN ('ownership-committed', 'activated')
+        OR (activation.status = 'uncertain' AND activation.ownership_generation IS NOT NULL)`,
+  );
+  for (const move of committedMoves) {
+    const sourceGeneration = safeNonnegativeInteger(move.ownership_generation);
+    const destinationGeneration = safeNonnegativeInteger(
+      move.destination_current_generation,
+    );
+    const activationGeneration = safeNonnegativeInteger(
+      move.activation_generation,
+    );
+    const destinationPriorGeneration = safeNonnegativeInteger(
+      move.destination_ownership_generation,
+    );
+    if (
+      sourceGeneration === undefined ||
+      destinationGeneration === undefined ||
+      activationGeneration === undefined ||
+      destinationPriorGeneration === undefined ||
+      activationGeneration !== destinationGeneration ||
+      Math.max(sourceGeneration, destinationPriorGeneration) >=
+        Number.MAX_SAFE_INTEGER ||
+      activationGeneration !==
+        Math.max(sourceGeneration, destinationPriorGeneration) + 1 ||
+      move.source_retired_at === null ||
+      (move.status !== "activated" &&
+        (move.thread_node_id !== move.destination_node_id ||
+          move.thread_workspace_id !== move.destination_workspace_id ||
+          safeNonnegativeInteger(move.thread_generation) !==
+            destinationGeneration)) ||
+      (move.status !== "activated" && move.capture_count !== 1) ||
+      (move.status === "activated" && move.capture_count !== 0)
+    ) {
+      throw new Error(
+        "Workspace relocation activation authority is inconsistent",
+      );
+    }
+  }
+
+  const sourceKey = (
+    threadId: string,
+    nodeId: string,
+    workspaceId: string,
+    generation: number,
+  ) => JSON.stringify([threadId, nodeId, workspaceId, generation]);
+  const successors = new Map<string, (typeof committedMoves)[number][]>();
+  for (const move of committedMoves) {
+    const sourceGeneration = safeNonnegativeInteger(move.ownership_generation)!;
+    const key = sourceKey(
+      move.thread_id,
+      move.source_node_id,
+      move.source_workspace_id,
+      sourceGeneration,
+    );
+    const matches = successors.get(key) ?? [];
+    matches.push(move);
+    successors.set(key, matches);
+  }
+
+  // Historical activated edges must form one exact path to current placement;
+  // a committed pending tail is retained as a barrier, never as final success.
+  for (const activatedMove of committedMoves.filter(
+    (move) => move.status === "activated",
+  )) {
+    let nodeId = activatedMove.destination_node_id;
+    let workspaceId = activatedMove.destination_workspace_id;
+    let generation = safeNonnegativeInteger(
+      activatedMove.activation_generation,
+    )!;
+    const visited = new Set<string>();
+    let reachedCurrentPlacement = false;
+
+    for (let hop = 0; hop <= committedMoves.length; hop += 1) {
+      const placement = sourceKey(
+        activatedMove.thread_id,
+        nodeId,
+        workspaceId,
+        generation,
+      );
+      if (visited.has(placement)) break;
+      visited.add(placement);
+
+      if (
+        activatedMove.thread_node_id === nodeId &&
+        activatedMove.thread_workspace_id === workspaceId &&
+        safeNonnegativeInteger(activatedMove.thread_generation) === generation
+      ) {
+        reachedCurrentPlacement =
+          workspaceNodes.get(workspaceId) === nodeId &&
+          workspaceRetirements.get(workspaceId) === null &&
+          generations.get(workspaceId) === generation;
+        break;
+      }
+
+      const nextMoves = successors.get(placement) ?? [];
+      if (nextMoves.length !== 1) break;
+      const nextMove = nextMoves[0]!;
+      const nextGeneration = safeNonnegativeInteger(
+        nextMove.activation_generation,
+      )!;
+      if (nextMove.status !== "activated") {
+        reachedCurrentPlacement =
+          nextMove.thread_node_id === nextMove.destination_node_id &&
+          nextMove.thread_workspace_id === nextMove.destination_workspace_id &&
+          safeNonnegativeInteger(nextMove.thread_generation) ===
+            nextGeneration &&
+          workspaceNodes.get(nextMove.destination_workspace_id) ===
+            nextMove.destination_node_id &&
+          workspaceRetirements.get(nextMove.destination_workspace_id) ===
+            null &&
+          generations.get(nextMove.destination_workspace_id) ===
+            nextGeneration &&
+          nextMove.capture_count === 1;
+        break;
+      }
+      nodeId = nextMove.destination_node_id;
+      workspaceId = nextMove.destination_workspace_id;
+      generation = nextGeneration;
+    }
+
+    if (!reachedCurrentPlacement) {
+      throw new Error(
+        "Workspace relocation activation authority is inconsistent",
       );
     }
   }
@@ -156,7 +338,8 @@ const schema = [
     workspace_id TEXT PRIMARY KEY,
     node_id TEXT NOT NULL REFERENCES nodes(node_id),
     name TEXT NOT NULL,
-    ownership_generation INTEGER NOT NULL DEFAULT 0 CHECK (ownership_generation >= 0)
+    ownership_generation INTEGER NOT NULL DEFAULT 0 CHECK (ownership_generation >= 0),
+    retired_at TEXT
   )`,
   `CREATE TABLE IF NOT EXISTS threads (
     thread_id TEXT PRIMARY KEY,
@@ -371,6 +554,33 @@ const schema = [
       OR (status IN ('blocked', 'uncertain') AND report_json IS NOT NULL AND report_sha256 IS NOT NULL AND receipt_sha256 IS NOT NULL AND error_code IS NOT NULL)
     )
   )`,
+  `CREATE TABLE IF NOT EXISTS workspace_relocation_activations (
+    relocation_id TEXT PRIMARY KEY REFERENCES workspace_relocations(relocation_id),
+    status TEXT NOT NULL CHECK (status IN ('intent', 'preflight-claimed', 'ownership-committed', 'activated', 'uncertain')),
+    destination_node_id TEXT NOT NULL REFERENCES nodes(node_id),
+    destination_workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id),
+    destination_ownership_generation INTEGER NOT NULL CHECK (destination_ownership_generation >= 0),
+    ownership_generation INTEGER CHECK (ownership_generation >= 0),
+    prepared_receipt_sha256 TEXT NOT NULL CHECK (length(prepared_receipt_sha256) = 64 AND prepared_receipt_sha256 NOT GLOB '*[^a-f0-9]*'),
+    readiness_json TEXT,
+    readiness_sha256 TEXT,
+    readiness_receipt_sha256 TEXT,
+    activation_command_json TEXT,
+    activation_command_sha256 TEXT,
+    activation_receipt_json TEXT,
+    activation_receipt_sha256 TEXT,
+    uncertainty_receipt_sha256 TEXT,
+    intent_at TEXT NOT NULL,
+    claimed_at TEXT,
+    updated_at TEXT NOT NULL,
+    CHECK (
+      (status IN ('intent', 'preflight-claimed') AND ownership_generation IS NULL AND readiness_json IS NULL AND readiness_sha256 IS NULL AND readiness_receipt_sha256 IS NULL AND activation_command_json IS NULL AND activation_command_sha256 IS NULL AND activation_receipt_json IS NULL AND activation_receipt_sha256 IS NULL AND uncertainty_receipt_sha256 IS NULL)
+      OR (status = 'ownership-committed' AND ownership_generation IS NOT NULL AND readiness_json IS NOT NULL AND readiness_sha256 IS NOT NULL AND readiness_receipt_sha256 IS NOT NULL AND activation_command_json IS NOT NULL AND activation_command_sha256 IS NOT NULL AND activation_receipt_json IS NULL AND activation_receipt_sha256 IS NULL AND uncertainty_receipt_sha256 IS NULL)
+      OR (status = 'activated' AND ownership_generation IS NOT NULL AND readiness_json IS NOT NULL AND readiness_sha256 IS NOT NULL AND readiness_receipt_sha256 IS NOT NULL AND activation_command_json IS NOT NULL AND activation_command_sha256 IS NOT NULL AND activation_receipt_json IS NOT NULL AND activation_receipt_sha256 IS NOT NULL AND uncertainty_receipt_sha256 IS NULL)
+      OR status = 'uncertain'
+    )
+  )`,
+  `CREATE INDEX IF NOT EXISTS workspace_relocation_activation_queue ON workspace_relocation_activations(status, destination_node_id, intent_at)`,
   `CREATE INDEX IF NOT EXISTS workspace_relocation_queue_by_node ON workspace_relocations(status, destination_node_id, accepted_at)`,
   `CREATE INDEX IF NOT EXISTS workspace_snapshot_queue_by_node ON workspace_snapshot_requests(status, node_id, accepted_at)`,
   `CREATE INDEX IF NOT EXISTS capture_control_queue_by_node ON capture_control_requests(status, node_id, accepted_at)`,
@@ -379,13 +589,16 @@ const schema = [
 
 export function initializeFactoryDatabase(database: FactoryDatabase): void {
   for (const statement of schema) database.exec(statement);
-  const workspaceColumns = new Set(
+  let workspaceColumns = new Set(
     database
       .all<{ name: string }>("PRAGMA table_info(workspaces)")
       .map((column) => column.name),
   );
   if (!workspaceColumns.has("ownership_generation")) {
     database.transaction(() => {
+      if (!workspaceColumns.has("retired_at")) {
+        database.exec("ALTER TABLE workspaces ADD COLUMN retired_at TEXT");
+      }
       const provisioned =
         database.all<{ count: number }>(
           "SELECT COUNT(*) AS count FROM workspaces",
@@ -413,7 +626,12 @@ export function initializeFactoryDatabase(database: FactoryDatabase): void {
       validateScopedWorkspaceAuthority(database);
     });
   } else {
-    database.transaction(() => validateScopedWorkspaceAuthority(database));
+    database.transaction(() => {
+      if (!workspaceColumns.has("retired_at")) {
+        database.exec("ALTER TABLE workspaces ADD COLUMN retired_at TEXT");
+      }
+      validateScopedWorkspaceAuthority(database);
+    });
   }
   const managedWorkCheckpointColumns = new Set(
     database
@@ -436,10 +654,13 @@ export function initializeFactoryDatabase(database: FactoryDatabase): void {
     "previous_report_json",
     "previous_report_sha256",
     "previous_receipt_sha256",
+    "destination_ownership_generation",
   ] as const) {
     if (!workspaceRelocationColumns.has(column)) {
+      const type =
+        column === "destination_ownership_generation" ? "INTEGER" : "TEXT";
       database.exec(
-        `ALTER TABLE workspace_relocations ADD COLUMN ${column} TEXT`,
+        `ALTER TABLE workspace_relocations ADD COLUMN ${column} ${type}`,
       );
     }
   }

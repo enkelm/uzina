@@ -251,6 +251,7 @@ export const captureControlStatusSchema = z
     updatedAt: z.string().datetime(),
     sourceFence: executionCaptureFenceReceiptSchema.optional(),
     errorCode: z.string().min(1).max(128).optional(),
+    historical: z.literal(true).optional(),
   })
   .strict();
 
@@ -281,6 +282,7 @@ export const workspaceSnapshotStatusSchema = z
       .regex(/^[a-f0-9]{64}$/)
       .optional(),
     errorCode: z.string().min(1).max(128).optional(),
+    historical: z.literal(true).optional(),
   })
   .strict();
 
@@ -321,6 +323,7 @@ export const managedWorkCheckpointStatusSchema = z
       .string()
       .regex(/^[a-f0-9]{64}$/)
       .optional(),
+    historical: z.literal(true).optional(),
   })
   .strict()
   .superRefine((status, context) => {
@@ -360,6 +363,12 @@ const workspaceRelocationBindingShape = {
   source: workspaceRelocationTargetSchema,
   destination: workspaceRelocationTargetSchema,
   ownershipGeneration: z.number().int().nonnegative().safe(),
+  destinationOwnershipGeneration: z
+    .number()
+    .int()
+    .nonnegative()
+    .safe()
+    .optional(),
   manifestReference: z.string().regex(/^[a-f0-9]{64}$/),
 };
 
@@ -393,6 +402,10 @@ export const workspaceRelocationStatusSchema = z
       .regex(/^[a-f0-9]{64}$/)
       .optional(),
     errorCode: workspaceRelocationErrorCodeSchema.optional(),
+    activation: z
+      .lazy(() => workspaceRelocationActivationStatusSchema)
+      .optional(),
+    historical: z.literal(true).optional(),
   })
   .strict()
   .superRefine((status, context) => {
@@ -437,6 +450,176 @@ export const workspaceRelocationStatusSchema = z
       });
     }
   });
+export const workspaceRelocationActivationIntentRequestSchema = z
+  .object({ ...versioned })
+  .strict();
+export const workspaceRelocationActivationStatusSchema = z
+  .object({
+    status: z.enum([
+      "intent",
+      "preflight-claimed",
+      "ownership-committed",
+      "activated",
+      "uncertain",
+    ]),
+    destinationOwnershipGeneration: z.number().int().nonnegative().safe(),
+    ownershipGeneration: z.number().int().nonnegative().safe().optional(),
+    preparedReceiptSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    readinessReceiptSha256: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
+    activationReceiptSha256: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
+    uncertaintyReceiptSha256: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
+    intentAt: z.string().datetime(),
+    updatedAt: z.string().datetime(),
+  })
+  .strict()
+  .superRefine((activation, context) => {
+    const hasGeneration = activation.ownershipGeneration !== undefined;
+    const hasReadiness = activation.readinessReceiptSha256 !== undefined;
+    const hasActivationReceipt =
+      activation.activationReceiptSha256 !== undefined;
+    const hasUncertaintyReceipt =
+      activation.uncertaintyReceiptSha256 !== undefined;
+    const initial = ["intent", "preflight-claimed"].includes(activation.status);
+    const committed = ["ownership-committed", "activated"].includes(
+      activation.status,
+    );
+    const valid = initial
+      ? !hasGeneration &&
+        !hasReadiness &&
+        !hasActivationReceipt &&
+        !hasUncertaintyReceipt
+      : committed
+        ? hasGeneration &&
+          hasReadiness &&
+          (activation.status === "activated") === hasActivationReceipt &&
+          !hasUncertaintyReceipt
+        : activation.status === "uncertain"
+          ? hasGeneration === hasReadiness &&
+            !hasActivationReceipt &&
+            hasUncertaintyReceipt === hasGeneration
+          : false;
+    if (!valid) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["readinessReceiptSha256"],
+        message: "Activation evidence must match its persisted phase",
+      });
+    }
+  });
+const workspaceRelocationActivationBindingShape = {
+  contractVersion: z.literal(EXECUTION_CONTRACT_VERSION),
+  relocationId: identifier,
+  requestId: identifier,
+  checkpointRequestId: identifier,
+  captureRequestId: identifier,
+  captureId: executionCaptureIdSchema,
+  workspaceSnapshotRequestId: identifier,
+  snapshotId: identifier,
+  threadId: identifier,
+  source: workspaceRelocationTargetSchema,
+  destination: workspaceRelocationTargetSchema,
+  sourceOwnershipGeneration: z.number().int().nonnegative().safe(),
+  destinationOwnershipGeneration: z.number().int().nonnegative().safe(),
+  manifestReference: z.string().regex(/^[a-f0-9]{64}$/),
+  sourceProofSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  preparedReceiptSha256: z.string().regex(/^[a-f0-9]{64}$/),
+};
+export const workspaceRelocationActivationPreflightSchema = z
+  .object(workspaceRelocationActivationBindingShape)
+  .strict();
+export const workspaceRelocationActivationCommandSchema = z
+  .object({
+    ...workspaceRelocationActivationBindingShape,
+    ownershipGeneration: z.number().int().nonnegative().safe(),
+    readinessReceiptSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    committedAt: z.string().datetime(),
+  })
+  .strict();
+export const workspaceRelocationActivationClaimSchema = z.discriminatedUnion(
+  "phase",
+  [
+    z
+      .object({
+        phase: z.literal("preflight"),
+        assignment: workspaceRelocationActivationPreflightSchema,
+      })
+      .strict(),
+    z
+      .object({
+        phase: z.literal("activate"),
+        command: workspaceRelocationActivationCommandSchema,
+      })
+      .strict(),
+  ],
+);
+export const workspaceRelocationActivationClaimRequestSchema = z
+  .object({
+    contractVersion: z.literal(EXECUTION_CONTRACT_VERSION),
+    nodeId: identifier,
+  })
+  .strict();
+export const workspaceRelocationActivationClaimResponseSchema = z
+  .object({
+    contractVersion: z.literal(EXECUTION_CONTRACT_VERSION),
+    activation: workspaceRelocationActivationClaimSchema.nullable(),
+  })
+  .strict();
+export const workspaceRelocationActivationReadinessSchema = z
+  .object({
+    ...workspaceRelocationActivationBindingShape,
+    readinessReceiptSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    reportedAt: z.string().datetime(),
+  })
+  .strict();
+export const workspaceRelocationActivationReadinessResponseSchema = z
+  .object({
+    contractVersion: z.literal(EXECUTION_CONTRACT_VERSION),
+    nodeId: identifier,
+    relocationId: identifier,
+    accepted: z.literal(true),
+    command: workspaceRelocationActivationCommandSchema,
+  })
+  .strict();
+export const workspaceRelocationActivationReportSchema = z.discriminatedUnion(
+  "status",
+  [
+    z
+      .object({
+        status: z.literal("activated"),
+        command: workspaceRelocationActivationCommandSchema,
+        activationReceiptSha256: z.string().regex(/^[a-f0-9]{64}$/),
+        reportedAt: z.string().datetime(),
+      })
+      .strict(),
+    z
+      .object({
+        status: z.literal("uncertain"),
+        command: workspaceRelocationActivationCommandSchema,
+        uncertaintyReceiptSha256: z.string().regex(/^[a-f0-9]{64}$/),
+        errorCode: workspaceRelocationErrorCodeSchema,
+        reportedAt: z.string().datetime(),
+      })
+      .strict(),
+  ],
+);
+export const workspaceRelocationActivationReportResponseSchema = z
+  .object({
+    contractVersion: z.literal(EXECUTION_CONTRACT_VERSION),
+    nodeId: identifier,
+    relocationId: identifier,
+    accepted: z.literal(true),
+    status: z.enum(["activated", "uncertain"]),
+  })
+  .strict();
 export const workspaceRelocationClaimRequestSchema = z
   .object({
     contractVersion: z.literal(EXECUTION_CONTRACT_VERSION),
@@ -786,6 +969,27 @@ export type WorkspaceRelocationClaim = z.infer<
 >;
 export type WorkspaceRelocationReport = z.infer<
   typeof workspaceRelocationReportSchema
+>;
+export type WorkspaceRelocationActivationIntentRequest = z.infer<
+  typeof workspaceRelocationActivationIntentRequestSchema
+>;
+export type WorkspaceRelocationActivationStatus = z.infer<
+  typeof workspaceRelocationActivationStatusSchema
+>;
+export type WorkspaceRelocationActivationPreflight = z.infer<
+  typeof workspaceRelocationActivationPreflightSchema
+>;
+export type WorkspaceRelocationActivationCommand = z.infer<
+  typeof workspaceRelocationActivationCommandSchema
+>;
+export type WorkspaceRelocationActivationClaim = z.infer<
+  typeof workspaceRelocationActivationClaimSchema
+>;
+export type WorkspaceRelocationActivationReadiness = z.infer<
+  typeof workspaceRelocationActivationReadinessSchema
+>;
+export type WorkspaceRelocationActivationReport = z.infer<
+  typeof workspaceRelocationActivationReportSchema
 >;
 export type ManagedWorkCheckpointRequest = z.infer<
   typeof managedWorkCheckpointRequestSchema

@@ -40,6 +40,20 @@ import {
   workspaceRelocationClaimSchema,
   workspaceRelocationReportSchema,
   workspaceRelocationReportResponseSchema,
+  workspaceRelocationActivationIntentRequestSchema,
+  workspaceRelocationActivationStatusSchema,
+  workspaceRelocationActivationClaimRequestSchema,
+  workspaceRelocationActivationClaimSchema,
+  workspaceRelocationActivationPreflightSchema,
+  workspaceRelocationActivationCommandSchema,
+  workspaceRelocationActivationReadinessSchema,
+  workspaceRelocationActivationReadinessResponseSchema,
+  workspaceRelocationActivationReportSchema,
+  workspaceRelocationActivationReportResponseSchema,
+  type WorkspaceRelocationActivationStatus,
+  type WorkspaceRelocationActivationPreflight,
+  type WorkspaceRelocationActivationCommand,
+  type WorkspaceRelocationActivationReadiness,
   type WorkspaceRelocationClaim,
   type WorkspaceRelocationReport,
   type WorkspaceRelocationStatus,
@@ -252,6 +266,11 @@ type ManagedWorkCheckpointBindingRow = Pick<
   | "workspace_id"
   | "ownership_generation"
 >;
+type ManagedWorkCheckpointExecutionPlacement = {
+  nodeId: string;
+  workspaceId: string;
+  ownershipGeneration: number;
+};
 type WorkspaceRelocationRow = {
   request_id: string;
   relocation_id: string;
@@ -268,6 +287,7 @@ type WorkspaceRelocationRow = {
   destination_node_id: string;
   destination_workspace_id: string;
   ownership_generation: number;
+  destination_ownership_generation: number | null;
   manifest_reference: string;
   status: WorkspaceRelocationStatus["status"];
   accepted_at: string;
@@ -280,6 +300,26 @@ type WorkspaceRelocationRow = {
   previous_report_sha256: string | null;
   previous_receipt_sha256: string | null;
   error_code: string | null;
+};
+type WorkspaceRelocationActivationRow = {
+  relocation_id: string;
+  status: WorkspaceRelocationActivationStatus["status"];
+  destination_node_id: string;
+  destination_workspace_id: string;
+  destination_ownership_generation: number;
+  ownership_generation: number | null;
+  prepared_receipt_sha256: string;
+  readiness_json: string | null;
+  readiness_sha256: string | null;
+  readiness_receipt_sha256: string | null;
+  activation_command_json: string | null;
+  activation_command_sha256: string | null;
+  activation_receipt_json: string | null;
+  activation_receipt_sha256: string | null;
+  uncertainty_receipt_sha256: string | null;
+  intent_at: string;
+  claimed_at: string | null;
+  updated_at: string;
 };
 type WorkspaceSnapshotRow = {
   request_id: string;
@@ -1370,6 +1410,11 @@ export class FactoryService {
         input.target.nodeId,
         input.target.workspaceId,
       );
+      this.#assertCurrentWorkspaceAssignment(
+        input.target.nodeId,
+        input.target.workspaceId,
+        generation,
+      );
       this.#assertWorkspaceNotCapturing(input.target.workspaceId);
       if (
         this.database.all("SELECT thread_id FROM threads WHERE thread_id = ?", [
@@ -1978,7 +2023,16 @@ export class FactoryService {
     const row = this.#workspaceSnapshotByRequest(requestId);
     if (!row) throw notFound("Workspace snapshot request");
     if (row.actor_json !== encode(session.actor)) throw forbidden();
-    return this.#workspaceSnapshotStatus(row);
+    const historical = this.#workspaceRelocationHistoricalForCapture(
+      row.capture_id,
+    );
+    if (historical) {
+      this.#assertWorkspaceRelocationHistoricalAuthority(
+        session,
+        historical.row,
+      );
+    }
+    return this.#workspaceSnapshotStatus(row, Boolean(historical));
   }
 
   /**
@@ -2124,6 +2178,22 @@ export class FactoryService {
     const row = this.#managedWorkCheckpointByRequest(requestId);
     if (!row) throw notFound("Managed-work checkpoint request");
     if (row.actor_json !== encode(session.actor)) throw forbidden();
+    const historical = this.#workspaceRelocationHistoricalForCapture(
+      row.capture_id,
+    );
+    if (historical) {
+      return this.database.transaction(() => {
+        this.#requireOwner(session);
+        const persisted = this.#managedWorkCheckpointByRequest(requestId);
+        if (!persisted) throw notFound("Managed-work checkpoint request");
+        if (persisted.actor_json !== encode(session.actor)) throw forbidden();
+        this.#assertWorkspaceRelocationHistoricalAuthority(
+          session,
+          historical.row,
+        );
+        return this.#managedWorkCheckpointStatus(persisted, true);
+      });
+    }
     const state = await this.getManagedWorkCaptureState(row.thread_id);
     const current = this.database.transaction(() => {
       this.#requireOwner(session);
@@ -2244,6 +2314,16 @@ export class FactoryService {
         destinationNodeId: input.destination.nodeId,
         destinationWorkspaceId: input.destination.workspaceId,
       });
+      const destination = this.database.all<{
+        ownership_generation: number;
+        retired_at: string | null;
+      }>(
+        "SELECT ownership_generation, retired_at FROM workspaces WHERE workspace_id = ? AND node_id = ?",
+        [input.destination.workspaceId, input.destination.nodeId],
+      )[0];
+      if (!destination || destination.retired_at !== null) {
+        throw conflict("workspace_relocation_destination_unavailable");
+      }
       const acceptedAt = now();
       this.database.exec(
         `INSERT INTO workspace_relocations(
@@ -2251,8 +2331,8 @@ export class FactoryService {
           capture_id, workspace_snapshot_request_id, snapshot_id, actor_json,
           project_id, thread_id, source_node_id, source_workspace_id,
           destination_node_id, destination_workspace_id, ownership_generation,
-          manifest_reference, status, accepted_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`,
+          destination_ownership_generation, manifest_reference, status, accepted_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`,
         [
           input.requestId,
           makeId("workspace-relocation"),
@@ -2269,6 +2349,7 @@ export class FactoryService {
           input.destination.nodeId,
           input.destination.workspaceId,
           checkpoint.ownership_generation,
+          destination.ownership_generation,
           snapshot.manifest_reference,
           acceptedAt,
           acceptedAt,
@@ -2281,6 +2362,102 @@ export class FactoryService {
     return this.#workspaceRelocationStatus(result);
   }
 
+  /** Explicitly begin activation for the same prepared relocation identity. */
+  async requestWorkspaceRelocationActivation(
+    session: FactorySession,
+    requestId: string,
+    request: unknown,
+  ): Promise<WorkspaceRelocationStatus> {
+    this.#requireOwner(session);
+    workspaceRelocationActivationIntentRequestSchema.parse(request);
+    const initial = this.#workspaceRelocationByRequest(requestId);
+    if (!initial) throw notFound("Workspace relocation request");
+    if (initial.actor_json !== encode(session.actor)) throw forbidden();
+    const existingActivation = this.#workspaceRelocationActivationById(
+      initial.relocation_id,
+    );
+    if (
+      existingActivation &&
+      (["ownership-committed", "activated"].includes(
+        existingActivation.status,
+      ) ||
+        (existingActivation.status === "uncertain" &&
+          existingActivation.ownership_generation !== null))
+    ) {
+      return this.database.transaction(() => {
+        this.#requireOwner(session);
+        const row = this.#workspaceRelocationById(initial.relocation_id);
+        const activation = this.#workspaceRelocationActivationById(
+          initial.relocation_id,
+        );
+        if (!row || !activation) throw notFound("Workspace relocation request");
+        if (row.actor_json !== encode(session.actor)) throw forbidden();
+        this.#assertWorkspaceRelocationHistoricalAuthority(session, row);
+        return this.#workspaceRelocationStatus(row);
+      });
+    }
+    const state = await this.getManagedWorkCaptureState(initial.thread_id);
+    const current = this.database.transaction(() => {
+      this.#requireOwner(session);
+      const row = this.#workspaceRelocationByRequest(requestId);
+      if (!row) throw notFound("Workspace relocation request");
+      if (row.actor_json !== encode(session.actor)) throw forbidden();
+      this.#assertWorkspaceRelocationAuthority(session, row, state);
+      if (row.status !== "prepared-inactive" || !row.receipt_sha256) {
+        throw conflict(
+          "workspace_relocation_not_prepared",
+          "Activation requires the original prepared-inactive destination receipt",
+        );
+      }
+      const prior = this.#workspaceRelocationActivationById(row.relocation_id);
+      if (prior) {
+        if (
+          prior.prepared_receipt_sha256 !== row.receipt_sha256 ||
+          prior.destination_node_id !== row.destination_node_id ||
+          prior.destination_workspace_id !== row.destination_workspace_id
+        ) {
+          throw conflict("workspace_relocation_activation_binding_mismatch");
+        }
+        return row;
+      }
+      const destination = this.database.all<{
+        ownership_generation: number;
+        retired_at: string | null;
+      }>(
+        "SELECT ownership_generation, retired_at FROM workspaces WHERE workspace_id = ? AND node_id = ?",
+        [row.destination_workspace_id, row.destination_node_id],
+      )[0];
+      if (
+        !destination ||
+        destination.retired_at !== null ||
+        (row.destination_ownership_generation !== null &&
+          row.destination_ownership_generation !==
+            destination.ownership_generation)
+      ) {
+        throw conflict("workspace_relocation_destination_unavailable");
+      }
+      const intentAt = now();
+      this.database.exec(
+        `INSERT INTO workspace_relocation_activations(
+          relocation_id, status, destination_node_id, destination_workspace_id,
+          destination_ownership_generation, prepared_receipt_sha256,
+          intent_at, updated_at
+        ) VALUES (?, 'intent', ?, ?, ?, ?, ?, ?)`,
+        [
+          row.relocation_id,
+          row.destination_node_id,
+          row.destination_workspace_id,
+          destination.ownership_generation,
+          row.receipt_sha256,
+          intentAt,
+          intentAt,
+        ],
+      );
+      return row;
+    });
+    return this.#workspaceRelocationStatus(current);
+  }
+
   /** Owner status lookup rechecks the same source fence and immutable checkpoint binding. */
   async getWorkspaceRelocationStatus(
     session: FactorySession,
@@ -2290,6 +2467,25 @@ export class FactoryService {
     const initial = this.#workspaceRelocationByRequest(requestId);
     if (!initial) throw notFound("Workspace relocation request");
     if (initial.actor_json !== encode(session.actor)) throw forbidden();
+    const activation = this.#workspaceRelocationActivationById(
+      initial.relocation_id,
+    );
+    if (
+      activation &&
+      (["ownership-committed", "activated"].includes(activation.status) ||
+        (activation.status === "uncertain" &&
+          activation.ownership_generation !== null))
+    ) {
+      const current = this.database.transaction(() => {
+        this.#requireOwner(session);
+        const row = this.#workspaceRelocationByRequest(requestId);
+        if (!row) throw notFound("Workspace relocation request");
+        if (row.actor_json !== encode(session.actor)) throw forbidden();
+        this.#assertWorkspaceRelocationHistoricalAuthority(session, row);
+        return row;
+      });
+      return this.#workspaceRelocationStatus(current);
+    }
     const state = await this.getManagedWorkCaptureState(initial.thread_id);
     const current = this.database.transaction(() => {
       this.#requireOwner(session);
@@ -2461,6 +2657,9 @@ export class FactoryService {
           reference: blob.reference,
           size: blob.size_bytes,
         })),
+        authorizedCommandPlacements: [
+          ...projected.authorizedPlacements.values(),
+        ],
         evidence,
         evidenceBytes,
         privateArtifacts: artifacts.map((artifact) => ({
@@ -2625,6 +2824,10 @@ export class FactoryService {
     if (!row) throw notFound("Managed-work checkpoint request");
     const session = this.#managedWorkCheckpointOwnerSession(row);
     const state = await this.getManagedWorkCaptureState(row.thread_id);
+    const expectedAssembly =
+      row.status === "assembling"
+        ? await this.getManagedWorkCheckpointAssembly(requestId)
+        : undefined;
     return this.database.transaction(() => {
       const current = this.#managedWorkCheckpointByRequest(requestId);
       if (!current) throw notFound("Managed-work checkpoint request");
@@ -2669,6 +2872,12 @@ export class FactoryService {
       const runtimeRequirements = parsePersistedManagedWorkRuntimeRequirements(
         current.runtime_requirements_json,
       );
+      const authorizedCommandPlacements = [
+        ...this.#managedWorkCheckpointAuthorityLineage(
+          current.thread_id,
+          current,
+        ).values(),
+      ];
       if (!runtimeRequirements) {
         throw conflict("managed_work_checkpoint_verification_mismatch");
       }
@@ -2681,6 +2890,7 @@ export class FactoryService {
         privateObjects.set(artifact.reference, artifact.size_bytes);
       }
       if (
+        !expectedAssembly ||
         !isVerifiedManagedWorkCheckpointClosure(verification, {
           checkpointRequestId: current.request_id,
           captureId: current.capture_id,
@@ -2690,6 +2900,8 @@ export class FactoryService {
             reference: blob.reference,
             size: blob.size_bytes,
           })),
+          authorizedCommandPlacements,
+          expectedEvidence: expectedAssembly.evidence,
           expectedRuntimeRequirements: runtimeRequirements,
           privateArtifacts: privateRows.map((artifact) => ({
             role: artifact.role,
@@ -2745,6 +2957,55 @@ export class FactoryService {
     const row = this.#managedWorkCheckpointByRequest(requestId);
     if (!row) throw notFound("Managed-work checkpoint request");
     if (row.actor_json !== encode(session.actor)) throw forbidden();
+    const historical = this.#workspaceRelocationHistoricalForCapture(
+      row.capture_id,
+    );
+    if (historical) {
+      return this.database.transaction(() => {
+        this.#requireOwner(session);
+        const current = this.#managedWorkCheckpointByRequest(requestId);
+        if (!current) throw notFound("Managed-work checkpoint request");
+        if (current.actor_json !== encode(session.actor)) throw forbidden();
+        this.#assertWorkspaceRelocationHistoricalAuthority(
+          session,
+          historical.row,
+        );
+        if (current.status !== "available" || !current.manifest_reference) {
+          throw notFound("Available managed-work checkpoint blob");
+        }
+        const privateArtifact =
+          this.database.all<ManagedWorkCheckpointArtifactRow>(
+            "SELECT * FROM managed_work_checkpoint_artifacts WHERE request_id = ? AND reference = ? LIMIT 1",
+            [requestId, reference],
+          )[0];
+        if (privateArtifact) {
+          return {
+            scope: "private" as const,
+            requestId,
+            captureId: current.capture_id,
+            reference,
+            size: privateArtifact.size_bytes,
+            historical: true,
+          };
+        }
+        const workspaceBlob = this.database.all<{
+          reference: string;
+          size_bytes: number;
+        }>(
+          "SELECT reference, size_bytes FROM workspace_snapshot_blobs WHERE capture_id = ? AND reference = ?",
+          [current.capture_id, reference],
+        )[0];
+        if (!workspaceBlob) throw notFound("Managed-work checkpoint blob");
+        return {
+          scope: "workspace" as const,
+          requestId,
+          captureId: current.capture_id,
+          reference: workspaceBlob.reference,
+          size: workspaceBlob.size_bytes,
+          historical: true,
+        };
+      });
+    }
     const state = await this.getManagedWorkCaptureState(row.thread_id);
     return this.database.transaction(() => {
       this.#requireOwner(session);
@@ -2767,6 +3028,7 @@ export class FactoryService {
           captureId: current.capture_id,
           reference,
           size: privateArtifact.size_bytes,
+          historical: false,
         };
       }
       const workspaceBlob = this.database.all<{
@@ -2783,6 +3045,7 @@ export class FactoryService {
         captureId: current.capture_id,
         reference,
         size: workspaceBlob.size_bytes,
+        historical: false,
       };
     });
   }
@@ -2960,25 +3223,40 @@ export class FactoryService {
     );
   }
 
-  getAuthorizedWorkspaceSnapshotBlobReferences(
+  getAuthorizedWorkspaceSnapshotBlob(
     session: FactorySession,
-    captureId: string,
-  ): string[] {
-    this.#requireOwner(session);
-    const row = this.#workspaceSnapshotByCapture(captureId);
+    requestId: string,
+    reference: string,
+  ) {
+    const status = this.getWorkspaceSnapshotStatus(session, requestId);
     if (
-      !row ||
-      row.actor_json !== encode(session.actor) ||
-      row.status !== "workspace-checkpoint-available"
+      status.status !== "workspace-checkpoint-available" ||
+      !status.manifestReference
     ) {
       throw notFound("Workspace checkpoint");
     }
-    return this.database
-      .all<{ reference: string }>(
-        "SELECT reference FROM workspace_snapshot_blobs WHERE capture_id = ? ORDER BY reference",
-        [captureId],
-      )
-      .map((item) => item.reference);
+    const blob = this.database.all<{
+      reference: string;
+      size_bytes: number;
+    }>(
+      "SELECT reference, size_bytes FROM workspace_snapshot_blobs WHERE capture_id = ? AND reference = ?",
+      [status.captureId, reference],
+    )[0];
+    if (!blob) throw notFound("Workspace checkpoint blob");
+    return {
+      requestId: status.requestId,
+      snapshotId: status.snapshotId,
+      captureRequestId: status.captureRequestId,
+      captureId: status.captureId,
+      threadId: status.threadId,
+      target: status.target,
+      ownershipGeneration: status.ownershipGeneration,
+      status: status.status,
+      manifestReference: status.manifestReference,
+      reference: blob.reference,
+      size: blob.size_bytes,
+      historical: Boolean(status.historical),
+    };
   }
 
   /** Destination-node claims are fixed to their provisioned workspace and never reassigned. */
@@ -3092,6 +3370,12 @@ export class FactoryService {
             input.previousReceiptSha256,
           ],
         );
+        this.database.exec(
+          `UPDATE workspace_relocation_activations
+           SET status = 'uncertain', updated_at = ?
+           WHERE relocation_id = ? AND status IN ('intent', 'preflight-claimed')`,
+          [input.reportedAt, relocationId],
+        );
         return;
       }
       if (current.status !== "claimed") {
@@ -3122,6 +3406,475 @@ export class FactoryService {
       relocationId,
       accepted: true,
       status: input.status,
+    });
+  }
+
+  /** Claim a persisted activation intent for fresh local preparation verification. */
+  async claimWorkspaceRelocationActivation(
+    session: FactorySession,
+    request: unknown,
+  ) {
+    const input =
+      workspaceRelocationActivationClaimRequestSchema.parse(request);
+    this.#requireNode(session, input.nodeId);
+    const activation = this.database.all<WorkspaceRelocationActivationRow>(
+      `SELECT * FROM workspace_relocation_activations
+       WHERE destination_node_id = ?
+         AND status IN ('intent', 'preflight-claimed', 'ownership-committed')
+       ORDER BY CASE status WHEN 'ownership-committed' THEN 0
+         WHEN 'preflight-claimed' THEN 1 ELSE 2 END,
+         intent_at, relocation_id LIMIT 1`,
+      [input.nodeId],
+    )[0];
+    if (!activation) return null;
+    const initial = this.#workspaceRelocationById(activation.relocation_id);
+    if (!initial) throw notFound("Workspace relocation activation");
+    const ownerSession = this.#workspaceRelocationOwnerSession(initial);
+    const node = this.database.all<NodeRow>(
+      "SELECT node_id, name, availability, last_seen_at FROM nodes WHERE node_id = ?",
+      [input.nodeId],
+    )[0];
+    if (!node || !this.#isNodeOnline(node)) return null;
+
+    if (activation.status === "ownership-committed") {
+      return this.database.transaction(() => {
+        this.#requireNode(session, input.nodeId);
+        const row = this.#workspaceRelocationById(activation.relocation_id);
+        const currentActivation = this.#workspaceRelocationActivationById(
+          activation.relocation_id,
+        );
+        if (!row || !currentActivation) return null;
+        const currentNode = this.database.all<NodeRow>(
+          "SELECT node_id, name, availability, last_seen_at FROM nodes WHERE node_id = ?",
+          [input.nodeId],
+        )[0];
+        if (!currentNode || !this.#isNodeOnline(currentNode)) return null;
+        this.#assertWorkspaceRelocationHistoricalAuthority(ownerSession, row);
+        if (currentActivation.status !== "ownership-committed") return null;
+        return workspaceRelocationActivationClaimSchema.parse({
+          phase: "activate",
+          command:
+            this.#workspaceRelocationActivationCommand(currentActivation),
+        });
+      });
+    }
+
+    const state = await this.getManagedWorkCaptureState(initial.thread_id);
+    return this.database.transaction(() => {
+      this.#requireNode(session, input.nodeId);
+      const row = this.#workspaceRelocationById(activation.relocation_id);
+      const currentActivation = this.#workspaceRelocationActivationById(
+        activation.relocation_id,
+      );
+      if (!row || !currentActivation) return null;
+      const currentNode = this.database.all<NodeRow>(
+        "SELECT node_id, name, availability, last_seen_at FROM nodes WHERE node_id = ?",
+        [input.nodeId],
+      )[0];
+      if (!currentNode || !this.#isNodeOnline(currentNode)) return null;
+      if (
+        row.status !== "prepared-inactive" ||
+        currentActivation.status === "uncertain" ||
+        currentActivation.status === "ownership-committed" ||
+        currentActivation.status === "activated"
+      ) {
+        return null;
+      }
+      this.#assertWorkspaceRelocationAuthority(ownerSession, row, state);
+      this.#assertWorkspaceRelocationActivationBinding(row, currentActivation);
+      if (currentActivation.status === "intent") {
+        this.database.exec(
+          `UPDATE workspace_relocation_activations
+           SET status = 'preflight-claimed', claimed_at = ?, updated_at = ?
+           WHERE relocation_id = ? AND status = 'intent'`,
+          [now(), now(), row.relocation_id],
+        );
+      }
+      const claimed = this.#workspaceRelocationActivationById(
+        row.relocation_id,
+      );
+      if (!claimed || claimed.status !== "preflight-claimed") return null;
+      return workspaceRelocationActivationClaimSchema.parse({
+        phase: "preflight",
+        assignment: this.#workspaceRelocationActivationPreflight(row, claimed),
+      });
+    });
+  }
+
+  /** Commit the scoped target only after B reports its freshly verified original receipt. */
+  async reportWorkspaceRelocationActivationReadiness(
+    session: FactorySession,
+    nodeId: string,
+    relocationId: string,
+    readiness: unknown,
+  ) {
+    const input = workspaceRelocationActivationReadinessSchema.parse(readiness);
+    this.#requireNode(session, nodeId);
+    const initial = this.#workspaceRelocationById(relocationId);
+    if (!initial) throw notFound("Workspace relocation activation");
+    if (initial.destination_node_id !== nodeId) throw forbidden();
+    const initialActivation =
+      this.#workspaceRelocationActivationById(relocationId);
+    if (!initialActivation)
+      throw notFound("Workspace relocation activation intent");
+    const ownerSession = this.#workspaceRelocationOwnerSession(initial);
+    const state = await this.getManagedWorkCaptureState(initial.thread_id);
+    const reportHash = await sha256(stableJson(input));
+    if (!initial.report_sha256 || !initial.receipt_sha256) {
+      throw conflict("workspace_relocation_prepared_receipt_missing");
+    }
+    const expectedReadinessReceiptSha256 = await sha256(
+      stableJson({
+        purpose: "workspace-relocation-activation-readiness-v1",
+        preflight: this.#workspaceRelocationActivationPreflight(
+          initial,
+          initialActivation,
+        ),
+        preparedReportSha256: initial.report_sha256,
+        preparedReceiptSha256: initial.receipt_sha256,
+        verifiedAt: input.reportedAt,
+      }),
+    );
+    if (input.readinessReceiptSha256 !== expectedReadinessReceiptSha256) {
+      throw conflict(
+        "workspace_relocation_activation_readiness_receipt_mismatch",
+      );
+    }
+    const initialDestinationGeneration =
+      initialActivation.destination_ownership_generation;
+    const nextGenerationBase = Math.max(
+      initial.ownership_generation,
+      initialDestinationGeneration,
+    );
+    if (nextGenerationBase >= Number.MAX_SAFE_INTEGER) {
+      throw conflict("workspace_ownership_generation_overflow");
+    }
+    const committedAt = now();
+    const candidateCommand = workspaceRelocationActivationCommandSchema.parse({
+      ...this.#workspaceRelocationActivationPreflight(
+        initial,
+        initialActivation,
+      ),
+      ownershipGeneration: nextGenerationBase + 1,
+      readinessReceiptSha256: input.readinessReceiptSha256,
+      committedAt,
+    });
+    const candidateCommandHash = await sha256(stableJson(candidateCommand));
+    return this.database.transaction(() => {
+      this.#requireNode(session, nodeId);
+      const row = this.#workspaceRelocationById(relocationId);
+      const activation = this.#workspaceRelocationActivationById(relocationId);
+      if (!row || !activation)
+        throw notFound("Workspace relocation activation");
+      if (row.destination_node_id !== nodeId) throw forbidden();
+      this.#assertWorkspaceRelocationActivationReadinessBinding(
+        row,
+        activation,
+        input,
+      );
+      if (
+        activation.status === "ownership-committed" &&
+        activation.readiness_sha256 === reportHash
+      ) {
+        this.#assertWorkspaceRelocationHistoricalAuthority(ownerSession, row);
+        return workspaceRelocationActivationReadinessResponseSchema.parse({
+          contractVersion: EXECUTION_CONTRACT_VERSION,
+          nodeId,
+          relocationId,
+          accepted: true,
+          command: this.#workspaceRelocationActivationCommand(activation),
+        });
+      }
+      if (
+        activation.status !== "preflight-claimed" ||
+        row.status !== "prepared-inactive" ||
+        row.receipt_sha256 !== activation.prepared_receipt_sha256
+      ) {
+        throw conflict("workspace_relocation_activation_not_preflighted");
+      }
+      this.#assertWorkspaceRelocationAuthority(ownerSession, row, state);
+      const destination = this.database.all<{
+        ownership_generation: number;
+        retired_at: string | null;
+      }>(
+        "SELECT ownership_generation, retired_at FROM workspaces WHERE workspace_id = ? AND node_id = ?",
+        [row.destination_workspace_id, row.destination_node_id],
+      )[0];
+      if (
+        !destination ||
+        destination.retired_at !== null ||
+        destination.ownership_generation !==
+          activation.destination_ownership_generation
+      ) {
+        throw conflict("workspace_relocation_destination_changed");
+      }
+      this.#assertWorkspaceRelocationActivationQuiescent(row);
+      const ownershipGeneration = candidateCommand.ownershipGeneration;
+      if (
+        ownershipGeneration !==
+        Math.max(
+          row.ownership_generation,
+          activation.destination_ownership_generation,
+        ) +
+          1
+      ) {
+        throw conflict("workspace_relocation_destination_changed");
+      }
+      const command = candidateCommand;
+      const commandJson = encode(command);
+      this.database.exec(
+        `UPDATE workspace_relocation_activations SET status = 'ownership-committed',
+          ownership_generation = ?, readiness_json = ?, readiness_sha256 = ?,
+          readiness_receipt_sha256 = ?, activation_command_json = ?,
+          activation_command_sha256 = ?, updated_at = ?
+         WHERE relocation_id = ? AND status = 'preflight-claimed'`,
+        [
+          ownershipGeneration,
+          encode(input),
+          reportHash,
+          input.readinessReceiptSha256,
+          commandJson,
+          candidateCommandHash,
+          committedAt,
+          relocationId,
+        ],
+      );
+      this.database.exec(
+        `UPDATE workspaces SET retired_at = ?
+         WHERE workspace_id = ? AND node_id = ? AND ownership_generation = ?
+           AND retired_at IS NULL`,
+        [
+          committedAt,
+          row.source_workspace_id,
+          row.source_node_id,
+          row.ownership_generation,
+        ],
+      );
+      this.database.exec(
+        `UPDATE workspaces SET ownership_generation = ?
+         WHERE workspace_id = ? AND node_id = ? AND ownership_generation = ?
+           AND retired_at IS NULL`,
+        [
+          ownershipGeneration,
+          row.destination_workspace_id,
+          row.destination_node_id,
+          activation.destination_ownership_generation,
+        ],
+      );
+      this.database.exec(
+        `UPDATE threads SET node_id = ?, workspace_id = ?, ownership_generation = ?
+         WHERE thread_id = ? AND node_id = ? AND workspace_id = ? AND ownership_generation = ?`,
+        [
+          row.destination_node_id,
+          row.destination_workspace_id,
+          ownershipGeneration,
+          row.thread_id,
+          row.source_node_id,
+          row.source_workspace_id,
+          row.ownership_generation,
+        ],
+      );
+      const committed = this.#workspaceRelocationActivationById(relocationId);
+      const moved = this.#workspaceRelocationById(relocationId);
+      if (
+        !committed ||
+        committed.status !== "ownership-committed" ||
+        !moved ||
+        moved.source_workspace_id === moved.destination_workspace_id
+      ) {
+        throw new Error(
+          "Workspace relocation ownership commit was not durable",
+        );
+      }
+      this.#assertWorkspaceRelocationHistoricalAuthority(ownerSession, moved);
+      return workspaceRelocationActivationReadinessResponseSchema.parse({
+        contractVersion: EXECUTION_CONTRACT_VERSION,
+        nodeId,
+        relocationId,
+        accepted: true,
+        command,
+      });
+    });
+  }
+
+  /** Finalize only a correlated destination activation receipt; source fences stay held. */
+  async reportWorkspaceRelocationActivation(
+    session: FactorySession,
+    nodeId: string,
+    relocationId: string,
+    report: unknown,
+  ) {
+    const input = workspaceRelocationActivationReportSchema.parse(report);
+    this.#requireNode(session, nodeId);
+    const initial = this.#workspaceRelocationById(relocationId);
+    if (!initial) throw notFound("Workspace relocation activation");
+    if (initial.destination_node_id !== nodeId) throw forbidden();
+    const ownerSession = this.#workspaceRelocationOwnerSession(initial);
+    const commandSha256 = await sha256(stableJson(input.command));
+    const expectedReceiptSha256 = await sha256(
+      stableJson(
+        input.status === "activated"
+          ? {
+              purpose: "workspace-relocation-activated-v1",
+              relocationId: input.command.relocationId,
+              commandSha256,
+              readinessReceiptSha256: input.command.readinessReceiptSha256,
+              preparedReceiptSha256: input.command.preparedReceiptSha256,
+              ownershipGeneration: input.command.ownershipGeneration,
+              activatedAt: input.reportedAt,
+            }
+          : {
+              purpose: "workspace-relocation-activation-uncertain-v1",
+              relocationId: input.command.relocationId,
+              commandSha256,
+              preparedReceiptSha256: input.command.preparedReceiptSha256,
+              readinessReceiptSha256: input.command.readinessReceiptSha256,
+              errorCode: input.errorCode,
+              reportedAt: input.reportedAt,
+            },
+      ),
+    );
+    const reportReceiptSha256 =
+      input.status === "activated"
+        ? input.activationReceiptSha256
+        : input.uncertaintyReceiptSha256;
+    if (reportReceiptSha256 !== expectedReceiptSha256) {
+      throw conflict("workspace_relocation_activation_receipt_mismatch");
+    }
+    const reportJson = encode(input);
+    return this.database.transaction(() => {
+      this.#requireNode(session, nodeId);
+      const row = this.#workspaceRelocationById(relocationId);
+      const activation = this.#workspaceRelocationActivationById(relocationId);
+      if (!row || !activation)
+        throw notFound("Workspace relocation activation");
+      if (row.destination_node_id !== nodeId) throw forbidden();
+      this.#assertWorkspaceRelocationActivationCommand(
+        row,
+        activation,
+        input.command,
+      );
+      if (activation.status === "activated") {
+        if (activation.activation_receipt_json !== reportJson) {
+          throw conflict("workspace_relocation_activation_report_conflict");
+        }
+        return workspaceRelocationActivationReportResponseSchema.parse({
+          contractVersion: EXECUTION_CONTRACT_VERSION,
+          nodeId,
+          relocationId,
+          accepted: true,
+          status: "activated",
+        });
+      }
+      if (
+        activation.status === "uncertain" &&
+        activation.ownership_generation !== null &&
+        input.status === "uncertain" &&
+        activation.activation_receipt_json === reportJson
+      ) {
+        return workspaceRelocationActivationReportResponseSchema.parse({
+          contractVersion: EXECUTION_CONTRACT_VERSION,
+          nodeId,
+          relocationId,
+          accepted: true,
+          status: "uncertain",
+        });
+      }
+      if (activation.status !== "ownership-committed") {
+        throw conflict("workspace_relocation_activation_not_committed");
+      }
+      this.#assertWorkspaceRelocationHistoricalAuthority(ownerSession, row);
+      if (input.status === "uncertain") {
+        this.database.exec(
+          `UPDATE workspace_relocation_activations SET status = 'uncertain',
+            activation_receipt_json = ?, uncertainty_receipt_sha256 = ?, updated_at = ?
+           WHERE relocation_id = ? AND status = 'ownership-committed'`,
+          [
+            reportJson,
+            input.uncertaintyReceiptSha256,
+            input.reportedAt,
+            relocationId,
+          ],
+        );
+        return workspaceRelocationActivationReportResponseSchema.parse({
+          contractVersion: EXECUTION_CONTRACT_VERSION,
+          nodeId,
+          relocationId,
+          accepted: true,
+          status: "uncertain",
+        });
+      }
+      this.#assertWorkspaceRelocationFinalizationQuiescent(row);
+      const target = this.database.all<{
+        node_id: string;
+        workspace_id: string;
+        ownership_generation: number;
+        retired_at: string | null;
+      }>(
+        `SELECT thread.node_id, thread.workspace_id, thread.ownership_generation,
+          source.retired_at
+         FROM threads thread JOIN workspaces source
+           ON source.workspace_id = ?
+         WHERE thread.thread_id = ?`,
+        [row.source_workspace_id, row.thread_id],
+      )[0];
+      const destination = this.database.all<{
+        ownership_generation: number;
+        retired_at: string | null;
+      }>(
+        "SELECT ownership_generation, retired_at FROM workspaces WHERE workspace_id = ? AND node_id = ?",
+        [row.destination_workspace_id, row.destination_node_id],
+      )[0];
+      if (
+        !target ||
+        target.node_id !== row.destination_node_id ||
+        target.workspace_id !== row.destination_workspace_id ||
+        target.ownership_generation !== activation.ownership_generation ||
+        target.retired_at === null ||
+        !destination ||
+        destination.retired_at !== null ||
+        destination.ownership_generation !== activation.ownership_generation
+      ) {
+        throw conflict("workspace_relocation_activation_authority_changed");
+      }
+      this.database.exec(
+        `INSERT INTO execution_node_workspaces(
+          node_id, workspace_id, ownership_generation, state
+         ) VALUES (?, ?, ?, 'active')
+         ON CONFLICT(node_id, workspace_id) DO UPDATE SET
+           ownership_generation = excluded.ownership_generation,
+           state = excluded.state`,
+        [nodeId, row.destination_workspace_id, activation.ownership_generation],
+      );
+      this.database.exec(
+        `UPDATE workspace_relocation_activations SET status = 'activated',
+          activation_receipt_json = ?, activation_receipt_sha256 = ?, updated_at = ?
+         WHERE relocation_id = ? AND status = 'ownership-committed'`,
+        [
+          reportJson,
+          input.activationReceiptSha256,
+          input.reportedAt,
+          relocationId,
+        ],
+      );
+      this.database.exec(
+        `DELETE FROM managed_work_captures
+         WHERE capture_id = ? AND thread_id = ? AND workspace_id = ?`,
+        [row.capture_id, row.thread_id, row.source_workspace_id],
+      );
+      const finalized = this.#workspaceRelocationActivationById(relocationId);
+      if (!finalized || finalized.status !== "activated") {
+        throw new Error(
+          "Workspace relocation activation finalization was lost",
+        );
+      }
+      return workspaceRelocationActivationReportResponseSchema.parse({
+        contractVersion: EXECUTION_CONTRACT_VERSION,
+        nodeId,
+        relocationId,
+        accepted: true,
+        status: "activated",
+      });
     });
   }
 
@@ -3180,7 +3933,16 @@ export class FactoryService {
     const row = this.#captureControlByRequest(requestId);
     if (!row) throw notFound("Capture control request");
     if (row.actor_json !== encode(session.actor)) throw forbidden();
-    return this.#captureControlStatus(row);
+    const historical = this.#workspaceRelocationHistoricalForCapture(
+      row.capture_id,
+    );
+    if (historical) {
+      this.#assertWorkspaceRelocationHistoricalAuthority(
+        session,
+        historical.row,
+      );
+    }
+    return this.#captureControlStatus(row, Boolean(historical));
   }
 
   /** Authenticated node claim for capture controls; it never exposes effect jobs. */
@@ -3650,19 +4412,34 @@ export class FactoryService {
       "SELECT capture_id, workspace_id FROM managed_work_captures WHERE thread_id = ?",
       [threadId],
     )[0];
-    if (!capture || capture.capture_id !== captureId) {
+    if (capture?.capture_id === captureId) {
+      const rows = this.database.all<ReceiptRow>(
+        "SELECT request_id, actor_json, thread_id, payload_hash, job_id, accepted_at FROM command_receipts WHERE thread_id = ? ORDER BY accepted_at, request_id",
+        [threadId],
+      );
+      return {
+        threadId,
+        workspaceId: capture.workspace_id,
+        commands: rows.map((row) => this.#receiptByJob(row.job_id)),
+      };
+    }
+    const historical = this.#workspaceRelocationHistoricalForCapture(captureId);
+    if (!historical || historical.row.thread_id !== threadId) {
       throw conflict(
         "capture_lock_missing",
-        "Managed-work provenance can be read only under its active capture lock",
+        "Managed-work provenance is available only under its capture lock or as an immutable relocation record",
       );
     }
+    this.#assertWorkspaceRelocationHistoricalAuthority(session, historical.row);
     const rows = this.database.all<ReceiptRow>(
       "SELECT request_id, actor_json, thread_id, payload_hash, job_id, accepted_at FROM command_receipts WHERE thread_id = ? ORDER BY accepted_at, request_id",
       [threadId],
     );
     return {
       threadId,
-      workspaceId: capture.workspace_id,
+      workspaceId: historical.row.source_workspace_id,
+      ownershipGeneration: historical.row.ownership_generation,
+      historical: true,
       commands: rows.map((row) => this.#receiptByJob(row.job_id)),
     };
   }
@@ -3841,7 +4618,10 @@ export class FactoryService {
     const timestamp = now();
     this.database.transaction(() => {
       this.#requireNode(session, input.nodeId);
-      this.#validateReportedWorkspaces(input.nodeId, input.workspaces);
+      const workspaces = this.#validateReportedWorkspaces(
+        input.nodeId,
+        input.workspaces,
+      );
       const node = this.database.all<NodeRow>(
         "SELECT node_id, name, availability, last_seen_at FROM nodes WHERE node_id = ?",
         [input.nodeId],
@@ -3860,7 +4640,7 @@ export class FactoryService {
           timestamp,
         ],
       );
-      this.#storeReportedWorkspaces(input.nodeId, input.workspaces);
+      this.#storeReportedWorkspaces(input.nodeId, workspaces);
       this.database.exec(
         "UPDATE nodes SET availability = 'online', last_seen_at = ? WHERE node_id = ?",
         [timestamp, input.nodeId],
@@ -3907,8 +4687,11 @@ export class FactoryService {
           "Register before sending heartbeats",
         );
       }
-      this.#validateReportedWorkspaces(input.nodeId, input.workspaces);
-      this.#storeReportedWorkspaces(input.nodeId, input.workspaces);
+      const workspaces = this.#validateReportedWorkspaces(
+        input.nodeId,
+        input.workspaces,
+      );
+      this.#storeReportedWorkspaces(input.nodeId, workspaces);
       this.database.exec(
         "UPDATE execution_node_state SET capabilities_json = ?, last_seen_at = ? WHERE node_id = ?",
         [encode(input.capabilities), timestamp, input.nodeId],
@@ -4693,15 +5476,18 @@ export class FactoryService {
   #validateReportedWorkspaces(
     nodeId: string,
     reports: readonly ExecutionWorkspaceReport[],
-  ): void {
+  ): ExecutionWorkspaceReport[] {
     const reported = new Set<string>();
+    const accepted: ExecutionWorkspaceReport[] = [];
     for (const report of reports) {
       if (reported.has(report.workspaceId)) {
         throw new FactoryError(400, "duplicate_workspace_report");
       }
       reported.add(report.workspaceId);
-      const workspace = this.database.all<WorkspaceAuthorityRow>(
-        "SELECT workspace_id, node_id, name, ownership_generation FROM workspaces WHERE workspace_id = ?",
+      const workspace = this.database.all<
+        WorkspaceAuthorityRow & { retired_at: string | null }
+      >(
+        "SELECT workspace_id, node_id, name, ownership_generation, retired_at FROM workspaces WHERE workspace_id = ?",
         [report.workspaceId],
       )[0];
       if (!workspace || workspace.node_id !== nodeId) {
@@ -4711,16 +5497,44 @@ export class FactoryService {
           "The owner has not assigned this workspace to the authenticated node",
         );
       }
-      if (
-        report.ownershipGeneration !==
-        this.#workspaceOwnershipGeneration(nodeId, report.workspaceId)
-      ) {
-        throw conflict(
-          "stale_ownership_generation",
-          "Workspace report does not match its provisioned workspace ownership generation",
-        );
+      const authorityGeneration = workspace.ownership_generation;
+      if (workspace.retired_at !== null) {
+        if (report.ownershipGeneration !== authorityGeneration) {
+          throw conflict(
+            "stale_ownership_generation",
+            "Retired workspace report does not match its original assignment",
+          );
+        }
+        accepted.push({ ...report, state: "fenced" });
+        continue;
       }
+      if (report.ownershipGeneration !== authorityGeneration) {
+        const pending = this.database.all<{
+          destination_ownership_generation: number;
+        }>(
+          `SELECT destination_ownership_generation
+           FROM workspace_relocation_activations
+           WHERE status IN ('ownership-committed', 'uncertain')
+             AND ownership_generation IS NOT NULL
+             AND destination_node_id = ? AND destination_workspace_id = ?`,
+          [nodeId, report.workspaceId],
+        )[0];
+        if (
+          !pending ||
+          report.ownershipGeneration !==
+            pending.destination_ownership_generation
+        ) {
+          throw conflict(
+            "stale_ownership_generation",
+            "Workspace report does not match its provisioned workspace ownership generation",
+          );
+        }
+        accepted.push({ ...report, state: "fenced" });
+        continue;
+      }
+      accepted.push(report);
     }
+    return accepted;
   }
 
   #storeReportedWorkspaces(
@@ -5088,10 +5902,115 @@ export class FactoryService {
     return { credentialId: credential.credential_id, actor };
   }
 
+  #managedWorkCheckpointPlacementKey(
+    nodeId: string,
+    workspaceId: string,
+    ownershipGeneration: number,
+  ): string {
+    return stableJson([nodeId, workspaceId, ownershipGeneration]);
+  }
+
+  #managedWorkCheckpointAuthorityLineage(
+    threadId: string,
+    binding: ManagedWorkCheckpointBindingRow,
+  ): Map<string, ManagedWorkCheckpointExecutionPlacement> {
+    const thread = this.#captureThread(threadId);
+    if (
+      thread.project_id !== binding.project_id ||
+      thread.node_id !== binding.node_id ||
+      thread.workspace_id !== binding.workspace_id ||
+      thread.ownership_generation !== binding.ownership_generation
+    ) {
+      throw checkpointConflict("managed_work_checkpoint_evidence_limit");
+    }
+    const placements = new Map<
+      string,
+      ManagedWorkCheckpointExecutionPlacement
+    >();
+    let cursor = {
+      nodeId: binding.node_id,
+      workspaceId: binding.workspace_id,
+      ownershipGeneration: binding.ownership_generation,
+    };
+    const visited = new Set<string>();
+    const relocationCount = Number(
+      this.database.all<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM workspace_relocations WHERE thread_id = ?",
+        [threadId],
+      )[0]?.count ?? 0,
+    );
+    for (let hop = 0; hop <= relocationCount; hop += 1) {
+      const cursorKey = this.#managedWorkCheckpointPlacementKey(
+        cursor.nodeId,
+        cursor.workspaceId,
+        cursor.ownershipGeneration,
+      );
+      if (visited.has(cursorKey)) {
+        throw checkpointConflict("managed_work_checkpoint_evidence_limit");
+      }
+      visited.add(cursorKey);
+      placements.set(cursorKey, { ...cursor });
+      const predecessors = this.database.all<{ relocation_id: string }>(
+        `SELECT r.relocation_id
+         FROM workspace_relocations r
+         JOIN workspace_relocation_activations a
+           ON a.relocation_id = r.relocation_id
+         WHERE r.thread_id = ? AND r.destination_node_id = ?
+           AND r.destination_workspace_id = ?
+           AND a.ownership_generation = ? AND a.status = 'activated'`,
+        [
+          threadId,
+          cursor.nodeId,
+          cursor.workspaceId,
+          cursor.ownershipGeneration,
+        ],
+      );
+      if (predecessors.length === 0) return placements;
+      if (predecessors.length !== 1) {
+        throw checkpointConflict("managed_work_checkpoint_evidence_limit");
+      }
+      const predecessor = this.#workspaceRelocationById(
+        predecessors[0]!.relocation_id,
+      );
+      const activation = this.#workspaceRelocationActivationById(
+        predecessors[0]!.relocation_id,
+      );
+      if (!predecessor || !activation) {
+        throw checkpointConflict("managed_work_checkpoint_evidence_limit");
+      }
+      this.#assertWorkspaceRelocationHistoricalAuthorityBindings(
+        predecessor,
+        activation,
+      );
+      if (
+        activation.ownership_generation === null ||
+        activation.ownership_generation !== cursor.ownershipGeneration ||
+        predecessor.destination_node_id !== cursor.nodeId ||
+        predecessor.destination_workspace_id !== cursor.workspaceId
+      ) {
+        throw checkpointConflict("managed_work_checkpoint_evidence_limit");
+      }
+      cursor = {
+        nodeId: predecessor.source_node_id,
+        workspaceId: predecessor.source_workspace_id,
+        ownershipGeneration: predecessor.ownership_generation,
+      };
+    }
+    throw checkpointConflict("managed_work_checkpoint_evidence_limit");
+  }
+
   #boundedManagedWorkCheckpointCommands(
     threadId: string,
     binding: ManagedWorkCheckpointBindingRow,
-  ): { commands: FactoryProvenanceCommand[]; serializedBytes: number } {
+  ): {
+    commands: FactoryProvenanceCommand[];
+    serializedBytes: number;
+    authorizedPlacements: ManagedWorkCheckpointExecutionPlacement[];
+  } {
+    const authorizedPlacements = this.#managedWorkCheckpointAuthorityLineage(
+      threadId,
+      binding,
+    );
     const maxRecords = 100_000;
     const maxEvidenceBytes = 32 * 1024 * 1024;
     const totals = this.database.all<{
@@ -5161,8 +6080,7 @@ export class FactoryService {
          (SELECT COALESCE(SUM(CASE WHEN dispatch_status NOT IN ('completed', 'failed')
               THEN 1 ELSE 0 END), 0) FROM command_projection) AS command_unsettled,
          (SELECT COALESCE(SUM(CASE WHEN payload_hash <> dispatch_payload_hash
-              OR project_id <> ? OR thread_id <> ? OR node_id <> ? OR workspace_id <> ?
-              OR ownership_generation <> ? THEN 1 ELSE 0 END), 0)
+              OR project_id <> ? OR thread_id <> ? THEN 1 ELSE 0 END), 0)
           FROM command_projection) AS command_binding_mismatches,
          (SELECT COUNT(*) FROM effect_projection) AS effect_count,
          (SELECT COALESCE(SUM(length(CAST(projected_json AS BLOB))), 0)
@@ -5186,9 +6104,6 @@ export class FactoryService {
         threadId,
         binding.project_id,
         binding.thread_id,
-        binding.node_id,
-        binding.workspace_id,
-        binding.ownership_generation,
         ...FACTORY_PROVENANCE_EXECUTION_ERROR_CODES,
       ],
     )[0];
@@ -5275,18 +6190,33 @@ export class FactoryService {
       throw checkpointConflict("managed_work_checkpoint_evidence_limit");
     }
 
+    const commandPlacements = new Map<string, string>();
+    for (const row of commandRows) {
+      commandPlacements.set(
+        row.request_id,
+        this.#managedWorkCheckpointPlacementKey(
+          row.node_id,
+          row.workspace_id,
+          row.ownership_generation,
+        ),
+      );
+    }
     const effectsByRequest = new Map<
       string,
       FactoryProvenanceExecutionEffect[]
     >();
     for (const row of effectRows) {
+      const effectPlacement = this.#managedWorkCheckpointPlacementKey(
+        row.node_id,
+        row.workspace_id,
+        row.ownership_generation,
+      );
       if (
         !row.request_id ||
         (row.status !== "completed" && row.status !== "failed") ||
         !row.finished_at ||
-        row.node_id !== binding.node_id ||
-        row.workspace_id !== binding.workspace_id ||
-        row.ownership_generation !== binding.ownership_generation
+        !authorizedPlacements.has(effectPlacement) ||
+        commandPlacements.get(row.request_id) !== effectPlacement
       ) {
         throw checkpointConflict("managed_work_checkpoint_unsettled_effect");
       }
@@ -5312,12 +6242,15 @@ export class FactoryService {
     const encoder = new TextEncoder();
     let serializedBytes = 2;
     for (const row of commandRows) {
+      const commandPlacement = this.#managedWorkCheckpointPlacementKey(
+        row.node_id,
+        row.workspace_id,
+        row.ownership_generation,
+      );
       if (
         row.thread_id !== binding.thread_id ||
         row.project_id !== binding.project_id ||
-        row.node_id !== binding.node_id ||
-        row.workspace_id !== binding.workspace_id ||
-        row.ownership_generation !== binding.ownership_generation ||
+        !authorizedPlacements.has(commandPlacement) ||
         row.payload_hash !== row.dispatch_payload_hash ||
         (row.dispatch_status !== "completed" &&
           row.dispatch_status !== "failed")
@@ -5344,7 +6277,11 @@ export class FactoryService {
       }
       commands.push(command);
     }
-    return { commands, serializedBytes };
+    return {
+      commands,
+      serializedBytes,
+      authorizedPlacements: [...authorizedPlacements.values()],
+    };
   }
 
   #managedWorkCheckpointByRequest(
@@ -5374,6 +6311,577 @@ export class FactoryService {
     )[0];
   }
 
+  #workspaceRelocationActivationById(
+    relocationId: string,
+  ): WorkspaceRelocationActivationRow | undefined {
+    return this.database.all<WorkspaceRelocationActivationRow>(
+      "SELECT * FROM workspace_relocation_activations WHERE relocation_id = ?",
+      [relocationId],
+    )[0];
+  }
+
+  #workspaceRelocationActivationPreflight(
+    row: WorkspaceRelocationRow,
+    activation: WorkspaceRelocationActivationRow,
+  ): WorkspaceRelocationActivationPreflight {
+    if (!row.receipt_sha256) {
+      throw conflict("workspace_relocation_prepared_receipt_missing");
+    }
+    const capture = this.#captureControlByRequest(row.capture_request_id);
+    if (
+      !capture?.report_sha256 ||
+      !/^[a-f0-9]{64}$/.test(capture.report_sha256)
+    ) {
+      throw conflict("workspace_relocation_source_proof_missing");
+    }
+    return workspaceRelocationActivationPreflightSchema.parse({
+      contractVersion: EXECUTION_CONTRACT_VERSION,
+      relocationId: row.relocation_id,
+      requestId: row.request_id,
+      checkpointRequestId: row.checkpoint_request_id,
+      captureRequestId: row.capture_request_id,
+      captureId: row.capture_id,
+      workspaceSnapshotRequestId: row.workspace_snapshot_request_id,
+      snapshotId: row.snapshot_id,
+      threadId: row.thread_id,
+      source: {
+        nodeId: row.source_node_id,
+        workspaceId: row.source_workspace_id,
+      },
+      destination: {
+        nodeId: row.destination_node_id,
+        workspaceId: row.destination_workspace_id,
+      },
+      sourceOwnershipGeneration: row.ownership_generation,
+      destinationOwnershipGeneration:
+        activation.destination_ownership_generation,
+      manifestReference: row.manifest_reference,
+      sourceProofSha256: capture.report_sha256,
+      preparedReceiptSha256: row.receipt_sha256,
+    });
+  }
+
+  #workspaceRelocationActivationCommand(
+    activation: WorkspaceRelocationActivationRow,
+  ): WorkspaceRelocationActivationCommand {
+    if (!activation.activation_command_json) {
+      throw conflict("workspace_relocation_activation_command_missing");
+    }
+    return workspaceRelocationActivationCommandSchema.parse(
+      JSON.parse(activation.activation_command_json),
+    );
+  }
+
+  #assertWorkspaceRelocationActivationBinding(
+    row: WorkspaceRelocationRow,
+    activation: WorkspaceRelocationActivationRow,
+  ): void {
+    const preflight = this.#workspaceRelocationActivationPreflight(
+      row,
+      activation,
+    );
+    if (
+      activation.relocation_id !== row.relocation_id ||
+      activation.destination_node_id !== row.destination_node_id ||
+      activation.destination_workspace_id !== row.destination_workspace_id ||
+      activation.prepared_receipt_sha256 !== row.receipt_sha256 ||
+      (row.destination_ownership_generation !== null &&
+        activation.destination_ownership_generation !==
+          row.destination_ownership_generation) ||
+      row.status !== "prepared-inactive" ||
+      preflight.preparedReceiptSha256 !== row.receipt_sha256
+    ) {
+      throw conflict("workspace_relocation_activation_binding_mismatch");
+    }
+  }
+
+  #assertWorkspaceRelocationActivationReadinessBinding(
+    row: WorkspaceRelocationRow,
+    activation: WorkspaceRelocationActivationRow,
+    readiness: WorkspaceRelocationActivationReadiness,
+  ): void {
+    const {
+      readinessReceiptSha256: _receipt,
+      reportedAt: _reportedAt,
+      ...binding
+    } = readiness;
+    this.#assertWorkspaceRelocationActivationBinding(row, activation);
+    if (
+      stableJson(binding) !==
+      stableJson(this.#workspaceRelocationActivationPreflight(row, activation))
+    ) {
+      throw conflict("workspace_relocation_activation_readiness_mismatch");
+    }
+  }
+
+  #assertWorkspaceRelocationActivationCommand(
+    row: WorkspaceRelocationRow,
+    activation: WorkspaceRelocationActivationRow,
+    command: WorkspaceRelocationActivationCommand,
+  ): void {
+    const stored = this.#workspaceRelocationActivationCommand(activation);
+    if (
+      activation.status !== "ownership-committed" &&
+      activation.status !== "activated" &&
+      !(
+        activation.status === "uncertain" &&
+        activation.ownership_generation !== null
+      )
+    ) {
+      throw conflict("workspace_relocation_activation_not_committed");
+    }
+    this.#assertWorkspaceRelocationHistoricalAuthorityBindings(row, activation);
+    if (
+      stableJson(command) !== stableJson(stored) ||
+      command.destination.nodeId !== row.destination_node_id ||
+      command.destination.workspaceId !== row.destination_workspace_id
+    ) {
+      throw conflict("workspace_relocation_activation_command_mismatch");
+    }
+  }
+
+  #assertWorkspaceRelocationActivationQuiescent(
+    row: WorkspaceRelocationRow,
+  ): void {
+    const capture = this.database.all<{ capture_id: string }>(
+      `SELECT capture_id FROM managed_work_captures
+       WHERE capture_id = ? AND thread_id = ? AND workspace_id = ?`,
+      [row.capture_id, row.thread_id, row.source_workspace_id],
+    )[0];
+    const permit = this.database.all<{ permit_id: string }>(
+      "SELECT permit_id FROM managed_work_runtime_permits WHERE thread_id = ? AND released_at IS NULL LIMIT 1",
+      [row.thread_id],
+    )[0];
+    const input = this.database.all<{ status: string }>(
+      "SELECT status FROM dispatch_intents WHERE thread_id = ? AND status IN ('queued', 'unavailable', 'running', 'dispatched', 'uncertain') LIMIT 1",
+      [row.thread_id],
+    )[0];
+    const effect = this.database.all<{ status: string }>(
+      "SELECT status FROM execution_jobs WHERE workspace_id IN (?, ?) AND status IN ('queued', 'claimed', 'uncertain') LIMIT 1",
+      [row.source_workspace_id, row.destination_workspace_id],
+    )[0];
+    if (!capture || permit || input || effect) {
+      throw conflict("workspace_relocation_not_quiescent");
+    }
+  }
+
+  #assertWorkspaceRelocationFinalizationQuiescent(
+    row: WorkspaceRelocationRow,
+  ): void {
+    this.#assertWorkspaceRelocationActivationQuiescent(row);
+    const destinationInput = this.database.all<{ status: string }>(
+      "SELECT status FROM dispatch_intents WHERE thread_id = ? AND status IN ('queued', 'unavailable', 'running', 'dispatched', 'uncertain') LIMIT 1",
+      [row.thread_id],
+    )[0];
+    if (destinationInput) throw conflict("workspace_relocation_not_quiescent");
+  }
+
+  #workspaceRelocationHistoricalForCapture(captureId: string):
+    | {
+        row: WorkspaceRelocationRow;
+        activation: WorkspaceRelocationActivationRow;
+      }
+    | undefined {
+    const row = this.database.all<WorkspaceRelocationRow>(
+      "SELECT * FROM workspace_relocations WHERE capture_id = ?",
+      [captureId],
+    )[0];
+    if (!row) return undefined;
+    const activation = this.#workspaceRelocationActivationById(
+      row.relocation_id,
+    );
+    if (
+      !activation ||
+      (!["ownership-committed", "activated"].includes(activation.status) &&
+        !(
+          activation.status === "uncertain" &&
+          activation.ownership_generation !== null
+        ))
+    ) {
+      return undefined;
+    }
+    return { row, activation };
+  }
+
+  #assertWorkspaceRelocationHistoricalAuthority(
+    session: FactorySession,
+    row: WorkspaceRelocationRow,
+  ): void {
+    this.#requireOwner(session);
+    if (row.actor_json !== encode(session.actor)) throw forbidden();
+    const activation = this.#workspaceRelocationActivationById(
+      row.relocation_id,
+    );
+    if (!activation) throw conflict("workspace_relocation_activation_missing");
+    this.#assertWorkspaceRelocationHistoricalAuthorityBindings(row, activation);
+  }
+
+  #assertWorkspaceRelocationHistoricalCurrentPlacement(
+    row: WorkspaceRelocationRow,
+    activation: WorkspaceRelocationActivationRow,
+    destination: {
+      retired_at: string | null;
+      ownership_generation: number;
+      node_id: string;
+    },
+    thread: ThreadRow,
+  ): void {
+    const unavailable = () =>
+      conflict("workspace_relocation_historical_evidence_unavailable");
+    const generation = activation.ownership_generation;
+    if (generation === null || thread.project_id !== row.project_id) {
+      throw unavailable();
+    }
+    const firstPlacement = {
+      nodeId: row.destination_node_id,
+      workspaceId: row.destination_workspace_id,
+      ownershipGeneration: generation,
+    };
+    if (activation.status !== "activated") {
+      if (
+        destination.retired_at !== null ||
+        thread.node_id !== firstPlacement.nodeId ||
+        thread.workspace_id !== firstPlacement.workspaceId ||
+        thread.ownership_generation !== firstPlacement.ownershipGeneration
+      ) {
+        throw unavailable();
+      }
+      return;
+    }
+
+    let cursor = firstPlacement;
+    const visited = new Set<string>();
+    const relocationCount = Number(
+      this.database.all<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM workspace_relocations WHERE thread_id = ?",
+        [row.thread_id],
+      )[0]?.count ?? 0,
+    );
+    for (let hop = 0; hop <= relocationCount; hop += 1) {
+      const placementKey = this.#managedWorkCheckpointPlacementKey(
+        cursor.nodeId,
+        cursor.workspaceId,
+        cursor.ownershipGeneration,
+      );
+      if (visited.has(placementKey)) throw unavailable();
+      visited.add(placementKey);
+
+      if (
+        thread.node_id === cursor.nodeId &&
+        thread.workspace_id === cursor.workspaceId &&
+        thread.ownership_generation === cursor.ownershipGeneration
+      ) {
+        const currentWorkspace = this.database.all<{
+          node_id: string;
+          ownership_generation: number;
+          retired_at: string | null;
+        }>(
+          "SELECT node_id, ownership_generation, retired_at FROM workspaces WHERE workspace_id = ?",
+          [cursor.workspaceId],
+        )[0];
+        if (
+          currentWorkspace?.node_id === cursor.nodeId &&
+          currentWorkspace.ownership_generation ===
+            cursor.ownershipGeneration &&
+          currentWorkspace.retired_at === null
+        ) {
+          return;
+        }
+        throw unavailable();
+      }
+
+      const successors = this.database.all<{ relocation_id: string }>(
+        `SELECT r.relocation_id
+         FROM workspace_relocations r
+         JOIN workspace_relocation_activations a
+           ON a.relocation_id = r.relocation_id
+         WHERE r.thread_id = ? AND r.source_node_id = ?
+           AND r.source_workspace_id = ? AND r.ownership_generation = ?
+           AND a.status = 'activated'`,
+        [
+          row.thread_id,
+          cursor.nodeId,
+          cursor.workspaceId,
+          cursor.ownershipGeneration,
+        ],
+      );
+      if (successors.length !== 1) throw unavailable();
+      const successor = this.#workspaceRelocationById(
+        successors[0]!.relocation_id,
+      );
+      const successorActivation = this.#workspaceRelocationActivationById(
+        successors[0]!.relocation_id,
+      );
+      if (!successor || !successorActivation) throw unavailable();
+      this.#assertWorkspaceRelocationHistoricalAuthorityBindings(
+        successor,
+        successorActivation,
+        false,
+      );
+      const nextGeneration = successorActivation.ownership_generation;
+      if (
+        successor.thread_id !== row.thread_id ||
+        successor.project_id !== row.project_id ||
+        successor.source_node_id !== cursor.nodeId ||
+        successor.source_workspace_id !== cursor.workspaceId ||
+        successor.ownership_generation !== cursor.ownershipGeneration ||
+        successorActivation.status !== "activated" ||
+        successorActivation.destination_ownership_generation !==
+          successor.destination_ownership_generation ||
+        successor.destination_ownership_generation === null ||
+        !Number.isSafeInteger(nextGeneration) ||
+        nextGeneration !==
+          Math.max(
+            successor.ownership_generation,
+            successor.destination_ownership_generation,
+          ) +
+            1
+      ) {
+        throw unavailable();
+      }
+      cursor = {
+        nodeId: successor.destination_node_id,
+        workspaceId: successor.destination_workspace_id,
+        ownershipGeneration: nextGeneration!,
+      };
+    }
+    throw unavailable();
+  }
+
+  #assertWorkspaceRelocationHistoricalAuthorityBindings(
+    row: WorkspaceRelocationRow,
+    activation: WorkspaceRelocationActivationRow,
+    requireCurrentPlacement = true,
+  ): void {
+    if (
+      !["ownership-committed", "activated"].includes(activation.status) &&
+      !(
+        activation.status === "uncertain" &&
+        activation.ownership_generation !== null
+      )
+    ) {
+      throw conflict("workspace_relocation_not_historical");
+    }
+    const checkpoint = this.#managedWorkCheckpointByRequest(
+      row.checkpoint_request_id,
+    );
+    const snapshot = this.#workspaceSnapshotByRequest(
+      row.workspace_snapshot_request_id,
+    );
+    const capture = this.#captureControlByRequest(row.capture_request_id);
+    const source = this.database.all<{
+      retired_at: string | null;
+      ownership_generation: number;
+      node_id: string;
+    }>(
+      "SELECT retired_at, ownership_generation, node_id FROM workspaces WHERE workspace_id = ?",
+      [row.source_workspace_id],
+    )[0];
+    const destination = this.database.all<{
+      retired_at: string | null;
+      ownership_generation: number;
+      node_id: string;
+    }>(
+      "SELECT retired_at, ownership_generation, node_id FROM workspaces WHERE workspace_id = ?",
+      [row.destination_workspace_id],
+    )[0];
+    const thread = this.#captureThread(row.thread_id);
+    let captureReport: ExecutionCaptureControlReport | undefined;
+    let captureControl: ExecutionCaptureControl | undefined;
+    let activationCommand: WorkspaceRelocationActivationCommand | undefined;
+    let activationReport:
+      | ReturnType<typeof workspaceRelocationActivationReportSchema.parse>
+      | undefined;
+    let readiness: WorkspaceRelocationActivationReadiness | undefined;
+    try {
+      captureReport = capture?.report_json
+        ? executionCaptureControlReportSchema.parse(
+            JSON.parse(capture.report_json),
+          )
+        : undefined;
+      captureControl = capture?.payload_json
+        ? executionCaptureControlSchema.parse(JSON.parse(capture.payload_json))
+        : undefined;
+      activationCommand = activation.activation_command_json
+        ? workspaceRelocationActivationCommandSchema.parse(
+            JSON.parse(activation.activation_command_json),
+          )
+        : undefined;
+      activationReport = activation.activation_receipt_json
+        ? workspaceRelocationActivationReportSchema.parse(
+            JSON.parse(activation.activation_receipt_json),
+          )
+        : undefined;
+      readiness = activation.readiness_json
+        ? workspaceRelocationActivationReadinessSchema.parse(
+            JSON.parse(activation.readiness_json),
+          )
+        : undefined;
+    } catch {
+      throw conflict("workspace_relocation_historical_evidence_unavailable");
+    }
+    if (
+      !checkpoint ||
+      !snapshot ||
+      !capture ||
+      !row.receipt_sha256 ||
+      activation.prepared_receipt_sha256 !== row.receipt_sha256 ||
+      activation.destination_node_id !== row.destination_node_id ||
+      activation.destination_workspace_id !== row.destination_workspace_id ||
+      activation.ownership_generation === null ||
+      !activation.readiness_json ||
+      !activation.readiness_sha256 ||
+      !/^[a-f0-9]{64}$/.test(activation.readiness_sha256) ||
+      !activation.readiness_receipt_sha256 ||
+      !activation.activation_command_json ||
+      !activationCommand ||
+      !readiness ||
+      !activation.activation_command_sha256 ||
+      !/^[a-f0-9]{64}$/.test(activation.activation_command_sha256) ||
+      checkpoint.actor_json !== row.actor_json ||
+      checkpoint.status !== "available" ||
+      checkpoint.stage !== "available" ||
+      checkpoint.request_id !== row.checkpoint_request_id ||
+      checkpoint.capture_id !== row.capture_id ||
+      checkpoint.capture_request_id !== row.capture_request_id ||
+      checkpoint.workspace_snapshot_request_id !==
+        row.workspace_snapshot_request_id ||
+      checkpoint.thread_id !== row.thread_id ||
+      checkpoint.project_id !== row.project_id ||
+      checkpoint.node_id !== row.source_node_id ||
+      checkpoint.workspace_id !== row.source_workspace_id ||
+      checkpoint.ownership_generation !== row.ownership_generation ||
+      !checkpoint.manifest_reference ||
+      !/^[a-f0-9]{64}$/.test(checkpoint.manifest_reference) ||
+      snapshot.actor_json !== row.actor_json ||
+      snapshot.project_id !== row.project_id ||
+      snapshot.capture_request_id !== row.capture_request_id ||
+      snapshot.status !== "workspace-checkpoint-available" ||
+      snapshot.request_id !== row.workspace_snapshot_request_id ||
+      snapshot.snapshot_id !== row.snapshot_id ||
+      snapshot.capture_id !== row.capture_id ||
+      snapshot.thread_id !== row.thread_id ||
+      snapshot.node_id !== row.source_node_id ||
+      snapshot.workspace_id !== row.source_workspace_id ||
+      snapshot.ownership_generation !== row.ownership_generation ||
+      snapshot.manifest_reference !== row.manifest_reference ||
+      !this.#hasVerifiedWorkspaceSnapshotReport(snapshot) ||
+      !this.#hasVerifiedWorkspaceSnapshotReferences(snapshot) ||
+      capture.actor_json !== row.actor_json ||
+      capture.project_id !== row.project_id ||
+      capture.thread_id !== row.thread_id ||
+      capture.node_id !== row.source_node_id ||
+      capture.workspace_id !== row.source_workspace_id ||
+      capture.ownership_generation !== row.ownership_generation ||
+      capture.status !== "source-capture-fenced" ||
+      !capture.report_json ||
+      !capture.report_sha256 ||
+      !/^[a-f0-9]{64}$/.test(capture.report_sha256) ||
+      !captureReport ||
+      captureReport.status !== "source-capture-fenced" ||
+      captureReport.requestId !== row.capture_request_id ||
+      captureReport.captureId !== row.capture_id ||
+      captureReport.controlId !== capture.control_id ||
+      captureReport.payloadSha256 !== captureControl?.payloadSha256 ||
+      captureReport.nodeId !== row.source_node_id ||
+      captureReport.target.nodeId !== row.source_node_id ||
+      captureReport.target.workspaceId !== row.source_workspace_id ||
+      captureReport.ownershipGeneration !== row.ownership_generation ||
+      !captureReport.sourceFence ||
+      captureReport.sourceFence.controlId !== capture.control_id ||
+      captureReport.sourceFence.captureId !== row.capture_id ||
+      captureReport.sourceFence.requestId !== row.capture_request_id ||
+      captureReport.sourceFence.nodeId !== row.source_node_id ||
+      captureReport.sourceFence.target.nodeId !== row.source_node_id ||
+      captureReport.sourceFence.target.workspaceId !==
+        row.source_workspace_id ||
+      captureReport.sourceFence.ownershipGeneration !==
+        row.ownership_generation ||
+      !/^[a-f0-9]{64}$/.test(captureReport.sourceFence.receiptSha256) ||
+      !captureControl ||
+      captureControl.requestId !== row.capture_request_id ||
+      captureControl.captureId !== row.capture_id ||
+      captureControl.controlId !== capture.control_id ||
+      captureControl.payloadSha256 !==
+        (captureReport.payloadSha256 ?? undefined) ||
+      captureControl.nodeId !== row.source_node_id ||
+      captureControl.target.workspaceId !== row.source_workspace_id ||
+      captureControl.ownershipGeneration !== row.ownership_generation ||
+      captureReport.sourceFence.receiptSha256.length !== 64 ||
+      source?.node_id !== row.source_node_id ||
+      source.retired_at === null ||
+      source.ownership_generation !== row.ownership_generation ||
+      destination?.node_id !== row.destination_node_id ||
+      destination.ownership_generation !== activation.ownership_generation ||
+      (activation.status === "activated" &&
+        (!activation.activation_receipt_json ||
+          !activation.activation_receipt_sha256 ||
+          !/^[a-f0-9]{64}$/.test(activation.activation_receipt_sha256) ||
+          activationReport?.status !== "activated" ||
+          activationReport.activationReceiptSha256 !==
+            activation.activation_receipt_sha256 ||
+          stableJson(activationReport.command) !==
+            stableJson(activationCommand))) ||
+      activationCommand.relocationId !== row.relocation_id ||
+      activationCommand.requestId !== row.request_id ||
+      activationCommand.checkpointRequestId !== row.checkpoint_request_id ||
+      activationCommand.captureRequestId !== row.capture_request_id ||
+      activationCommand.captureId !== row.capture_id ||
+      activationCommand.workspaceSnapshotRequestId !==
+        row.workspace_snapshot_request_id ||
+      activationCommand.snapshotId !== row.snapshot_id ||
+      activationCommand.threadId !== row.thread_id ||
+      activationCommand.source.nodeId !== row.source_node_id ||
+      activationCommand.source.workspaceId !== row.source_workspace_id ||
+      activationCommand.destination.nodeId !== row.destination_node_id ||
+      activationCommand.destination.workspaceId !==
+        row.destination_workspace_id ||
+      activationCommand.sourceOwnershipGeneration !==
+        row.ownership_generation ||
+      activationCommand.destinationOwnershipGeneration !==
+        activation.destination_ownership_generation ||
+      activationCommand.ownershipGeneration !==
+        activation.ownership_generation ||
+      activationCommand.manifestReference !== row.manifest_reference ||
+      activationCommand.sourceProofSha256 !== capture.report_sha256 ||
+      activationCommand.preparedReceiptSha256 !== row.receipt_sha256 ||
+      activationCommand.readinessReceiptSha256 !==
+        activation.readiness_receipt_sha256 ||
+      readiness.readinessReceiptSha256 !==
+        activation.readiness_receipt_sha256 ||
+      readiness.preparedReceiptSha256 !== row.receipt_sha256
+    ) {
+      throw conflict("workspace_relocation_historical_evidence_unavailable");
+    }
+    this.#assertWorkspaceRelocationActivationReadinessBinding(
+      row,
+      activation,
+      readiness,
+    );
+    if (requireCurrentPlacement) {
+      this.#assertWorkspaceRelocationHistoricalCurrentPlacement(
+        row,
+        activation,
+        destination,
+        thread,
+      );
+    }
+    if (
+      (activation.status === "activated" &&
+        this.database.all(
+          "SELECT capture_id FROM managed_work_captures WHERE capture_id = ? AND thread_id = ?",
+          [row.capture_id, row.thread_id],
+        ).length !== 0) ||
+      (activation.status !== "activated" &&
+        this.database.all(
+          "SELECT capture_id FROM managed_work_captures WHERE capture_id = ? AND thread_id = ? AND workspace_id = ?",
+          [row.capture_id, row.thread_id, row.source_workspace_id],
+        ).length !== 1)
+    ) {
+      throw conflict("workspace_relocation_historical_evidence_unavailable");
+    }
+  }
+
   #workspaceRelocationAssignment(
     row: WorkspaceRelocationRow,
   ): WorkspaceRelocationClaim {
@@ -5396,11 +6904,26 @@ export class FactoryService {
         workspaceId: row.destination_workspace_id,
       },
       ownershipGeneration: row.ownership_generation,
+      ...(row.destination_ownership_generation !== null
+        ? {
+            destinationOwnershipGeneration:
+              row.destination_ownership_generation,
+          }
+        : {}),
       manifestReference: row.manifest_reference,
     });
   }
 
   #workspaceRelocationStatus(row: WorkspaceRelocationRow) {
+    const activation = this.#workspaceRelocationActivationById(
+      row.relocation_id,
+    );
+    const historical = Boolean(
+      activation &&
+      (["ownership-committed", "activated"].includes(activation.status) ||
+        (activation.status === "uncertain" &&
+          activation.ownership_generation !== null)),
+    );
     return workspaceRelocationStatusSchema.parse({
       ...this.#workspaceRelocationAssignment(row),
       contractVersion: CONTRACT_VERSION,
@@ -5412,6 +6935,35 @@ export class FactoryService {
         ? { previousReceiptSha256: row.previous_receipt_sha256 }
         : {}),
       ...(row.error_code ? { errorCode: row.error_code } : {}),
+      ...(activation
+        ? { activation: this.#workspaceRelocationActivationStatus(activation) }
+        : {}),
+      ...(historical ? { historical: true as const } : {}),
+    });
+  }
+
+  #workspaceRelocationActivationStatus(
+    activation: WorkspaceRelocationActivationRow,
+  ): WorkspaceRelocationActivationStatus {
+    return workspaceRelocationActivationStatusSchema.parse({
+      status: activation.status,
+      destinationOwnershipGeneration:
+        activation.destination_ownership_generation,
+      ...(activation.ownership_generation !== null
+        ? { ownershipGeneration: activation.ownership_generation }
+        : {}),
+      preparedReceiptSha256: activation.prepared_receipt_sha256,
+      ...(activation.readiness_receipt_sha256
+        ? { readinessReceiptSha256: activation.readiness_receipt_sha256 }
+        : {}),
+      ...(activation.activation_receipt_sha256
+        ? { activationReceiptSha256: activation.activation_receipt_sha256 }
+        : {}),
+      ...(activation.uncertainty_receipt_sha256
+        ? { uncertaintyReceiptSha256: activation.uncertainty_receipt_sha256 }
+        : {}),
+      intentAt: activation.intent_at,
+      updatedAt: activation.updated_at,
     });
   }
 
@@ -5437,6 +6989,8 @@ export class FactoryService {
       report.destination.nodeId !== row.destination_node_id ||
       report.destination.workspaceId !== row.destination_workspace_id ||
       report.ownershipGeneration !== row.ownership_generation ||
+      report.destinationOwnershipGeneration !==
+        (row.destination_ownership_generation ?? undefined) ||
       report.manifestReference !== row.manifest_reference
     ) {
       throw conflict(
@@ -5446,7 +7000,10 @@ export class FactoryService {
     }
   }
 
-  #managedWorkCheckpointStatus(row: ManagedWorkCheckpointRow) {
+  #managedWorkCheckpointStatus(
+    row: ManagedWorkCheckpointRow,
+    historical = false,
+  ) {
     return managedWorkCheckpointStatusSchema.parse({
       contractVersion: CONTRACT_VERSION,
       requestId: row.request_id,
@@ -5463,6 +7020,7 @@ export class FactoryService {
       ...(row.status === "available" && row.manifest_reference
         ? { manifestReference: row.manifest_reference }
         : {}),
+      ...(historical ? { historical: true as const } : {}),
     });
   }
 
@@ -5686,7 +7244,7 @@ export class FactoryService {
     );
   }
 
-  #workspaceSnapshotStatus(row: WorkspaceSnapshotRow) {
+  #workspaceSnapshotStatus(row: WorkspaceSnapshotRow, historical = false) {
     return workspaceSnapshotStatusSchema.parse({
       contractVersion: CONTRACT_VERSION,
       requestId: row.request_id,
@@ -5703,6 +7261,7 @@ export class FactoryService {
         ? { manifestReference: row.manifest_reference }
         : {}),
       ...(row.error_code ? { errorCode: row.error_code } : {}),
+      ...(historical ? { historical: true as const } : {}),
     });
   }
 
@@ -5720,7 +7279,7 @@ export class FactoryService {
     )[0];
   }
 
-  #captureControlStatus(row: CaptureControlRow) {
+  #captureControlStatus(row: CaptureControlRow, historical = false) {
     const report = row.report_json
       ? executionCaptureControlReportSchema.parse(JSON.parse(row.report_json))
       : undefined;
@@ -5737,6 +7296,7 @@ export class FactoryService {
       updatedAt: row.updated_at,
       ...(report?.sourceFence ? { sourceFence: report.sourceFence } : {}),
       ...(row.error_code ? { errorCode: row.error_code } : {}),
+      ...(historical ? { historical: true as const } : {}),
     });
   }
 
@@ -5761,7 +7321,15 @@ export class FactoryService {
 
   #assertWorkspaceNotReservedForRelocation(workspaceId: string): void {
     const reservation = this.database.all<{ relocation_id: string }>(
-      "SELECT relocation_id FROM workspace_relocations WHERE destination_workspace_id = ? LIMIT 1",
+      `SELECT relocation.relocation_id
+       FROM workspace_relocations relocation
+       WHERE relocation.destination_workspace_id = ?
+         AND NOT EXISTS (
+           SELECT 1 FROM workspace_relocation_activations activation
+           WHERE activation.relocation_id = relocation.relocation_id
+             AND activation.status = 'activated'
+         )
+       LIMIT 1`,
       [workspaceId],
     )[0];
     if (reservation) {
@@ -6272,11 +7840,21 @@ export class FactoryService {
     ownershipGeneration: number,
   ): boolean {
     try {
-      return (
+      const workspace = this.database.all<{
+        node_id: string;
+        ownership_generation: number;
+        retired_at: string | null;
+      }>(
+        "SELECT node_id, ownership_generation, retired_at FROM workspaces WHERE workspace_id = ?",
+        [workspaceId],
+      )[0];
+      return Boolean(
+        workspace &&
+        workspace.node_id === nodeId &&
+        workspace.retired_at === null &&
         Number.isSafeInteger(ownershipGeneration) &&
         ownershipGeneration >= 0 &&
-        this.#workspaceOwnershipGeneration(nodeId, workspaceId) ===
-          ownershipGeneration
+        workspace.ownership_generation === ownershipGeneration,
       );
     } catch (error) {
       if (

@@ -40,9 +40,17 @@ import {
   workspaceSnapshotClaimSchema,
   workspaceSnapshotReportSchema,
   workspaceRelocationClaimSchema,
+  workspaceRelocationActivationCommandSchema,
+  workspaceRelocationActivationPreflightSchema,
+  workspaceRelocationActivationReadinessSchema,
+  workspaceRelocationActivationReportSchema,
   workspaceRelocationReportSchema,
   type WorkspaceSnapshotClaim,
   type WorkspaceSnapshotReport,
+  type WorkspaceRelocationActivationCommand,
+  type WorkspaceRelocationActivationPreflight,
+  type WorkspaceRelocationActivationReadiness,
+  type WorkspaceRelocationActivationReport,
   type WorkspaceRelocationClaim,
   type WorkspaceRelocationReport,
 } from "@uzina/contracts/factory";
@@ -117,6 +125,22 @@ interface CaptureControlRow {
   report_sha256: string;
   reported_at: string | null;
   error_code: string | null;
+}
+
+interface WorkspaceRelocationActivationReceiptRow {
+  relocation_id: string;
+  status: "ready" | "authorized" | "activated" | "uncertain";
+  preflight_json: string;
+  readiness_json: string | null;
+  readiness_sha256: string | null;
+  readiness_receipt_sha256: string | null;
+  command_json: string | null;
+  command_sha256: string | null;
+  report_json: string | null;
+  report_sha256: string | null;
+  reported_at: string | null;
+  accepted_at: string;
+  updated_at: string;
 }
 
 interface WorkspaceRelocationReceiptRow {
@@ -478,6 +502,23 @@ export class ExecutionDaemon {
       );
       CREATE INDEX IF NOT EXISTS execution_workspace_relocations_pending
         ON execution_workspace_relocations(status, reported_at, accepted_at);
+      CREATE TABLE IF NOT EXISTS execution_workspace_activation_receipts (
+        relocation_id TEXT PRIMARY KEY REFERENCES execution_workspace_relocations(relocation_id),
+        status TEXT NOT NULL CHECK (status IN ('ready', 'authorized', 'activated', 'uncertain')),
+        preflight_json TEXT NOT NULL,
+        readiness_json TEXT,
+        readiness_sha256 TEXT,
+        readiness_receipt_sha256 TEXT,
+        command_json TEXT,
+        command_sha256 TEXT,
+        report_json TEXT,
+        report_sha256 TEXT,
+        reported_at TEXT,
+        accepted_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS execution_workspace_activation_pending
+        ON execution_workspace_activation_receipts(status, reported_at, updated_at);
       CREATE TABLE IF NOT EXISTS execution_rex_processes (
         process_id TEXT PRIMARY KEY,
         payload_sha256 TEXT NOT NULL,
@@ -1099,12 +1140,416 @@ export class ExecutionDaemon {
       .run(new Date().toISOString(), relocationId);
   }
 
+  pendingWorkspaceRelocationActivationReports(): WorkspaceRelocationActivationReport[] {
+    this.#assertOpen();
+    return this.#db
+      .query<{ report_json: string }, []>(
+        `SELECT report_json FROM execution_workspace_activation_receipts
+         WHERE report_json IS NOT NULL AND reported_at IS NULL
+         ORDER BY accepted_at, relocation_id`,
+      )
+      .all()
+      .map((row) =>
+        workspaceRelocationActivationReportSchema.parse(
+          JSON.parse(row.report_json),
+        ),
+      );
+  }
+
+  markWorkspaceRelocationActivationReported(
+    relocationId: string,
+    report: WorkspaceRelocationActivationReport,
+  ): void {
+    this.#assertOpen();
+    const row = this.#workspaceRelocationActivationReceiptRow(relocationId);
+    if (!row || row.report_sha256 !== executionPayloadSha256(report)) {
+      throw new ExecutionError(
+        "workspace_relocation_activation_report_ack_mismatch",
+      );
+    }
+    this.#db
+      .query(
+        `UPDATE execution_workspace_activation_receipts SET reported_at = ?
+         WHERE relocation_id = ? AND reported_at IS NULL`,
+      )
+      .run(new Date().toISOString(), relocationId);
+  }
+
+  /** Revalidate the exact prepared destination and durably record one readiness receipt. */
+  async prepareWorkspaceRelocationActivation(
+    input: unknown,
+  ): Promise<WorkspaceRelocationActivationReadiness | null> {
+    this.#assertOpen();
+    const preflight = workspaceRelocationActivationPreflightSchema.parse(input);
+    if (
+      preflight.destination.nodeId !== this.#nodeId ||
+      preflight.source.nodeId === this.#nodeId ||
+      preflight.source.workspaceId === preflight.destination.workspaceId
+    ) {
+      throw new ExecutionError("workspace_relocation_activation_node_mismatch");
+    }
+    const row = this.#workspaceRelocationRow(preflight.relocationId);
+    if (!row)
+      throw new ExecutionError("workspace_relocation_receipt_not_found");
+    const claim = workspaceRelocationClaimSchema.parse(
+      JSON.parse(row.binding_json),
+    );
+    this.#assertWorkspaceRelocationIdentity(claim, row);
+    this.#assertWorkspaceRelocationActivationPreflightBinding(
+      preflight,
+      claim,
+      row,
+    );
+    if (
+      row.status !== "prepared-inactive" ||
+      !row.report_json ||
+      !row.report_sha256 ||
+      !row.receipt_sha256
+    ) {
+      throw new ExecutionError("workspace_relocation_not_prepared");
+    }
+    const existing = this.#workspaceRelocationActivationReceiptRow(
+      preflight.relocationId,
+    );
+    if (existing) {
+      this.#assertWorkspaceRelocationActivationPreflightJson(
+        existing,
+        preflight,
+      );
+      if (existing.readiness_json) {
+        try {
+          await this.#verifyPreparedWorkspaceRelocation(row);
+        } catch {
+          this.#storeWorkspaceRelocationReport(
+            claim,
+            "uncertain",
+            "workspace_relocation_restore_unverified",
+          );
+          return null;
+        }
+        return workspaceRelocationActivationReadinessSchema.parse(
+          JSON.parse(existing.readiness_json),
+        );
+      }
+      if (existing.status === "uncertain") return null;
+      throw new ExecutionError(
+        "workspace_relocation_activation_readiness_missing",
+      );
+    }
+
+    try {
+      await this.#verifyPreparedWorkspaceRelocation(row);
+    } catch {
+      this.#storeWorkspaceRelocationReport(
+        claim,
+        "uncertain",
+        "workspace_relocation_restore_unverified",
+      );
+      return null;
+    }
+
+    const reportedAt = new Date().toISOString();
+    const readinessReceiptSha256 = executionPayloadSha256({
+      purpose: "workspace-relocation-activation-readiness-v1",
+      preflight,
+      preparedReportSha256: row.report_sha256,
+      preparedReceiptSha256: row.receipt_sha256,
+      verifiedAt: reportedAt,
+    });
+    const readiness = workspaceRelocationActivationReadinessSchema.parse({
+      ...preflight,
+      readinessReceiptSha256,
+      reportedAt,
+    });
+    this.#transaction(() => {
+      const current = this.#workspaceRelocationRow(preflight.relocationId);
+      if (!current) {
+        throw new ExecutionError("workspace_relocation_receipt_missing");
+      }
+      this.#assertWorkspaceRelocationIdentity(claim, current);
+      this.#assertWorkspaceRelocationActivationPreflightBinding(
+        preflight,
+        claim,
+        current,
+      );
+      if (
+        current.status !== "prepared-inactive" ||
+        current.report_sha256 !== row.report_sha256 ||
+        current.receipt_sha256 !== row.receipt_sha256
+      ) {
+        throw new ExecutionError("workspace_relocation_receipt_changed");
+      }
+      if (
+        this.#workspaceRelocationActivationReceiptRow(preflight.relocationId)
+      ) {
+        throw new ExecutionError(
+          "workspace_relocation_activation_readiness_conflict",
+        );
+      }
+      this.#db
+        .query(
+          `INSERT INTO execution_workspace_activation_receipts(
+            relocation_id, status, preflight_json, readiness_json,
+            readiness_sha256, readiness_receipt_sha256, accepted_at, updated_at
+          ) VALUES (?, 'ready', ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          preflight.relocationId,
+          JSON.stringify(preflight),
+          JSON.stringify(readiness),
+          executionPayloadSha256(readiness),
+          readinessReceiptSha256,
+          reportedAt,
+          reportedAt,
+        );
+    });
+    return readiness;
+  }
+
+  /** Apply Core's exact committed command without restoring or changing the prepared receipt. */
+  async activateWorkspaceRelocation(
+    input: unknown,
+  ): Promise<WorkspaceRelocationActivationReport> {
+    this.#assertOpen();
+    const command = workspaceRelocationActivationCommandSchema.parse(input);
+    if (
+      command.destination.nodeId !== this.#nodeId ||
+      command.source.nodeId === this.#nodeId ||
+      command.source.workspaceId === command.destination.workspaceId
+    ) {
+      throw new ExecutionError("workspace_relocation_activation_node_mismatch");
+    }
+    const row = this.#workspaceRelocationRow(command.relocationId);
+    if (!row)
+      throw new ExecutionError("workspace_relocation_receipt_not_found");
+    const claim = workspaceRelocationClaimSchema.parse(
+      JSON.parse(row.binding_json),
+    );
+    this.#assertWorkspaceRelocationIdentity(claim, row);
+    const preflight =
+      this.#workspaceRelocationActivationPreflightFromCommand(command);
+    this.#assertWorkspaceRelocationActivationPreflightBinding(
+      preflight,
+      claim,
+      row,
+    );
+    const commandSha256 = executionPayloadSha256(command);
+    let activation = this.#workspaceRelocationActivationReceiptRow(
+      command.relocationId,
+    );
+    if (
+      activation?.status === "activated" ||
+      activation?.status === "uncertain"
+    ) {
+      if (
+        activation.command_sha256 !== commandSha256 ||
+        !activation.report_json
+      ) {
+        throw new ExecutionError(
+          "workspace_relocation_activation_command_conflict",
+        );
+      }
+      return workspaceRelocationActivationReportSchema.parse(
+        JSON.parse(activation.report_json),
+      );
+    }
+    if (
+      row.status !== "prepared-inactive" ||
+      !row.receipt_sha256 ||
+      row.receipt_sha256 !== command.preparedReceiptSha256
+    ) {
+      return this.#storeWorkspaceRelocationActivationUncertain(
+        row,
+        command,
+        preflight,
+        "workspace_relocation_prepared_receipt_mismatch",
+      );
+    }
+    if (!activation?.readiness_json || !activation.readiness_receipt_sha256) {
+      return this.#storeWorkspaceRelocationActivationUncertain(
+        row,
+        command,
+        preflight,
+        "workspace_relocation_readiness_receipt_missing",
+      );
+    }
+    const readiness = workspaceRelocationActivationReadinessSchema.parse(
+      JSON.parse(activation.readiness_json),
+    );
+    if (
+      activation.readiness_receipt_sha256 !== command.readinessReceiptSha256 ||
+      readiness.readinessReceiptSha256 !== command.readinessReceiptSha256 ||
+      !activation.readiness_sha256 ||
+      activation.readiness_sha256 !== executionPayloadSha256(readiness)
+    ) {
+      return this.#storeWorkspaceRelocationActivationUncertain(
+        row,
+        command,
+        preflight,
+        "workspace_relocation_readiness_receipt_mismatch",
+      );
+    }
+    try {
+      this.#assertWorkspaceRelocationActivationPreflightJson(
+        activation,
+        preflight,
+      );
+      this.#assertWorkspaceRelocationActivationCommandBinding(
+        command,
+        preflight,
+        claim,
+        row,
+        readiness,
+      );
+    } catch {
+      return this.#storeWorkspaceRelocationActivationUncertain(
+        row,
+        command,
+        preflight,
+        "workspace_relocation_activation_binding_mismatch",
+      );
+    }
+    if (
+      activation.command_sha256 &&
+      activation.command_sha256 !== commandSha256
+    ) {
+      throw new ExecutionError(
+        "workspace_relocation_activation_command_conflict",
+      );
+    }
+    if (activation.status === "ready") {
+      this.#transaction(() => {
+        const current = this.#workspaceRelocationActivationReceiptRow(
+          command.relocationId,
+        );
+        if (
+          !current ||
+          current.status !== "ready" ||
+          current.readiness_sha256 !== activation!.readiness_sha256
+        ) {
+          throw new ExecutionError(
+            "workspace_relocation_activation_readiness_changed",
+          );
+        }
+        this.#db
+          .query(
+            `UPDATE execution_workspace_activation_receipts
+             SET status = 'authorized', command_json = ?, command_sha256 = ?, updated_at = ?
+             WHERE relocation_id = ? AND status = 'ready'`,
+          )
+          .run(
+            JSON.stringify(command),
+            commandSha256,
+            new Date().toISOString(),
+            command.relocationId,
+          );
+      });
+      activation = this.#workspaceRelocationActivationReceiptRow(
+        command.relocationId,
+      );
+    } else if (
+      activation.status !== "authorized" ||
+      activation.command_sha256 !== commandSha256
+    ) {
+      throw new ExecutionError(
+        "workspace_relocation_activation_state_conflict",
+      );
+    }
+
+    try {
+      await this.#verifyPreparedWorkspaceRelocation(row);
+    } catch {
+      return this.#storeWorkspaceRelocationActivationUncertain(
+        row,
+        command,
+        preflight,
+        "workspace_relocation_activation_unverified",
+      );
+    }
+
+    const activatedAt = new Date().toISOString();
+    const activationReceiptSha256 = executionPayloadSha256({
+      purpose: "workspace-relocation-activated-v1",
+      relocationId: command.relocationId,
+      commandSha256,
+      readinessReceiptSha256: command.readinessReceiptSha256,
+      preparedReceiptSha256: command.preparedReceiptSha256,
+      ownershipGeneration: command.ownershipGeneration,
+      activatedAt,
+    });
+    const report = workspaceRelocationActivationReportSchema.parse({
+      status: "activated",
+      command,
+      activationReceiptSha256,
+      reportedAt: activatedAt,
+    });
+    this.#transaction(() => {
+      const currentRow = this.#workspaceRelocationRow(command.relocationId);
+      const currentActivation = this.#workspaceRelocationActivationReceiptRow(
+        command.relocationId,
+      );
+      if (
+        !currentRow ||
+        !currentActivation ||
+        currentActivation.status !== "authorized" ||
+        currentActivation.command_sha256 !== commandSha256 ||
+        currentRow.receipt_sha256 !== command.preparedReceiptSha256
+      ) {
+        throw new ExecutionError(
+          "workspace_relocation_activation_authority_changed",
+        );
+      }
+      this.#assertWorkspaceRelocationActivationCommandBinding(
+        command,
+        preflight,
+        claim,
+        currentRow,
+        readiness,
+      );
+      this.#assertWorkspaceRelocationActivationAdmission(currentRow);
+      const priorGeneration =
+        claim.destinationOwnershipGeneration ?? claim.ownershipGeneration;
+      const changed = this.#db
+        .query(
+          `UPDATE execution_workspaces
+           SET ownership_generation = ?, active = 1
+           WHERE workspace_id = ? AND ownership_generation = ? AND active = 0`,
+        )
+        .run(
+          command.ownershipGeneration,
+          command.destination.workspaceId,
+          priorGeneration,
+        );
+      if (changed.changes !== 1) {
+        throw new ExecutionError("workspace_relocation_destination_fence_lost");
+      }
+      this.#db
+        .query(
+          `UPDATE execution_workspace_activation_receipts
+           SET status = 'activated', report_json = ?, report_sha256 = ?, updated_at = ?
+           WHERE relocation_id = ? AND status = 'authorized'`,
+        )
+        .run(
+          JSON.stringify(report),
+          executionPayloadSha256(report),
+          activatedAt,
+          command.relocationId,
+        );
+    });
+    return report;
+  }
+
   /** Reconciles local receipts before the daemon can accept new controller work. */
   async reconcileWorkspaceRelocations(): Promise<void> {
     this.#assertOpen();
     const rows = this.#db
       .query<WorkspaceRelocationReceiptRow, []>(
-        "SELECT * FROM execution_workspace_relocations WHERE status IN ('preparing', 'prepared-inactive') ORDER BY accepted_at, relocation_id",
+        `SELECT relocation.* FROM execution_workspace_relocations relocation
+         LEFT JOIN execution_workspace_activation_receipts activation
+           ON activation.relocation_id = relocation.relocation_id
+         WHERE relocation.status IN ('preparing', 'prepared-inactive')
+           AND activation.relocation_id IS NULL
+         ORDER BY relocation.accepted_at, relocation.relocation_id`,
       )
       .all();
     for (const row of rows) {
@@ -2121,7 +2566,9 @@ export class ExecutionDaemon {
       ) {
         return "workspace_relocation_destination_path_invalid";
       }
-      if (workspace.ownership_generation !== claim.ownershipGeneration) {
+      const destinationGeneration =
+        claim.destinationOwnershipGeneration ?? claim.ownershipGeneration;
+      if (workspace.ownership_generation !== destinationGeneration) {
         return "stale_ownership_generation";
       }
       if (!workspace.active) return "workspace_fenced";
@@ -2673,7 +3120,8 @@ export class ExecutionDaemon {
     if (
       !workspace ||
       workspace.directory !== row.workspace_root ||
-      workspace.ownership_generation !== row.ownership_generation ||
+      workspace.ownership_generation !==
+        this.#workspaceRelocationDestinationGeneration(row) ||
       workspace.active !== 0
     ) {
       throw new ExecutionError("workspace_relocation_destination_fence_lost");
@@ -2865,6 +3313,268 @@ export class ExecutionDaemon {
           "SELECT * FROM execution_workspace_relocations WHERE relocation_id = ?",
         )
         .get(relocationId) ?? undefined
+    );
+  }
+
+  #workspaceRelocationActivationReceiptRow(
+    relocationId: string,
+  ): WorkspaceRelocationActivationReceiptRow | undefined {
+    return (
+      this.#db
+        .query<WorkspaceRelocationActivationReceiptRow, [string]>(
+          "SELECT * FROM execution_workspace_activation_receipts WHERE relocation_id = ?",
+        )
+        .get(relocationId) ?? undefined
+    );
+  }
+
+  #workspaceRelocationDestinationGeneration(
+    row: WorkspaceRelocationReceiptRow,
+  ): number {
+    const claim = workspaceRelocationClaimSchema.parse(
+      JSON.parse(row.binding_json),
+    );
+    return claim.destinationOwnershipGeneration ?? claim.ownershipGeneration;
+  }
+
+  #workspaceRelocationActivationPreflightFromCommand(
+    command: WorkspaceRelocationActivationCommand,
+  ): WorkspaceRelocationActivationPreflight {
+    return workspaceRelocationActivationPreflightSchema.parse({
+      contractVersion: command.contractVersion,
+      relocationId: command.relocationId,
+      requestId: command.requestId,
+      checkpointRequestId: command.checkpointRequestId,
+      captureRequestId: command.captureRequestId,
+      captureId: command.captureId,
+      workspaceSnapshotRequestId: command.workspaceSnapshotRequestId,
+      snapshotId: command.snapshotId,
+      threadId: command.threadId,
+      source: command.source,
+      destination: command.destination,
+      sourceOwnershipGeneration: command.sourceOwnershipGeneration,
+      destinationOwnershipGeneration: command.destinationOwnershipGeneration,
+      manifestReference: command.manifestReference,
+      sourceProofSha256: command.sourceProofSha256,
+      preparedReceiptSha256: command.preparedReceiptSha256,
+    });
+  }
+
+  #assertWorkspaceRelocationActivationPreflightBinding(
+    preflight: WorkspaceRelocationActivationPreflight,
+    claim: WorkspaceRelocationClaim,
+    row: WorkspaceRelocationReceiptRow,
+  ): void {
+    const destinationGeneration =
+      claim.destinationOwnershipGeneration ?? claim.ownershipGeneration;
+    if (
+      preflight.relocationId !== row.relocation_id ||
+      preflight.relocationId !== claim.relocationId ||
+      preflight.requestId !== claim.requestId ||
+      preflight.checkpointRequestId !== claim.checkpointRequestId ||
+      preflight.captureRequestId !== claim.captureRequestId ||
+      preflight.captureId !== claim.captureId ||
+      preflight.workspaceSnapshotRequestId !==
+        claim.workspaceSnapshotRequestId ||
+      preflight.snapshotId !== claim.snapshotId ||
+      preflight.threadId !== claim.threadId ||
+      preflight.source.nodeId !== claim.source.nodeId ||
+      preflight.source.workspaceId !== claim.source.workspaceId ||
+      preflight.destination.nodeId !== claim.destination.nodeId ||
+      preflight.destination.workspaceId !== claim.destination.workspaceId ||
+      preflight.destination.nodeId !== this.#nodeId ||
+      preflight.sourceOwnershipGeneration !== claim.ownershipGeneration ||
+      preflight.destinationOwnershipGeneration !== destinationGeneration ||
+      preflight.manifestReference !== claim.manifestReference ||
+      preflight.preparedReceiptSha256 !== row.receipt_sha256
+    ) {
+      throw new ExecutionError(
+        "workspace_relocation_activation_binding_mismatch",
+      );
+    }
+  }
+
+  #assertWorkspaceRelocationActivationPreflightJson(
+    receipt: WorkspaceRelocationActivationReceiptRow,
+    preflight: WorkspaceRelocationActivationPreflight,
+  ): void {
+    const persisted = workspaceRelocationActivationPreflightSchema.parse(
+      JSON.parse(receipt.preflight_json),
+    );
+    if (
+      executionPayloadSha256(persisted) !== executionPayloadSha256(preflight)
+    ) {
+      throw new ExecutionError(
+        "workspace_relocation_activation_binding_mismatch",
+      );
+    }
+  }
+
+  #assertWorkspaceRelocationActivationCommandBinding(
+    command: WorkspaceRelocationActivationCommand,
+    preflight: WorkspaceRelocationActivationPreflight,
+    claim: WorkspaceRelocationClaim,
+    row: WorkspaceRelocationReceiptRow,
+    readiness: WorkspaceRelocationActivationReadiness,
+  ): void {
+    const expectedGenerationBase = Math.max(
+      preflight.sourceOwnershipGeneration,
+      preflight.destinationOwnershipGeneration,
+    );
+    if (
+      expectedGenerationBase >= Number.MAX_SAFE_INTEGER ||
+      command.ownershipGeneration !== expectedGenerationBase + 1 ||
+      command.readinessReceiptSha256 !== readiness.readinessReceiptSha256 ||
+      command.preparedReceiptSha256 !== row.receipt_sha256 ||
+      command.destinationOwnershipGeneration !==
+        (claim.destinationOwnershipGeneration ?? claim.ownershipGeneration) ||
+      executionPayloadSha256(
+        this.#workspaceRelocationActivationPreflightFromCommand(command),
+      ) !== executionPayloadSha256(preflight)
+    ) {
+      throw new ExecutionError(
+        "workspace_relocation_activation_command_mismatch",
+      );
+    }
+  }
+
+  async #verifyPreparedWorkspaceRelocation(
+    row: WorkspaceRelocationReceiptRow,
+  ): Promise<void> {
+    this.#assertWorkspaceRelocationReady(row, false);
+    const manifest = this.#loadWorkspaceRelocationManifest(row);
+    const transport = new FileBlobTransport(row.cache_directory!);
+    const validation = await validateWorkspaceCheckpoint(manifest, transport);
+    this.#assertWorkspaceRelocationReady(row, false);
+    if (!validation.valid) {
+      throw new ExecutionError("workspace_relocation_checkpoint_invalid");
+    }
+    await verifyRestoredWorkspaceCheckpoint(
+      manifest,
+      transport,
+      row.workspace_root!,
+    );
+    this.#assertWorkspaceRelocationReady(row, false);
+  }
+
+  #assertWorkspaceRelocationActivationAdmission(
+    row: WorkspaceRelocationReceiptRow,
+  ): void {
+    this.#assertWorkspaceRelocationReady(row, false);
+  }
+
+  #storeWorkspaceRelocationActivationUncertain(
+    row: WorkspaceRelocationReceiptRow,
+    command: WorkspaceRelocationActivationCommand,
+    preflight: WorkspaceRelocationActivationPreflight,
+    errorCode: string,
+  ): WorkspaceRelocationActivationReport {
+    const commandSha256 = executionPayloadSha256(command);
+    const existing = this.#workspaceRelocationActivationReceiptRow(
+      command.relocationId,
+    );
+    if (
+      existing?.status === "activated" ||
+      (existing?.status === "uncertain" && existing.report_json)
+    ) {
+      if (existing.command_sha256 !== commandSha256) {
+        throw new ExecutionError(
+          "workspace_relocation_activation_command_conflict",
+        );
+      }
+      return workspaceRelocationActivationReportSchema.parse(
+        JSON.parse(existing.report_json!),
+      );
+    }
+    if (existing?.command_sha256 && existing.command_sha256 !== commandSha256) {
+      throw new ExecutionError(
+        "workspace_relocation_activation_command_conflict",
+      );
+    }
+    const reportedAt = new Date().toISOString();
+    const uncertaintyReceiptSha256 = executionPayloadSha256({
+      purpose: "workspace-relocation-activation-uncertain-v1",
+      relocationId: command.relocationId,
+      commandSha256,
+      preparedReceiptSha256: row.receipt_sha256,
+      readinessReceiptSha256: command.readinessReceiptSha256,
+      errorCode,
+      reportedAt,
+    });
+    const report = workspaceRelocationActivationReportSchema.parse({
+      status: "uncertain",
+      command,
+      uncertaintyReceiptSha256,
+      errorCode,
+      reportedAt,
+    });
+    this.#transaction(() => {
+      const currentRow = this.#workspaceRelocationRow(command.relocationId);
+      if (!currentRow) {
+        throw new ExecutionError("workspace_relocation_receipt_missing");
+      }
+      const current = this.#workspaceRelocationActivationReceiptRow(
+        command.relocationId,
+      );
+      if (
+        current?.status === "activated" ||
+        (current?.status === "uncertain" && current.report_json)
+      ) {
+        if (current.command_sha256 !== commandSha256) {
+          throw new ExecutionError(
+            "workspace_relocation_activation_command_conflict",
+          );
+        }
+        return;
+      }
+      const preflightJson =
+        current?.preflight_json ?? JSON.stringify(preflight);
+      if (current) {
+        this.#db
+          .query(
+            `UPDATE execution_workspace_activation_receipts
+             SET status = 'uncertain', command_json = ?, command_sha256 = ?,
+               report_json = ?, report_sha256 = ?, reported_at = NULL, updated_at = ?
+             WHERE relocation_id = ?`,
+          )
+          .run(
+            JSON.stringify(command),
+            commandSha256,
+            JSON.stringify(report),
+            executionPayloadSha256(report),
+            reportedAt,
+            command.relocationId,
+          );
+      } else {
+        this.#db
+          .query(
+            `INSERT INTO execution_workspace_activation_receipts(
+              relocation_id, status, preflight_json, command_json,
+              command_sha256, report_json, report_sha256, accepted_at, updated_at
+            ) VALUES (?, 'uncertain', ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            command.relocationId,
+            preflightJson,
+            JSON.stringify(command),
+            commandSha256,
+            JSON.stringify(report),
+            executionPayloadSha256(report),
+            reportedAt,
+            reportedAt,
+          );
+      }
+    });
+    const persisted = this.#workspaceRelocationActivationReceiptRow(
+      command.relocationId,
+    );
+    if (!persisted?.report_json) {
+      throw new ExecutionError(
+        "workspace_relocation_activation_receipt_missing",
+      );
+    }
+    return workspaceRelocationActivationReportSchema.parse(
+      JSON.parse(persisted.report_json),
     );
   }
 
@@ -3061,7 +3771,12 @@ export class ExecutionDaemon {
     if (
       this.#db
         .query<{ relocation_id: string }, [string]>(
-          "SELECT relocation_id FROM execution_workspace_relocations WHERE destination_workspace_id = ? LIMIT 1",
+          `SELECT relocation.relocation_id FROM execution_workspace_relocations relocation
+           LEFT JOIN execution_workspace_activation_receipts activation
+             ON activation.relocation_id = relocation.relocation_id
+           WHERE relocation.destination_workspace_id = ?
+             AND NOT (activation.status = 'activated' AND activation.reported_at IS NOT NULL)
+           LIMIT 1`,
         )
         .get(workspaceId)
     ) {
@@ -3080,12 +3795,67 @@ export class ExecutionDaemon {
     } catch {
       // A missing ordinary workspace is rejected later by its filesystem effect.
     }
+    const captureFenceRoots = this.#db
+      .query<{ directory: string }, []>(
+        `SELECT workspace.directory FROM execution_workspace_captures capture
+         JOIN execution_capture_controls control
+           ON control.control_id = capture.control_id
+          AND control.status = 'source-capture-fenced'
+         JOIN execution_workspaces workspace
+           ON workspace.workspace_id = capture.workspace_id`,
+      )
+      .all();
+    for (const fence of captureFenceRoots) {
+      const roots = new Set([resolve(fence.directory)]);
+      try {
+        roots.add(realpathSync(fence.directory));
+      } catch (error) {
+        const errorCode =
+          error && typeof error === "object" && "code" in error
+            ? error.code
+            : undefined;
+        if (errorCode !== "ENOENT") {
+          throw new ExecutionError("workspace_capture_fence_unavailable");
+        }
+      }
+      for (const workspaceRoot of workspaceRoots) {
+        for (const fenceRoot of roots) {
+          if (
+            within(workspaceRoot, fenceRoot) ||
+            within(fenceRoot, workspaceRoot)
+          ) {
+            throw new ExecutionError("workspace_capture_active");
+          }
+        }
+      }
+    }
     const reservedRoots = this.#db
-      .query<{ workspace_root: string }, []>(
-        "SELECT workspace_root FROM execution_workspace_relocations WHERE workspace_root IS NOT NULL",
+      .query<
+        {
+          relocation_id: string;
+          destination_workspace_id: string;
+          workspace_root: string;
+          activated: number;
+        },
+        []
+      >(
+        `SELECT relocation.relocation_id, relocation.destination_workspace_id,
+           relocation.workspace_root,
+           CASE WHEN activation.status = 'activated'
+             AND activation.reported_at IS NOT NULL THEN 1 ELSE 0 END AS activated
+         FROM execution_workspace_relocations relocation
+         LEFT JOIN execution_workspace_activation_receipts activation
+           ON activation.relocation_id = relocation.relocation_id
+         WHERE relocation.workspace_root IS NOT NULL`,
       )
       .all();
     for (const reservation of reservedRoots) {
+      if (
+        reservation.activated === 1 &&
+        reservation.destination_workspace_id === workspaceId
+      ) {
+        continue;
+      }
       const roots = new Set([resolve(reservation.workspace_root)]);
       try {
         roots.add(realpathSync(reservation.workspace_root));

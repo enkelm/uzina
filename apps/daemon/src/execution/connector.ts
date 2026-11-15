@@ -3,11 +3,20 @@ import {
   workspaceSnapshotClaimResponseSchema,
   workspaceSnapshotReportSchema,
   workspaceSnapshotReportResponseSchema,
+  workspaceRelocationActivationClaimRequestSchema,
+  workspaceRelocationActivationClaimResponseSchema,
+  workspaceRelocationActivationCommandSchema,
+  workspaceRelocationActivationReadinessSchema,
+  workspaceRelocationActivationReadinessResponseSchema,
+  workspaceRelocationActivationReportSchema,
+  workspaceRelocationActivationReportResponseSchema,
   workspaceRelocationClaimRequestSchema,
   workspaceRelocationClaimResponseSchema,
   workspaceRelocationReportSchema,
   workspaceRelocationReportResponseSchema,
   type WorkspaceSnapshotClaim,
+  type WorkspaceRelocationActivationClaim,
+  type WorkspaceRelocationActivationCommand,
   type WorkspaceRelocationClaim,
 } from "@uzina/contracts/factory";
 import {
@@ -111,6 +120,11 @@ export interface ExecutionControllerConnector {
     reference: string,
   ): Promise<{ body: ReadableStream<Uint8Array>; size: number }>;
   reportWorkspaceRelocation(report: unknown): Promise<void>;
+  claimWorkspaceRelocationActivation(): Promise<WorkspaceRelocationActivationClaim | null>;
+  reportWorkspaceRelocationActivationReadiness(
+    readiness: unknown,
+  ): Promise<WorkspaceRelocationActivationCommand>;
+  reportWorkspaceRelocationActivation(report: unknown): Promise<void>;
 }
 
 export interface HttpExecutionControllerConnectorOptions {
@@ -423,6 +437,105 @@ export class HttpExecutionControllerConnector implements ExecutionControllerConn
     ) {
       throw new ControllerProtocolError(
         "Controller relocation report acknowledgement mismatch",
+      );
+    }
+  }
+
+  async claimWorkspaceRelocationActivation(): Promise<WorkspaceRelocationActivationClaim | null> {
+    const body = workspaceRelocationActivationClaimRequestSchema.parse({
+      contractVersion: 1,
+      nodeId: this.#nodeId,
+    });
+    const response = await this.#post(
+      `/v1/nodes/${encodeURIComponent(this.#nodeId)}/workspace-relocation-activations/claim`,
+      body,
+      workspaceRelocationActivationClaimResponseSchema,
+    );
+    const activation = response.activation;
+    if (activation?.phase === "preflight") {
+      this.#assertNode(activation.assignment.destination.nodeId);
+      if (
+        activation.assignment.source.nodeId === this.#nodeId ||
+        activation.assignment.destination.workspaceId ===
+          activation.assignment.source.workspaceId
+      ) {
+        throw new ControllerProtocolError(
+          "Controller activation assignment mismatch",
+        );
+      }
+    } else if (activation?.phase === "activate") {
+      this.#assertNode(activation.command.destination.nodeId);
+      if (
+        activation.command.source.nodeId === this.#nodeId ||
+        activation.command.destination.workspaceId ===
+          activation.command.source.workspaceId
+      ) {
+        throw new ControllerProtocolError(
+          "Controller activation command mismatch",
+        );
+      }
+    }
+    return activation;
+  }
+
+  async reportWorkspaceRelocationActivationReadiness(
+    readiness: unknown,
+  ): Promise<WorkspaceRelocationActivationCommand> {
+    const body = workspaceRelocationActivationReadinessSchema.parse(readiness);
+    this.#assertNode(body.destination.nodeId);
+    const response = await this.#post(
+      `/v1/nodes/${encodeURIComponent(this.#nodeId)}/workspace-relocations/${encodeURIComponent(body.relocationId)}/readiness`,
+      body,
+      workspaceRelocationActivationReadinessResponseSchema,
+    );
+    const command = workspaceRelocationActivationCommandSchema.parse(
+      response.command,
+    );
+    if (
+      response.nodeId !== this.#nodeId ||
+      response.relocationId !== body.relocationId ||
+      command.relocationId !== body.relocationId ||
+      command.requestId !== body.requestId ||
+      command.checkpointRequestId !== body.checkpointRequestId ||
+      command.captureRequestId !== body.captureRequestId ||
+      command.captureId !== body.captureId ||
+      command.workspaceSnapshotRequestId !== body.workspaceSnapshotRequestId ||
+      command.snapshotId !== body.snapshotId ||
+      command.threadId !== body.threadId ||
+      command.source.nodeId !== body.source.nodeId ||
+      command.source.workspaceId !== body.source.workspaceId ||
+      command.destination.nodeId !== body.destination.nodeId ||
+      command.destination.workspaceId !== body.destination.workspaceId ||
+      command.sourceOwnershipGeneration !== body.sourceOwnershipGeneration ||
+      command.destinationOwnershipGeneration !==
+        body.destinationOwnershipGeneration ||
+      command.manifestReference !== body.manifestReference ||
+      command.sourceProofSha256 !== body.sourceProofSha256 ||
+      command.preparedReceiptSha256 !== body.preparedReceiptSha256 ||
+      command.readinessReceiptSha256 !== body.readinessReceiptSha256
+    ) {
+      throw new ControllerProtocolError(
+        "Controller activation command does not match readiness",
+      );
+    }
+    return command;
+  }
+
+  async reportWorkspaceRelocationActivation(report: unknown): Promise<void> {
+    const body = workspaceRelocationActivationReportSchema.parse(report);
+    this.#assertNode(body.command.destination.nodeId);
+    const response = await this.#post(
+      `/v1/nodes/${encodeURIComponent(this.#nodeId)}/workspace-relocations/${encodeURIComponent(body.command.relocationId)}/activation-report`,
+      body,
+      workspaceRelocationActivationReportResponseSchema,
+    );
+    if (
+      response.nodeId !== this.#nodeId ||
+      response.relocationId !== body.command.relocationId ||
+      response.status !== body.status
+    ) {
+      throw new ControllerProtocolError(
+        "Controller activation report acknowledgement mismatch",
       );
     }
   }

@@ -164,6 +164,185 @@ describe("outbound execution controller connector", () => {
     });
   });
 
+  test("claims activation, correlates readiness to the committed command, and reports the stable local receipt", async () => {
+    const preflight = {
+      contractVersion: 1,
+      relocationId: "relocation:activation-http",
+      requestId: "request:activation-http",
+      checkpointRequestId: "checkpoint:activation-http",
+      captureRequestId: "capture-request:activation-http",
+      captureId: "capture:activation-http",
+      workspaceSnapshotRequestId: "snapshot-request:activation-http",
+      snapshotId: "snapshot:activation-http",
+      threadId: "thread:activation-http",
+      source: { nodeId: "node:source", workspaceId: "workspace:source" },
+      destination: {
+        nodeId: "node:test",
+        workspaceId: "workspace:destination",
+      },
+      sourceOwnershipGeneration: 4,
+      destinationOwnershipGeneration: 2,
+      manifestReference: "a".repeat(64),
+      sourceProofSha256: "b".repeat(64),
+      preparedReceiptSha256: "c".repeat(64),
+    };
+    const readiness = {
+      ...preflight,
+      readinessReceiptSha256: "d".repeat(64),
+      reportedAt: "2026-06-01T12:00:00.000Z",
+    };
+    const command = {
+      ...preflight,
+      ownershipGeneration: 5,
+      readinessReceiptSha256: readiness.readinessReceiptSha256,
+      committedAt: "2026-06-01T12:00:01.000Z",
+    };
+    const requests: Array<{ route: string; authorization: string; body: any }> =
+      [];
+    const server = start(async (request) => {
+      const route = new URL(request.url).pathname;
+      const body = await request.json();
+      requests.push({
+        route,
+        authorization: request.headers.get("authorization") ?? "",
+        body,
+      });
+      if (route.endsWith("/workspace-relocation-activations/claim")) {
+        return Response.json({
+          contractVersion: 1,
+          activation: { phase: "preflight", assignment: preflight },
+        });
+      }
+      if (route.endsWith("/readiness")) {
+        return Response.json({
+          contractVersion: 1,
+          nodeId: "node:test",
+          relocationId: preflight.relocationId,
+          accepted: true,
+          command,
+        });
+      }
+      return Response.json({
+        contractVersion: 1,
+        nodeId: "node:test",
+        relocationId: preflight.relocationId,
+        accepted: true,
+        status: "activated",
+      });
+    });
+    const connector = new HttpExecutionControllerConnector({
+      controllerUrl: server.url.toString(),
+      nodeId: "node:test",
+      credential: "activation-node-secret",
+    });
+
+    expect(
+      (await connector.claimWorkspaceRelocationActivation()) as unknown,
+    ).toEqual({ phase: "preflight", assignment: preflight });
+    expect(
+      (await connector.reportWorkspaceRelocationActivationReadiness(
+        readiness,
+      )) as unknown,
+    ).toEqual(command);
+    await connector.reportWorkspaceRelocationActivation({
+      status: "activated",
+      command,
+      activationReceiptSha256: "e".repeat(64),
+      reportedAt: "2026-06-01T12:00:02.000Z",
+    });
+    expect(requests.map(({ route }) => route)).toEqual([
+      "/v1/nodes/node%3Atest/workspace-relocation-activations/claim",
+      "/v1/nodes/node%3Atest/workspace-relocations/relocation%3Aactivation-http/readiness",
+      "/v1/nodes/node%3Atest/workspace-relocations/relocation%3Aactivation-http/activation-report",
+    ]);
+    expect(
+      requests.every(
+        ({ authorization }) =>
+          authorization === "Bearer activation-node-secret",
+      ),
+    ).toBe(true);
+    expect(requests[0]?.body).toEqual({
+      contractVersion: 1,
+      nodeId: "node:test",
+    });
+    expect(requests[1]?.body).toEqual(readiness);
+  });
+
+  test("rejects activation responses bound to another node or readiness", async () => {
+    const preflight = {
+      contractVersion: 1,
+      relocationId: "relocation:activation-mismatch",
+      requestId: "request:activation-mismatch",
+      checkpointRequestId: "checkpoint:activation-mismatch",
+      captureRequestId: "capture-request:activation-mismatch",
+      captureId: "capture:activation-mismatch",
+      workspaceSnapshotRequestId: "snapshot-request:activation-mismatch",
+      snapshotId: "snapshot:activation-mismatch",
+      threadId: "thread:activation-mismatch",
+      source: { nodeId: "node:source", workspaceId: "workspace:source" },
+      destination: {
+        nodeId: "node:test",
+        workspaceId: "workspace:destination",
+      },
+      sourceOwnershipGeneration: 4,
+      destinationOwnershipGeneration: 2,
+      manifestReference: "a".repeat(64),
+      sourceProofSha256: "b".repeat(64),
+      preparedReceiptSha256: "c".repeat(64),
+    };
+    const readiness = {
+      ...preflight,
+      readinessReceiptSha256: "d".repeat(64),
+      reportedAt: "2026-06-01T12:00:00.000Z",
+    };
+    const server = start(async (request) => {
+      const route = new URL(request.url).pathname;
+      if (route.endsWith("/workspace-relocation-activations/claim")) {
+        return Response.json({
+          contractVersion: 1,
+          activation: {
+            phase: "activate",
+            command: {
+              ...preflight,
+              ownershipGeneration: 5,
+              readinessReceiptSha256: readiness.readinessReceiptSha256,
+              committedAt: "2026-06-01T12:00:01.000Z",
+              destination: {
+                nodeId: "node:other",
+                workspaceId: "workspace:destination",
+              },
+            },
+          },
+        });
+      }
+      const command = {
+        ...preflight,
+        ownershipGeneration: 5,
+        readinessReceiptSha256: readiness.readinessReceiptSha256,
+        committedAt: "2026-06-01T12:00:01.000Z",
+        preparedReceiptSha256: "f".repeat(64),
+      };
+      return Response.json({
+        contractVersion: 1,
+        nodeId: "node:test",
+        relocationId: preflight.relocationId,
+        accepted: true,
+        command,
+      });
+    });
+    const connector = new HttpExecutionControllerConnector({
+      controllerUrl: server.url.toString(),
+      nodeId: "node:test",
+      credential: "activation-node-secret",
+    });
+    await expect(
+      connector.claimWorkspaceRelocationActivation(),
+    ).rejects.toBeInstanceOf(ControllerProtocolError);
+    await expect(
+      connector.reportWorkspaceRelocationActivationReadiness(readiness),
+    ).rejects.toBeInstanceOf(ControllerProtocolError);
+  });
+
   test("fails closed on unauthorized credentials and claims assigned to a different node", async () => {
     const unauthorized = start(() =>
       Response.json({ error: "unauthorized" }, { status: 401 }),

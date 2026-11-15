@@ -23,6 +23,13 @@ import {
   workspaceRelocationClaimRequestSchema,
   workspaceRelocationClaimResponseSchema,
   workspaceRelocationReportSchema,
+  workspaceRelocationActivationIntentRequestSchema,
+  workspaceRelocationActivationClaimRequestSchema,
+  workspaceRelocationActivationClaimResponseSchema,
+  workspaceRelocationActivationReadinessSchema,
+  workspaceRelocationActivationReadinessResponseSchema,
+  workspaceRelocationActivationReportSchema,
+  workspaceRelocationActivationReportResponseSchema,
 } from "@uzina/contracts/factory";
 import {
   executionCaptureControlClaimRequestSchema,
@@ -367,12 +374,39 @@ export function createFactoryHttpHandler(
           await blob?.body.cancel().catch(() => {});
           throw new FactoryError(404, "managed_work_checkpoint_blob_not_found");
         }
+        let current: Awaited<
+          ReturnType<FactoryService["getAuthorizedManagedWorkCheckpointBlob"]>
+        >;
+        try {
+          current = await factory.getAuthorizedManagedWorkCheckpointBlob(
+            session,
+            requestId,
+            reference,
+          );
+        } catch (error) {
+          await blob.body.cancel().catch(() => {});
+          throw error;
+        }
+        if (
+          current.scope !== authorized.scope ||
+          current.requestId !== authorized.requestId ||
+          current.captureId !== authorized.captureId ||
+          current.reference !== authorized.reference ||
+          current.size !== authorized.size ||
+          current.historical !== authorized.historical
+        ) {
+          await blob.body.cancel().catch(() => {});
+          throw new FactoryError(404, "managed_work_checkpoint_blob_not_found");
+        }
         return new Response(blob.body, {
           headers: {
             "content-type": "application/octet-stream",
             "content-length": String(blob.size),
             "cache-control": "private, no-store",
             "x-content-sha256": reference,
+            ...(current.historical
+              ? { "x-uzina-evidence-authority": "historical-inactive" }
+              : {}),
           },
         });
       }
@@ -399,6 +433,26 @@ export function createFactoryHttpHandler(
             session,
             decodeURIComponent(workspaceRelocationStatusMatch[1]!),
           ),
+        );
+      }
+      const workspaceRelocationActivationIntentMatch = path.match(
+        /^\/v1\/workspace-relocations\/([^/]+)\/activation-intent$/,
+      );
+      if (
+        request.method === "POST" &&
+        workspaceRelocationActivationIntentMatch
+      ) {
+        const input = await body(
+          request,
+          workspaceRelocationActivationIntentRequestSchema,
+        );
+        return json(
+          await factory.requestWorkspaceRelocationActivation(
+            session,
+            decodeURIComponent(workspaceRelocationActivationIntentMatch[1]!),
+            input,
+          ),
+          202,
         );
       }
       const captureAdmissionMatch = path.match(
@@ -516,24 +570,60 @@ export function createFactoryHttpHandler(
           throw new FactoryError(503, "workspace_snapshot_storage_unavailable");
         }
         const requestId = decodeURIComponent(snapshotBlobDownloadMatch[1]!);
-        const status = factory.getWorkspaceSnapshotStatus(session, requestId);
-        const references = factory.getAuthorizedWorkspaceSnapshotBlobReferences(
-          session,
-          status.captureId,
-        );
         const reference = snapshotBlobDownloadMatch[2]!;
-        if (!references.includes(reference)) {
+        const authorized = factory.getAuthorizedWorkspaceSnapshotBlob(
+          session,
+          requestId,
+          reference,
+        );
+        const blob = await snapshotStorage.getBlob(
+          authorized.captureId,
+          reference,
+        );
+        if (!blob || blob.size !== authorized.size) {
+          await blob?.body.cancel().catch(() => {});
           throw new FactoryError(404, "workspace_checkpoint_blob_not_found");
         }
-        const blob = await snapshotStorage.getBlob(status.captureId, reference);
-        if (!blob)
+        let current: ReturnType<
+          FactoryService["getAuthorizedWorkspaceSnapshotBlob"]
+        >;
+        try {
+          current = factory.getAuthorizedWorkspaceSnapshotBlob(
+            session,
+            requestId,
+            reference,
+          );
+        } catch (error) {
+          await blob.body.cancel().catch(() => {});
+          throw error;
+        }
+        if (
+          current.requestId !== authorized.requestId ||
+          current.snapshotId !== authorized.snapshotId ||
+          current.captureRequestId !== authorized.captureRequestId ||
+          current.captureId !== authorized.captureId ||
+          current.threadId !== authorized.threadId ||
+          current.target.nodeId !== authorized.target.nodeId ||
+          current.target.workspaceId !== authorized.target.workspaceId ||
+          current.ownershipGeneration !== authorized.ownershipGeneration ||
+          current.status !== authorized.status ||
+          current.manifestReference !== authorized.manifestReference ||
+          current.reference !== authorized.reference ||
+          current.size !== authorized.size ||
+          current.historical !== authorized.historical
+        ) {
+          await blob.body.cancel().catch(() => {});
           throw new FactoryError(404, "workspace_checkpoint_blob_not_found");
+        }
         return new Response(blob.body, {
           headers: {
             "content-type": "application/octet-stream",
             "content-length": String(blob.size),
             "cache-control": "private, no-store",
             "x-content-sha256": reference,
+            ...(current.historical
+              ? { "x-uzina-evidence-authority": "historical-inactive" }
+              : {}),
           },
         });
       }
@@ -760,6 +850,81 @@ export function createFactoryHttpHandler(
             contractVersion: CONTRACT_VERSION,
             relocation: await factory.claimWorkspaceRelocation(session, input),
           }),
+        );
+      }
+      const workspaceRelocationActivationClaimMatch = path.match(
+        /^\/v1\/nodes\/([^/]+)\/workspace-relocation-activations\/claim$/,
+      );
+      if (
+        request.method === "POST" &&
+        workspaceRelocationActivationClaimMatch
+      ) {
+        const input = await body(
+          request,
+          workspaceRelocationActivationClaimRequestSchema,
+        );
+        if (
+          input.nodeId !==
+          decodeURIComponent(workspaceRelocationActivationClaimMatch[1]!)
+        ) {
+          throw new FactoryError(403, "node_identity_mismatch");
+        }
+        return json(
+          workspaceRelocationActivationClaimResponseSchema.parse({
+            contractVersion: CONTRACT_VERSION,
+            activation: await factory.claimWorkspaceRelocationActivation(
+              session,
+              input,
+            ),
+          }),
+        );
+      }
+      const workspaceRelocationActivationReadinessMatch = path.match(
+        /^\/v1\/nodes\/([^/]+)\/workspace-relocations\/([^/]+)\/readiness$/,
+      );
+      if (
+        request.method === "POST" &&
+        workspaceRelocationActivationReadinessMatch
+      ) {
+        const input = await body(
+          request,
+          workspaceRelocationActivationReadinessSchema,
+        );
+        return json(
+          workspaceRelocationActivationReadinessResponseSchema.parse(
+            await factory.reportWorkspaceRelocationActivationReadiness(
+              session,
+              decodeURIComponent(
+                workspaceRelocationActivationReadinessMatch[1]!,
+              ),
+              decodeURIComponent(
+                workspaceRelocationActivationReadinessMatch[2]!,
+              ),
+              input,
+            ),
+          ),
+        );
+      }
+      const workspaceRelocationActivationReportMatch = path.match(
+        /^\/v1\/nodes\/([^/]+)\/workspace-relocations\/([^/]+)\/activation-report$/,
+      );
+      if (
+        request.method === "POST" &&
+        workspaceRelocationActivationReportMatch
+      ) {
+        const input = await body(
+          request,
+          workspaceRelocationActivationReportSchema,
+        );
+        return json(
+          workspaceRelocationActivationReportResponseSchema.parse(
+            await factory.reportWorkspaceRelocationActivation(
+              session,
+              decodeURIComponent(workspaceRelocationActivationReportMatch[1]!),
+              decodeURIComponent(workspaceRelocationActivationReportMatch[2]!),
+              input,
+            ),
+          ),
         );
       }
       const workspaceRelocationReportMatch = path.match(

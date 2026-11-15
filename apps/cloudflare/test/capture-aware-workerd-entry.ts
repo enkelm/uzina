@@ -34,6 +34,11 @@ import worker from "../src/worker";
 
 let modelCalls = 0;
 let alarmCalls = 0;
+const queuedModelWriteCalls: Array<{
+  id: string;
+  path: string;
+  content: string;
+}> = [];
 let runtimeOptionsHeld = false;
 let runtimeOptionsEntered = false;
 let unusableProviderConfiguration = false;
@@ -54,6 +59,22 @@ let privateArtifactReadHoldRequestId: string | undefined;
 let privateArtifactReadHoldMode: "first-read" | "second-read" | undefined;
 let privateArtifactReadEntered = false;
 let releasePrivateArtifactRead: (() => void) | undefined;
+let ownerBlobReadGate:
+  | {
+      namespace: "managed-work-checkpoints" | "workspace-snapshots";
+      identifier: string;
+      reference: string;
+    }
+  | undefined;
+let ownerBlobReadEntered = false;
+let ownerBlobReadCancelled = false;
+let ownerBlobReadReleased = false;
+type OwnerBlobReadControl = {
+  action: "hold" | "state" | "release";
+  namespace?: "managed-work-checkpoints" | "workspace-snapshots";
+  identifier?: string;
+  reference?: string;
+};
 let checkpointExportForbiddenThreadId: string | undefined;
 let publicationBindingApplied = false;
 let privateReadBindingApplied = false;
@@ -108,6 +129,7 @@ function response(signal?: AbortSignal) {
   const emitManagedReadFailure = failNextManagedReadToolCall;
   if (emitManagedReadFailure) failNextManagedReadToolCall = false;
   let completed = false;
+  const modelWrite = queuedModelWriteCalls.shift();
   const complete = () => {
     if (completed) return;
     completed = true;
@@ -128,7 +150,19 @@ function response(signal?: AbortSignal) {
               },
             },
           ]
-        : [{ type: "text", text: "The captured Pi root is settled." }],
+        : modelWrite
+          ? [
+              {
+                type: "toolCall",
+                id: modelWrite.id,
+                name: "remote_write_file",
+                arguments: {
+                  path: modelWrite.path,
+                  content: modelWrite.content,
+                },
+              },
+            ]
+          : [{ type: "text", text: "The captured Pi root is settled." }],
       api: "uzina-capture-test-api",
       provider: "uzina-capture-test",
       model: "capture-test-model",
@@ -142,7 +176,7 @@ function response(signal?: AbortSignal) {
       },
       stopReason: signal?.aborted
         ? "aborted"
-        : emitManagedReadFailure
+        : emitManagedReadFailure || modelWrite
           ? "toolUse"
           : "stop",
       timestamp: Date.now(),
@@ -161,15 +195,77 @@ type TestFactoryEnvironment = ConstructorParameters<typeof FactoryObject>[1] & {
   UZINA_TEST_HOLD_PRIVATE_READ_REQUEST_ID?: string;
   UZINA_TEST_HOLD_PRIVATE_READ_MODE?: "first-read" | "second-read";
   UZINA_TEST_FORBID_CHECKPOINT_EXPORT_THREAD_ID?: string;
+  UZINA_TEST_OWNER_BLOB_BARRIER_URL?: string;
 };
 
 function checkpointBucketWithPrivateReadGate(
   bucket: NonNullable<TestFactoryEnvironment["CHECKPOINTS"]>,
+  ownerReadBarrierUrl?: string,
 ): NonNullable<TestFactoryEnvironment["CHECKPOINTS"]> {
   const reads = new Map<string, number>();
   return {
     put: (key, value, options) => bucket.put(key, value, options),
     async get(key) {
+      const ownerGate = ownerBlobReadGate;
+      if (ownerGate) {
+        const prefix = await namespacedPrefix(
+          ownerGate.namespace,
+          ownerGate.identifier,
+        );
+        if (
+          ownerBlobReadGate === ownerGate &&
+          !ownerBlobReadReleased &&
+          key === `${prefix}${ownerGate.reference}`
+        ) {
+          if (!ownerReadBarrierUrl) {
+            throw new Error("Owner blob read barrier is unavailable");
+          }
+          const object = await bucket.get(key);
+          ownerBlobReadEntered = true;
+          ownerBlobReadReleased = true;
+          try {
+            const released = await fetch(ownerReadBarrierUrl, {
+              method: "POST",
+            });
+            await released.body?.cancel();
+            if (released.status !== 204) {
+              throw new Error("Owner blob read barrier failed");
+            }
+          } finally {
+            ownerBlobReadEntered = false;
+          }
+          if (!object) return null;
+          const reader = object.body.getReader();
+          const body = new ReadableStream<Uint8Array>(
+            {
+              async pull(controller) {
+                try {
+                  const part = await reader.read();
+                  if (part.done) {
+                    reader.releaseLock();
+                    controller.close();
+                  } else {
+                    controller.enqueue(part.value);
+                  }
+                } catch (error) {
+                  reader.releaseLock();
+                  controller.error(error);
+                }
+              },
+              async cancel(reason) {
+                try {
+                  await reader.cancel(reason);
+                  ownerBlobReadCancelled = true;
+                } finally {
+                  reader.releaseLock();
+                }
+              },
+            },
+            { highWaterMark: 0 },
+          );
+          return { size: object.size, body };
+        }
+      }
       const requestId = privateArtifactReadHoldRequestId;
       const mode = privateArtifactReadHoldMode;
       if (requestId && mode) {
@@ -265,7 +361,10 @@ export class CaptureTestFactory extends FactoryObject {
     super(state, {
       ...environment,
       CHECKPOINTS: environment.CHECKPOINTS
-        ? checkpointBucketWithPrivateReadGate(environment.CHECKPOINTS)
+        ? checkpointBucketWithPrivateReadGate(
+            environment.CHECKPOINTS,
+            environment.UZINA_TEST_OWNER_BLOB_BARRIER_URL,
+          )
         : undefined,
     });
     if (!publicationBindingApplied) {
@@ -289,6 +388,33 @@ export class CaptureTestFactory extends FactoryObject {
       exportGuardBindingApplied = true;
     }
     this.#storage = state.storage;
+  }
+
+  ownerBlobReadForTest(input: OwnerBlobReadControl) {
+    if (input.action === "hold") {
+      if (
+        !input.namespace ||
+        !input.identifier ||
+        !input.reference ||
+        !/^[a-f0-9]{64}$/.test(input.reference)
+      ) {
+        throw new Error("Invalid owner blob read control");
+      }
+      ownerBlobReadGate = {
+        namespace: input.namespace,
+        identifier: input.identifier,
+        reference: input.reference,
+      };
+      ownerBlobReadEntered = false;
+      ownerBlobReadCancelled = false;
+      ownerBlobReadReleased = false;
+    } else if (input.action === "release") {
+      ownerBlobReadReleased = true;
+    }
+    return {
+      entered: ownerBlobReadEntered,
+      cancelled: ownerBlobReadCancelled,
+    };
   }
 
   checkpointAssemblyJournalForTest(requestId: string) {
@@ -753,6 +879,18 @@ export default {
     }
     if (
       request.method === "POST" &&
+      url.pathname === "/__test/owner-blob-read"
+    ) {
+      const input = (await request.json()) as OwnerBlobReadControl;
+      const factory = environment.FACTORY.get(
+        environment.FACTORY.idFromName("uzina-single-factory"),
+      ) as FactoryRpc & {
+        ownerBlobReadForTest(input: OwnerBlobReadControl): unknown;
+      };
+      return Response.json(await factory.ownerBlobReadForTest(input));
+    }
+    if (
+      request.method === "POST" &&
       url.pathname === "/__test/private-checkpoint-read"
     ) {
       const input = (await request.json()) as {
@@ -879,6 +1017,14 @@ export default {
             input.sourceWorkspaceManifestReference,
           authoritativeWorkspaceReferences:
             input.authoritativeWorkspaceReferences,
+          authorizedCommandPlacements: [
+            {
+              nodeId: input.expectedEvidence.capture.target.nodeId,
+              workspaceId: input.expectedEvidence.capture.target.workspaceId,
+              ownershipGeneration:
+                input.expectedEvidence.capture.ownershipGeneration,
+            },
+          ],
           manifestReference: input.manifestReference,
           expectedRuntimeRequirements: [
             ...MANAGED_WORK_RUNTIME_REQUIREMENTS,
@@ -1047,6 +1193,29 @@ export default {
         input.operation,
       );
       return Response.json({ jobId: receipt.jobId, status: receipt.status });
+    }
+    if (
+      request.method === "POST" &&
+      url.pathname === "/__test/model-tool-call"
+    ) {
+      const input = (await request.json()) as {
+        id: string;
+        path: string;
+        content: string;
+      };
+      if (
+        !input.id ||
+        !input.path ||
+        typeof input.content !== "string" ||
+        queuedModelWriteCalls.length > 0
+      ) {
+        return Response.json(
+          { error: "invalid_model_tool_call" },
+          { status: 400 },
+        );
+      }
+      queuedModelWriteCalls.push(input);
+      return Response.json({ queued: true });
     }
     if (
       request.method === "POST" &&

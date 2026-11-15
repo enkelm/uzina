@@ -139,6 +139,58 @@ export class ExecutionLoop {
             );
           }
 
+          for (const report of this.#daemon.pendingWorkspaceRelocationActivationReports()) {
+            if (shutdown.signal.aborted) break;
+            await this.#controller.reportWorkspaceRelocationActivation(report);
+            this.#daemon.markWorkspaceRelocationActivationReported(
+              report.command.relocationId,
+              report,
+            );
+          }
+
+          if (shutdown.signal.aborted) break;
+          const activation =
+            await this.#controller.claimWorkspaceRelocationActivation();
+          if (shutdown.signal.aborted) break;
+          if (activation?.phase === "preflight") {
+            const readiness =
+              await this.#daemon.prepareWorkspaceRelocationActivation(
+                activation.assignment,
+              );
+            if (readiness && !shutdown.signal.aborted) {
+              const command =
+                await this.#controller.reportWorkspaceRelocationActivationReadiness(
+                  readiness,
+                );
+              if (!shutdown.signal.aborted) {
+                const report =
+                  await this.#daemon.activateWorkspaceRelocation(command);
+                if (!credentialRejected) {
+                  await this.#controller.reportWorkspaceRelocationActivation(
+                    report,
+                  );
+                  this.#daemon.markWorkspaceRelocationActivationReported(
+                    report.command.relocationId,
+                    report,
+                  );
+                }
+              }
+            }
+          } else if (activation?.phase === "activate") {
+            const report = await this.#daemon.activateWorkspaceRelocation(
+              activation.command,
+            );
+            if (!credentialRejected && !shutdown.signal.aborted) {
+              await this.#controller.reportWorkspaceRelocationActivation(
+                report,
+              );
+              this.#daemon.markWorkspaceRelocationActivationReported(
+                report.command.relocationId,
+                report,
+              );
+            }
+          }
+
           if (shutdown.signal.aborted) break;
           const relocation = await this.#controller.claimWorkspaceRelocation();
           if (shutdown.signal.aborted) break;
