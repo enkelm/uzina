@@ -2988,6 +2988,47 @@ exec "$UZINA_RELOCATION_TEST_REAL_GIT" "$@"
     await destinationLoop?.catch(() => {});
     destinationLoop = undefined;
     destinationAbort = undefined;
+    const authorityBeforeMigration = await call<
+      Record<string, Array<Record<string, unknown>>>
+    >(baseUrl, "/__test/workspace-ownership-migration", {
+      body: { action: "read" },
+    });
+    expect(
+      authorityBeforeMigration.value.controls.some(
+        (row) => row.status === "source-capture-fenced",
+      ),
+    ).toBe(true);
+    expect(
+      authorityBeforeMigration.value.snapshots.some(
+        (row) => row.status === "workspace-checkpoint-available",
+      ),
+    ).toBe(true);
+    expect(
+      authorityBeforeMigration.value.checkpoints.some(
+        (row) => row.status === "available",
+      ),
+    ).toBe(true);
+    expect(
+      authorityBeforeMigration.value.relocations.some(
+        (row) => row.ownership_generation === 0 && row.report_json !== null,
+      ),
+    ).toBe(true);
+    const legacyAuthoritySchema = await call(
+      baseUrl,
+      "/__test/workspace-ownership-migration",
+      { body: { action: "drop-authority-column" } },
+    );
+    expect(legacyAuthoritySchema.response.status).toBe(200);
+    await evictFactory();
+    const authorityAfterMigration = await call<
+      Record<string, Array<Record<string, unknown>>>
+    >(baseUrl, "/__test/workspace-ownership-migration", {
+      body: { action: "read" },
+    });
+    expect(authorityAfterMigration.value).toEqual(
+      authorityBeforeMigration.value,
+    );
+
     await expect(
       reopenedDestinationDaemon.executeJob({
         contractVersion: 1,

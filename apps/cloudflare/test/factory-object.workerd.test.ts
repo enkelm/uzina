@@ -185,6 +185,38 @@ describe("Cloudflare Factory in Miniflare workerd", () => {
             event.requestId === "request:workerd",
         ),
       ).toHaveLength(1);
+
+      const factoryObject = namespace.get(durableId);
+      const legacySchema = await factoryObject.fetch(
+        new Request("http://factory.test/__test/drop-workspace-authority"),
+      );
+      expect(legacySchema.status).toBe(200);
+      await miniflare.unsafeEvictDurableObject("worker", "TestFactory", {
+        id: durableId.toString(),
+      });
+      const migratedReceipt = await request<{
+        jobId: string;
+        requestId: string;
+        ownershipGeneration: number;
+        dispatchStatus: string;
+      }>("/v1/commands/request:workerd", { credential: ownerCredential });
+      expect(migratedReceipt.response.status).toBe(200);
+      expect(migratedReceipt.value).toMatchObject({
+        jobId: firstAcceptance.value.jobId,
+        requestId: "request:workerd",
+        ownershipGeneration: 0,
+        dispatchStatus: "unavailable",
+      });
+      const authority = await factoryObject.fetch(
+        new Request("http://factory.test/__test/workspace-authority"),
+      );
+      expect(await authority.json()).toEqual([
+        {
+          workspace_id: "workspace:workerd",
+          node_id: "node:workerd",
+          ownership_generation: 0,
+        },
+      ]);
     } finally {
       await miniflare.dispose();
       await rm(directory, { recursive: true, force: true });

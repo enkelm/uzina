@@ -132,6 +132,7 @@ type NodeRow = {
   last_seen_at: string | null;
 };
 type WorkspaceRow = { workspace_id: string; node_id: string; name: string };
+type WorkspaceAuthorityRow = WorkspaceRow & { ownership_generation: number };
 type ThreadRow = {
   thread_id: string;
   project_id: string;
@@ -1285,7 +1286,7 @@ export class FactoryService {
         );
       }
       this.database.exec(
-        "INSERT INTO workspaces (workspace_id, node_id, name) VALUES (?, ?, ?)",
+        "INSERT INTO workspaces (workspace_id, node_id, name, ownership_generation) VALUES (?, ?, ?, 0)",
         [id, nodeId, name],
       );
       this.#event(
@@ -1363,8 +1364,12 @@ export class FactoryService {
       );
     const threadId = input.threadId ?? makeId("thread");
     const createdAt = now();
-    const generation = this.#ownershipGeneration();
+    let generation = 0;
     this.database.transaction(() => {
+      generation = this.#workspaceOwnershipGeneration(
+        input.target.nodeId,
+        input.target.workspaceId,
+      );
       this.#assertWorkspaceNotCapturing(input.target.workspaceId);
       if (
         this.database.all("SELECT thread_id FROM threads WHERE thread_id = ?", [
@@ -1511,6 +1516,11 @@ export class FactoryService {
     text: string,
   ): Promise<FactoryCommandReceipt> {
     const thread = this.#requireSteerThread(session, threadId);
+    this.#assertCurrentWorkspaceAssignment(
+      thread.node_id,
+      thread.workspace_id,
+      thread.ownership_generation,
+    );
     const actorJson = encode(session.actor);
     const payload = { threadId, text };
     const payloadHash = await sha256(encode(payload));
@@ -1519,27 +1529,52 @@ export class FactoryService {
       [requestId],
     )[0];
     if (existing) {
-      this.#requireSteerThread(session, threadId);
-      if (
-        existing.payload_hash !== payloadHash ||
-        existing.thread_id !== threadId ||
-        existing.actor_json !== actorJson
-      ) {
-        throw conflict(
-          "request_id_conflict",
-          "This request ID was already used for a different actor or payload",
+      return this.database.transaction(() => {
+        const currentThread = this.#requireSteerThread(session, threadId);
+        this.#assertCurrentWorkspaceAssignment(
+          currentThread.node_id,
+          currentThread.workspace_id,
+          currentThread.ownership_generation,
         );
-      }
-      return this.#receiptByJob(existing.job_id);
+        if (
+          currentThread.node_id !== thread.node_id ||
+          currentThread.workspace_id !== thread.workspace_id ||
+          currentThread.ownership_generation !== thread.ownership_generation
+        ) {
+          throw conflict(
+            "ownership_fenced",
+            "The thread placement changed before this request could be reconciled",
+          );
+        }
+        const currentReceipt = this.database.all<ReceiptRow>(
+          "SELECT request_id, actor_json, thread_id, payload_hash, job_id, accepted_at FROM command_receipts WHERE request_id = ?",
+          [requestId],
+        )[0];
+        if (
+          !currentReceipt ||
+          currentReceipt.payload_hash !== payloadHash ||
+          currentReceipt.thread_id !== threadId ||
+          currentReceipt.actor_json !== actorJson
+        ) {
+          throw conflict(
+            "request_id_conflict",
+            "This request ID was already used for a different actor or payload",
+          );
+        }
+        return this.#receiptByJob(currentReceipt.job_id);
+      });
     }
 
     const jobId = makeId("job");
     const acceptedAt = now();
-    const generation = this.#ownershipGeneration();
+    const generation = this.#workspaceOwnershipGeneration(
+      thread.node_id,
+      thread.workspace_id,
+    );
     if (Number(thread.ownership_generation) !== generation) {
       throw conflict(
         "ownership_fenced",
-        "This thread is not assigned to the current ownership generation",
+        "This thread does not match its current workspace ownership generation",
       );
     }
     const queuePayload = {
@@ -1557,6 +1592,25 @@ export class FactoryService {
 
     this.database.transaction(() => {
       this.#requireSteerThread(session, threadId);
+      const currentThread = this.database.all<ThreadRow>(
+        "SELECT thread_id, project_id, title, node_id, workspace_id, ownership_generation, owner_private, created_at FROM threads WHERE thread_id = ?",
+        [threadId],
+      )[0];
+      if (
+        !currentThread ||
+        !this.#isCurrentWorkspaceAssignment(
+          currentThread.node_id,
+          currentThread.workspace_id,
+          currentThread.ownership_generation,
+        ) ||
+        currentThread.node_id !== thread.node_id ||
+        currentThread.workspace_id !== thread.workspace_id
+      ) {
+        throw conflict(
+          "ownership_fenced",
+          "The thread placement changed before this request could be admitted",
+        );
+      }
       const raced = this.database.all<ReceiptRow>(
         "SELECT request_id, actor_json, thread_id, payload_hash, job_id, accepted_at FROM command_receipts WHERE request_id = ?",
         [requestId],
@@ -1574,17 +1628,17 @@ export class FactoryService {
         }
         return;
       }
-      const currentGeneration = this.#ownershipGeneration();
-      const currentThread = this.database.all<ThreadRow>(
-        "SELECT thread_id, project_id, title, node_id, workspace_id, ownership_generation, owner_private, created_at FROM threads WHERE thread_id = ?",
-        [threadId],
-      )[0];
       if (
-        currentGeneration !== generation ||
         !currentThread ||
-        Number(currentThread.ownership_generation) !== currentGeneration ||
+        !this.#isCurrentWorkspaceAssignment(
+          currentThread.node_id,
+          currentThread.workspace_id,
+          currentThread.ownership_generation,
+        ) ||
+        Number(currentThread.ownership_generation) !== generation ||
         currentThread.node_id !== thread.node_id ||
-        currentThread.workspace_id !== thread.workspace_id
+        currentThread.workspace_id !== thread.workspace_id ||
+        currentThread.ownership_generation !== generation
       ) {
         throw conflict(
           "ownership_fenced",
@@ -1876,7 +1930,12 @@ export class FactoryService {
         !lock ||
         thread.node_id !== capture.node_id ||
         thread.workspace_id !== capture.workspace_id ||
-        thread.ownership_generation !== capture.ownership_generation
+        thread.ownership_generation !== capture.ownership_generation ||
+        !this.#isCurrentWorkspaceAssignment(
+          capture.node_id,
+          capture.workspace_id,
+          capture.ownership_generation,
+        )
       ) {
         throw conflict(
           "workspace_snapshot_fence_missing",
@@ -3154,9 +3213,12 @@ export class FactoryService {
           [input.nodeId],
         )[0];
       if (!job) return null;
-      const currentGeneration = this.#ownershipGeneration();
       if (
-        job.ownership_generation !== currentGeneration ||
+        !this.#isCurrentWorkspaceAssignment(
+          job.node_id,
+          job.workspace_id,
+          job.ownership_generation,
+        ) ||
         !this.#hasActiveWorkspaceReport(
           job.node_id,
           job.workspace_id,
@@ -3331,6 +3393,11 @@ export class FactoryService {
   ): Promise<ManagedWorkRuntimeAdmission> {
     return this.database.transaction(() => {
       const thread = this.#captureThread(threadId);
+      this.#assertCurrentWorkspaceAssignment(
+        thread.node_id,
+        thread.workspace_id,
+        thread.ownership_generation,
+      );
       const captures = this.database.all<{ capture_id: string }>(
         "SELECT capture_id FROM managed_work_captures WHERE thread_id = ?",
         [threadId],
@@ -3526,7 +3593,11 @@ export class FactoryService {
       thread.node_id !== controlRow.node_id ||
       thread.workspace_id !== controlRow.workspace_id ||
       thread.ownership_generation !== controlRow.ownership_generation ||
-      this.#ownershipGeneration() !== controlRow.ownership_generation ||
+      !this.#isCurrentWorkspaceAssignment(
+        controlRow.node_id,
+        controlRow.workspace_id,
+        controlRow.ownership_generation,
+      ) ||
       sharedWorkspace !== 1 ||
       unsettledInput ||
       unsettledEffect
@@ -3768,9 +3839,9 @@ export class FactoryService {
     const input = executionRegisterRequestSchema.parse(request);
     this.#requireNode(session, input.nodeId);
     const timestamp = now();
-    this.#validateReportedWorkspaces(input.nodeId, input.workspaces);
     this.database.transaction(() => {
       this.#requireNode(session, input.nodeId);
+      this.#validateReportedWorkspaces(input.nodeId, input.workspaces);
       const node = this.database.all<NodeRow>(
         "SELECT node_id, name, availability, last_seen_at FROM nodes WHERE node_id = ?",
         [input.nodeId],
@@ -3823,20 +3894,20 @@ export class FactoryService {
   ) {
     const input = executionHeartbeatRequestSchema.parse(request);
     this.#requireNode(session, input.nodeId);
-    const registered = this.database.all<ExecutionNodeStateRow>(
-      "SELECT node_id, daemon_version, capabilities_json, registered_at, last_seen_at FROM execution_node_state WHERE node_id = ?",
-      [input.nodeId],
-    )[0];
-    if (!registered) {
-      throw conflict(
-        "node_not_registered",
-        "Register before sending heartbeats",
-      );
-    }
     const timestamp = now();
-    this.#validateReportedWorkspaces(input.nodeId, input.workspaces);
     this.database.transaction(() => {
       this.#requireNode(session, input.nodeId);
+      const registered = this.database.all<ExecutionNodeStateRow>(
+        "SELECT node_id, daemon_version, capabilities_json, registered_at, last_seen_at FROM execution_node_state WHERE node_id = ?",
+        [input.nodeId],
+      )[0];
+      if (!registered) {
+        throw conflict(
+          "node_not_registered",
+          "Register before sending heartbeats",
+        );
+      }
+      this.#validateReportedWorkspaces(input.nodeId, input.workspaces);
       this.#storeReportedWorkspaces(input.nodeId, input.workspaces);
       this.database.exec(
         "UPDATE execution_node_state SET capabilities_json = ?, last_seen_at = ? WHERE node_id = ?",
@@ -3880,7 +3951,6 @@ export class FactoryService {
       )[0];
       if (!node || !runtime || !this.#isNodeOnline(node)) return null;
 
-      const generation = this.#ownershipGeneration();
       const activeAssignment = this.database.all<ExecutionJobRow>(
         "SELECT * FROM execution_jobs WHERE node_id = ? AND status = 'claimed' ORDER BY claimed_at, job_id LIMIT 1",
         [nodeId],
@@ -3928,22 +3998,28 @@ export class FactoryService {
         activeAssignment ??
         this.database.all<ExecutionJobRow>(
           `SELECT jobs.* FROM execution_jobs AS jobs
-           JOIN execution_node_workspaces AS workspaces
-             ON workspaces.node_id = jobs.node_id AND workspaces.workspace_id = jobs.workspace_id
+           JOIN execution_node_workspaces AS observations
+             ON observations.node_id = jobs.node_id AND observations.workspace_id = jobs.workspace_id
+           JOIN workspaces AS authority
+             ON authority.node_id = jobs.node_id AND authority.workspace_id = jobs.workspace_id
            WHERE jobs.node_id = ? AND jobs.status = 'queued'
-             AND jobs.ownership_generation = ?
              AND NOT EXISTS (
                SELECT 1 FROM managed_work_captures AS captures
                WHERE captures.workspace_id = jobs.workspace_id
              )
-             AND workspaces.ownership_generation = jobs.ownership_generation
-             AND workspaces.state = 'active'
+             AND observations.ownership_generation = jobs.ownership_generation
+             AND observations.state = 'active'
+             AND authority.ownership_generation = jobs.ownership_generation
            ORDER BY jobs.accepted_at, jobs.job_id LIMIT 1`,
-          [nodeId, generation],
+          [nodeId],
         )[0];
       if (!job) return null;
       if (
-        job.ownership_generation !== generation ||
+        !this.#isCurrentWorkspaceAssignment(
+          job.node_id,
+          job.workspace_id,
+          job.ownership_generation,
+        ) ||
         !this.#hasActiveWorkspaceReport(
           nodeId,
           job.workspace_id,
@@ -4372,7 +4448,6 @@ export class FactoryService {
       return 0;
     }
     return this.database.transaction(() => {
-      const generation = this.#ownershipGeneration();
       const rows = this.database.all<
         IntentRow & {
           node_name: string;
@@ -4388,16 +4463,34 @@ export class FactoryService {
            nodes.last_seen_at AS node_last_seen_at
          FROM dispatch_intents AS intents
          JOIN nodes ON nodes.node_id = intents.node_id
-         WHERE intents.status = 'unavailable' AND intents.ownership_generation = ?
+         WHERE intents.status = 'unavailable'
            AND NOT EXISTS (
              SELECT 1 FROM managed_work_captures AS captures
              WHERE captures.thread_id = intents.thread_id
            )`,
-        [generation],
+        [],
       );
       let requeued = 0;
       for (const row of rows) {
+        const thread = this.database.all<ThreadRow>(
+          "SELECT thread_id, project_id, title, node_id, workspace_id, ownership_generation, owner_private, created_at FROM threads WHERE thread_id = ?",
+          [row.thread_id],
+        )[0];
         if (
+          !thread ||
+          thread.node_id !== row.node_id ||
+          thread.workspace_id !== row.workspace_id ||
+          thread.ownership_generation !== row.ownership_generation ||
+          !this.#isCurrentWorkspaceAssignment(
+            row.node_id,
+            row.workspace_id,
+            row.ownership_generation,
+          ) ||
+          !this.#hasActiveWorkspaceReport(
+            row.node_id,
+            row.workspace_id,
+            row.ownership_generation,
+          ) ||
           !this.#isNodeOnline({
             node_id: row.node_id,
             name: row.node_name,
@@ -4488,21 +4581,35 @@ export class FactoryService {
         queued.outcome = detail;
         return queued;
       }
-      const currentGeneration = this.#ownershipGeneration();
+      const currentThread = this.database.all<ThreadRow>(
+        "SELECT thread_id, project_id, title, node_id, workspace_id, ownership_generation, owner_private, created_at FROM threads WHERE thread_id = ?",
+        [queued.thread_id],
+      )[0];
+      const currentPlacement = Boolean(
+        currentThread &&
+        currentThread.node_id === queued.node_id &&
+        currentThread.workspace_id === queued.workspace_id &&
+        currentThread.ownership_generation === queued.ownership_generation &&
+        this.#isCurrentWorkspaceAssignment(
+          queued.node_id,
+          queued.workspace_id,
+          queued.ownership_generation,
+        ) &&
+        this.#hasActiveWorkspaceReport(
+          queued.node_id,
+          queued.workspace_id,
+          queued.ownership_generation,
+        ),
+      );
       const node = this.database.all<NodeRow>(
         "SELECT node_id, name, availability, last_seen_at FROM nodes WHERE node_id = ?",
         [queued.node_id],
       )[0];
-      if (
-        queued.ownership_generation !== currentGeneration ||
-        !node ||
-        !this.#isNodeOnline(node)
-      ) {
+      if (!currentPlacement || !node || !this.#isNodeOnline(node)) {
         const timestamp = now();
-        const detail =
-          queued.ownership_generation !== currentGeneration
-            ? "The assignment is fenced by a newer ownership generation"
-            : "The explicitly assigned execution node is unavailable";
+        const detail = !currentPlacement
+          ? "The assignment is fenced by its workspace ownership authority"
+          : "The explicitly assigned execution node is unavailable";
         this.database.exec(
           "UPDATE dispatch_intents SET status = 'unavailable', outcome = ?, updated_at = ? WHERE job_id = ? AND status = 'queued'",
           [detail, timestamp, queued.job_id],
@@ -4588,14 +4695,13 @@ export class FactoryService {
     reports: readonly ExecutionWorkspaceReport[],
   ): void {
     const reported = new Set<string>();
-    const generation = this.#ownershipGeneration();
     for (const report of reports) {
       if (reported.has(report.workspaceId)) {
         throw new FactoryError(400, "duplicate_workspace_report");
       }
       reported.add(report.workspaceId);
-      const workspace = this.database.all<WorkspaceRow>(
-        "SELECT workspace_id, node_id, name FROM workspaces WHERE workspace_id = ?",
+      const workspace = this.database.all<WorkspaceAuthorityRow>(
+        "SELECT workspace_id, node_id, name, ownership_generation FROM workspaces WHERE workspace_id = ?",
         [report.workspaceId],
       )[0];
       if (!workspace || workspace.node_id !== nodeId) {
@@ -4605,10 +4711,13 @@ export class FactoryService {
           "The owner has not assigned this workspace to the authenticated node",
         );
       }
-      if (report.ownershipGeneration !== generation) {
+      if (
+        report.ownershipGeneration !==
+        this.#workspaceOwnershipGeneration(nodeId, report.workspaceId)
+      ) {
         throw conflict(
           "stale_ownership_generation",
-          "Workspace report does not match the controller ownership generation",
+          "Workspace report does not match its provisioned workspace ownership generation",
         );
       }
     }
@@ -4640,12 +4749,18 @@ export class FactoryService {
       [nodeId, workspaceId],
     )[0];
     return Boolean(
-      row && row.state === "active" && row.ownership_generation === generation,
+      row &&
+      row.state === "active" &&
+      row.ownership_generation === generation &&
+      this.#isCurrentWorkspaceAssignment(nodeId, workspaceId, generation),
     );
   }
 
   #assertRemoteExecutionAdmission(job: ExecutionJob): void {
-    const generation = this.#ownershipGeneration();
+    const generation = this.#workspaceOwnershipGeneration(
+      job.target.nodeId,
+      job.target.workspaceId,
+    );
     if (job.ownershipGeneration !== generation) {
       throw conflict(
         "stale_ownership_generation",
@@ -4720,6 +4835,11 @@ export class FactoryService {
   }
 
   #assertManagedCaptureAdmission(threadId: string, row: ThreadRow): void {
+    this.#assertCurrentWorkspaceAssignment(
+      row.node_id,
+      row.workspace_id,
+      row.ownership_generation,
+    );
     this.#assertWorkspaceNotReservedForRelocation(row.workspace_id);
     const shared = this.database.all<{ count: number }>(
       "SELECT COUNT(*) AS count FROM threads WHERE workspace_id = ?",
@@ -4864,8 +4984,8 @@ export class FactoryService {
         "Destination node and workspace must differ from the held source",
       );
     }
-    const destination = this.database.all<WorkspaceRow>(
-      "SELECT workspace_id, node_id, name FROM workspaces WHERE workspace_id = ?",
+    const destination = this.database.all<WorkspaceAuthorityRow>(
+      "SELECT workspace_id, node_id, name, ownership_generation FROM workspaces WHERE workspace_id = ?",
       [binding.destinationWorkspaceId],
     )[0];
     const node = this.database.all<{ node_id: string }>(
@@ -4875,7 +4995,12 @@ export class FactoryService {
     if (
       !node ||
       !destination ||
-      destination.node_id !== binding.destinationNodeId
+      destination.node_id !== binding.destinationNodeId ||
+      !this.#isCurrentWorkspaceAssignment(
+        binding.destinationNodeId,
+        binding.destinationWorkspaceId,
+        destination.ownership_generation,
+      )
     ) {
       throw conflict(
         "workspace_relocation_destination_not_provisioned",
@@ -5411,7 +5536,11 @@ export class FactoryService {
       thread.node_id !== binding.node_id ||
       thread.workspace_id !== binding.workspace_id ||
       thread.ownership_generation !== binding.ownership_generation ||
-      this.#ownershipGeneration() !== binding.ownership_generation ||
+      !this.#isCurrentWorkspaceAssignment(
+        binding.node_id,
+        binding.workspace_id,
+        binding.ownership_generation,
+      ) ||
       !this.#isWorkspaceSnapshotFenceValid(snapshot) ||
       !this.#hasVerifiedWorkspaceSnapshotReferences(snapshot)
     ) {
@@ -5544,7 +5673,11 @@ export class FactoryService {
       thread.node_id === row.node_id &&
       thread.workspace_id === row.workspace_id &&
       thread.ownership_generation === row.ownership_generation &&
-      this.#ownershipGeneration() === row.ownership_generation &&
+      this.#isCurrentWorkspaceAssignment(
+        row.node_id,
+        row.workspace_id,
+        row.ownership_generation,
+      ) &&
       this.#hasActiveWorkspaceReport(
         row.node_id,
         row.workspace_id,
@@ -6106,17 +6239,74 @@ export class FactoryService {
     }
   }
 
-  #ownershipGeneration(): number {
-    const row = this.database.all<{ ownership_generation: number }>(
-      "SELECT ownership_generation FROM factory_meta WHERE singleton = 1",
+  #workspaceOwnershipGeneration(nodeId: string, workspaceId: string): number {
+    const workspace = this.database.all<{
+      node_id: string;
+      ownership_generation: number;
+    }>(
+      "SELECT node_id, ownership_generation FROM workspaces WHERE workspace_id = ?",
+      [workspaceId],
     )[0];
-    if (!row)
+    if (!workspace || workspace.node_id !== nodeId) {
+      throw conflict(
+        "workspace_authority_unavailable",
+        "The provisioned workspace does not belong to the selected node",
+      );
+    }
+    if (
+      !Number.isSafeInteger(workspace.ownership_generation) ||
+      workspace.ownership_generation < 0
+    ) {
       throw new FactoryError(
         503,
-        "not_bootstrapped",
-        "The private Factory has not been bootstrapped",
+        "workspace_authority_invalid",
+        "The provisioned workspace ownership generation is invalid",
       );
-    return Number(row.ownership_generation);
+    }
+    return workspace.ownership_generation;
+  }
+
+  #isCurrentWorkspaceAssignment(
+    nodeId: string,
+    workspaceId: string,
+    ownershipGeneration: number,
+  ): boolean {
+    try {
+      return (
+        Number.isSafeInteger(ownershipGeneration) &&
+        ownershipGeneration >= 0 &&
+        this.#workspaceOwnershipGeneration(nodeId, workspaceId) ===
+          ownershipGeneration
+      );
+    } catch (error) {
+      if (
+        error instanceof FactoryError &&
+        (error.code === "workspace_authority_unavailable" ||
+          error.code === "workspace_authority_invalid")
+      ) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  #assertCurrentWorkspaceAssignment(
+    nodeId: string,
+    workspaceId: string,
+    ownershipGeneration: number,
+  ): void {
+    if (
+      !this.#isCurrentWorkspaceAssignment(
+        nodeId,
+        workspaceId,
+        ownershipGeneration,
+      )
+    ) {
+      throw conflict(
+        "ownership_fenced",
+        "The assignment does not match its provisioned workspace ownership authority",
+      );
+    }
   }
 
   async #sameSecret(candidate: string, expected: string): Promise<boolean> {

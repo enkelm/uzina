@@ -11,6 +11,80 @@ export interface FactoryDatabase {
   transaction<T>(operation: () => T): T;
 }
 
+function safeNonnegativeInteger(value: unknown): number | undefined {
+  if (typeof value !== "number" && typeof value !== "bigint") return undefined;
+  const numeric = Number(value);
+  return Number.isSafeInteger(numeric) && numeric >= 0 ? numeric : undefined;
+}
+
+function validateScopedWorkspaceAuthority(database: FactoryDatabase): void {
+  const workspaces = database.all<{
+    workspace_id: string;
+    node_id: string;
+    provisioned_node_id: string | null;
+    ownership_generation: unknown;
+  }>(
+    `SELECT workspaces.workspace_id, workspaces.node_id,
+       nodes.node_id AS provisioned_node_id, workspaces.ownership_generation
+     FROM workspaces LEFT JOIN nodes ON nodes.node_id = workspaces.node_id`,
+  );
+  const generations = new Map<string, number>();
+  for (const workspace of workspaces) {
+    const generation = safeNonnegativeInteger(workspace.ownership_generation);
+    if (!workspace.provisioned_node_id || generation === undefined) {
+      throw new Error("Invalid scoped workspace ownership authority");
+    }
+    generations.set(workspace.workspace_id, generation);
+  }
+
+  const threads = database.all<{
+    workspace_id: string;
+    node_id: string;
+    workspace_node_id: string | null;
+    ownership_generation: unknown;
+  }>(
+    `SELECT threads.workspace_id, threads.node_id,
+       workspaces.node_id AS workspace_node_id, threads.ownership_generation
+     FROM threads LEFT JOIN workspaces ON workspaces.workspace_id = threads.workspace_id`,
+  );
+  for (const thread of threads) {
+    const authorityGeneration = generations.get(thread.workspace_id);
+    if (
+      authorityGeneration === undefined ||
+      thread.workspace_node_id !== thread.node_id ||
+      safeNonnegativeInteger(thread.ownership_generation) !==
+        authorityGeneration
+    ) {
+      throw new Error("Thread placement disagrees with workspace ownership");
+    }
+  }
+
+  const observations = database.all<{
+    workspace_id: string;
+    node_id: string;
+    workspace_node_id: string | null;
+    ownership_generation: unknown;
+  }>(
+    `SELECT reported.workspace_id, reported.node_id,
+       workspaces.node_id AS workspace_node_id, reported.ownership_generation
+     FROM execution_node_workspaces AS reported
+     LEFT JOIN workspaces ON workspaces.workspace_id = reported.workspace_id`,
+  );
+  for (const observation of observations) {
+    const authorityGeneration = generations.get(observation.workspace_id);
+    if (
+      authorityGeneration === undefined ||
+      observation.workspace_node_id !== observation.node_id ||
+      safeNonnegativeInteger(observation.ownership_generation) !==
+        authorityGeneration
+    ) {
+      throw new Error(
+        "Node workspace observation disagrees with workspace ownership",
+      );
+    }
+  }
+}
+
 const schema = [
   `CREATE TABLE IF NOT EXISTS factory_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -81,7 +155,8 @@ const schema = [
   `CREATE TABLE IF NOT EXISTS workspaces (
     workspace_id TEXT PRIMARY KEY,
     node_id TEXT NOT NULL REFERENCES nodes(node_id),
-    name TEXT NOT NULL
+    name TEXT NOT NULL,
+    ownership_generation INTEGER NOT NULL DEFAULT 0 CHECK (ownership_generation >= 0)
   )`,
   `CREATE TABLE IF NOT EXISTS threads (
     thread_id TEXT PRIMARY KEY,
@@ -304,6 +379,42 @@ const schema = [
 
 export function initializeFactoryDatabase(database: FactoryDatabase): void {
   for (const statement of schema) database.exec(statement);
+  const workspaceColumns = new Set(
+    database
+      .all<{ name: string }>("PRAGMA table_info(workspaces)")
+      .map((column) => column.name),
+  );
+  if (!workspaceColumns.has("ownership_generation")) {
+    database.transaction(() => {
+      const provisioned =
+        database.all<{ count: number }>(
+          "SELECT COUNT(*) AS count FROM workspaces",
+        )[0]?.count ?? 0;
+      let legacyGeneration: number | undefined;
+      if (provisioned > 0) {
+        const legacy = database.all<{ ownership_generation: unknown }>(
+          "SELECT ownership_generation FROM factory_meta WHERE singleton = 1",
+        )[0];
+        legacyGeneration = safeNonnegativeInteger(legacy?.ownership_generation);
+        if (legacyGeneration === undefined) {
+          throw new Error(
+            "Cannot migrate provisioned workspaces without a safe legacy ownership generation",
+          );
+        }
+      }
+      database.exec(
+        "ALTER TABLE workspaces ADD COLUMN ownership_generation INTEGER NOT NULL DEFAULT 0 CHECK (ownership_generation >= 0)",
+      );
+      if (legacyGeneration !== undefined) {
+        database.exec("UPDATE workspaces SET ownership_generation = ?", [
+          legacyGeneration,
+        ]);
+      }
+      validateScopedWorkspaceAuthority(database);
+    });
+  } else {
+    database.transaction(() => validateScopedWorkspaceAuthority(database));
+  }
   const managedWorkCheckpointColumns = new Set(
     database
       .all<{ name: string }>(

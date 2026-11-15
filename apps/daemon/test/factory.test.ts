@@ -47,6 +47,18 @@ afterEach(() => {
   }
 });
 
+function reopenFixtureDatabase(
+  directory: string,
+  database: BunFactoryDatabase,
+) {
+  database.close();
+  const reopened = new BunFactoryDatabase(join(directory, "factory.sqlite"));
+  const fixture = fixtures.find((item) => item.directory === directory);
+  if (!fixture) throw new Error("Factory test fixture is not registered");
+  fixture.database = reopened;
+  return reopened;
+}
+
 async function provisionFixture(nodeOnline: boolean) {
   const { directory, database } = openDatabase();
   const factory = new FactoryService(database, bootstrapSecret);
@@ -167,6 +179,296 @@ describe("persistent Factory behavior over Bun SQLite", () => {
       availability: "offline",
       nodeId: "node:laptop-a",
     });
+  });
+
+  test("legacy workspace generations migrate once and new provisioning ignores the legacy singleton", async () => {
+    const fixture = await provisionFixture(true);
+    const oldInput = await fixture.factory.submitInput(
+      fixture.owner,
+      fixture.thread.threadId,
+      "request:legacy-workspace-migration",
+      "Preserve this accepted input",
+    );
+    const settled = await fixture.factory.dispatchNext({
+      async dispatch() {
+        return { status: "completed" };
+      },
+    });
+    expect(settled?.jobId).toBe(oldInput.jobId);
+    const before = {
+      thread: fixture.database.all<{
+        thread_id: string;
+        node_id: string;
+        workspace_id: string;
+        ownership_generation: number;
+      }>(
+        "SELECT thread_id, node_id, workspace_id, ownership_generation FROM threads WHERE thread_id = ?",
+        [fixture.thread.threadId],
+      )[0],
+      input: fixture.database.all<{
+        job_id: string;
+        request_id: string;
+        ownership_generation: number;
+      }>(
+        "SELECT job_id, request_id, ownership_generation FROM dispatch_intents WHERE request_id = ?",
+        [oldInput.requestId],
+      )[0],
+      receipt: fixture.database.all<{ request_id: string; job_id: string }>(
+        "SELECT request_id, job_id FROM command_receipts WHERE request_id = ?",
+        [oldInput.requestId],
+      )[0],
+    };
+
+    fixture.database.exec(
+      "ALTER TABLE workspaces DROP COLUMN ownership_generation",
+    );
+    let database = reopenFixtureDatabase(fixture.directory, fixture.database);
+    let factory = new FactoryService(database, bootstrapSecret);
+    let owner = await factory.authenticate(fixture.ownerCredential.credential);
+    expect(
+      database.all<{ ownership_generation: number }>(
+        "SELECT ownership_generation FROM workspaces WHERE workspace_id = ?",
+        [fixture.thread.target.workspaceId],
+      )[0]?.ownership_generation,
+    ).toBe(0);
+    expect(
+      database.all(
+        "SELECT thread_id, node_id, workspace_id, ownership_generation FROM threads WHERE thread_id = ?",
+        [fixture.thread.threadId],
+      )[0],
+    ).toEqual(before.thread);
+    expect(
+      database.all(
+        "SELECT job_id, request_id, ownership_generation FROM dispatch_intents WHERE request_id = ?",
+        [oldInput.requestId],
+      )[0],
+    ).toEqual(before.input);
+    expect(
+      database.all(
+        "SELECT request_id, job_id FROM command_receipts WHERE request_id = ?",
+        [oldInput.requestId],
+      )[0],
+    ).toEqual(before.receipt);
+
+    database.exec(
+      "UPDATE factory_meta SET ownership_generation = 7 WHERE singleton = 1",
+    );
+    database = reopenFixtureDatabase(fixture.directory, database);
+    factory = new FactoryService(database, bootstrapSecret);
+    owner = await factory.authenticate(fixture.ownerCredential.credential);
+    const workspace = factory.createWorkspace(
+      owner,
+      "workspace:new-after-migration",
+      "node:laptop-a",
+      "New workspace",
+    );
+    const thread = factory.createThread(owner, {
+      threadId: "thread:new-after-migration",
+      projectId: fixture.thread.projectId,
+      title: "New scoped thread",
+      target: { nodeId: "node:laptop-a", workspaceId: workspace.workspaceId },
+    });
+    expect(thread.ownershipGeneration).toBe(0);
+    expect(
+      database.all<{ ownership_generation: number }>(
+        "SELECT ownership_generation FROM workspaces WHERE workspace_id = ?",
+        [workspace.workspaceId],
+      )[0]?.ownership_generation,
+    ).toBe(0);
+
+    const node = await factory.authenticate(fixture.nodeCredential.credential);
+    factory.registerExecutionNode(
+      node,
+      executionRegisterRequestSchema.parse({
+        ...registration("node:laptop-a", fixture.thread.target.workspaceId),
+        workspaces: [
+          {
+            workspaceId: fixture.thread.target.workspaceId,
+            ownershipGeneration: 0,
+            state: "active",
+          },
+          {
+            workspaceId: workspace.workspaceId,
+            ownershipGeneration: 0,
+            state: "active",
+          },
+        ],
+      }),
+    );
+    const accepted = await factory.submitInput(
+      owner,
+      thread.threadId,
+      "request:new-scoped-workspace",
+      "Use the new workspace",
+    );
+    expect(accepted).toMatchObject({
+      status: "accepted",
+      dispatchStatus: "queued",
+      ownershipGeneration: 0,
+      target: { nodeId: "node:laptop-a", workspaceId: workspace.workspaceId },
+    });
+    let dispatchedTarget: { nodeId: string; workspaceId: string } | undefined;
+    await factory.dispatchNext({
+      async dispatch(job) {
+        dispatchedTarget = job.target;
+        expect(job.ownershipGeneration).toBe(0);
+        return { status: "dispatched" };
+      },
+    });
+    expect(dispatchedTarget).toEqual({
+      nodeId: "node:laptop-a",
+      workspaceId: workspace.workspaceId,
+    });
+
+    const effect = await factory.enqueueRemoteExecution({
+      contractVersion: 1,
+      jobId: "job:new-scoped-workspace",
+      nodeId: "node:laptop-a",
+      target: { nodeId: "node:laptop-a", workspaceId: workspace.workspaceId },
+      ownershipGeneration: 0,
+      operation: "read-file",
+      path: "README.md",
+      maxBytes: 1024,
+    });
+    expect(effect).toMatchObject({ status: "queued", ownershipGeneration: 0 });
+    expect(factory.claimExecutionJob(node, "node:laptop-a")).toMatchObject({
+      jobId: effect.jobId,
+      target: { workspaceId: workspace.workspaceId },
+      ownershipGeneration: 0,
+    });
+    expect(
+      database.all<{ ownership_generation: number }>(
+        "SELECT ownership_generation FROM factory_meta WHERE singleton = 1",
+      )[0]?.ownership_generation,
+    ).toBe(7);
+  });
+
+  test("reopen rejects an invalid already-scoped authority instead of defaulting from the legacy singleton", async () => {
+    const fixture = await provisionFixture(false);
+    fixture.database.exec(
+      "UPDATE workspaces SET ownership_generation = 9007199254740992 WHERE workspace_id = ?",
+      [fixture.thread.target.workspaceId],
+    );
+    fixture.database.exec(
+      "UPDATE factory_meta SET ownership_generation = 0 WHERE singleton = 1",
+    );
+    const database = reopenFixtureDatabase(fixture.directory, fixture.database);
+    expect(() => new FactoryService(database, bootstrapSecret)).toThrow(
+      /Invalid scoped workspace ownership authority/,
+    );
+    expect(
+      database.all<{ ownership_generation: number }>(
+        "SELECT ownership_generation FROM workspaces WHERE workspace_id = ?",
+        [fixture.thread.target.workspaceId],
+      )[0]?.ownership_generation,
+    ).toBe(9007199254740992);
+  });
+
+  test("contradictory legacy thread placement refuses migration without adding partial authority", async () => {
+    const fixture = await provisionFixture(true);
+    fixture.database.exec(
+      "ALTER TABLE workspaces DROP COLUMN ownership_generation",
+    );
+    fixture.database.exec(
+      "UPDATE threads SET ownership_generation = 1 WHERE thread_id = ?",
+      [fixture.thread.threadId],
+    );
+    const database = reopenFixtureDatabase(fixture.directory, fixture.database);
+    expect(() => new FactoryService(database, bootstrapSecret)).toThrow(
+      /Thread placement disagrees with workspace ownership/,
+    );
+    expect(
+      database
+        .all<{ name: string }>("PRAGMA table_info(workspaces)")
+        .map((column) => column.name),
+    ).not.toContain("ownership_generation");
+  });
+
+  test("missing or unsafe legacy singleton and mismatched node observations fail closed", async () => {
+    const missing = await provisionFixture(false);
+    missing.database.exec(
+      "ALTER TABLE workspaces DROP COLUMN ownership_generation",
+    );
+    missing.database.exec("DELETE FROM factory_meta WHERE singleton = 1");
+    const missingDatabase = reopenFixtureDatabase(
+      missing.directory,
+      missing.database,
+    );
+    expect(() => new FactoryService(missingDatabase, bootstrapSecret)).toThrow(
+      /safe legacy ownership generation/,
+    );
+    expect(
+      missingDatabase
+        .all<{ name: string }>("PRAGMA table_info(workspaces)")
+        .map((column) => column.name),
+    ).not.toContain("ownership_generation");
+
+    const unsafe = await provisionFixture(false);
+    unsafe.database.exec(
+      "ALTER TABLE workspaces DROP COLUMN ownership_generation",
+    );
+    unsafe.database.exec(
+      "UPDATE factory_meta SET ownership_generation = 9007199254740992 WHERE singleton = 1",
+    );
+    const unsafeDatabase = reopenFixtureDatabase(
+      unsafe.directory,
+      unsafe.database,
+    );
+    expect(() => new FactoryService(unsafeDatabase, bootstrapSecret)).toThrow(
+      /safe legacy ownership generation/,
+    );
+    expect(
+      unsafeDatabase
+        .all<{ name: string }>("PRAGMA table_info(workspaces)")
+        .map((column) => column.name),
+    ).not.toContain("ownership_generation");
+
+    const mismatched = await provisionFixture(true);
+    mismatched.database.exec(
+      "ALTER TABLE workspaces DROP COLUMN ownership_generation",
+    );
+    mismatched.database.exec(
+      "UPDATE execution_node_workspaces SET ownership_generation = 1 WHERE workspace_id = ?",
+      [mismatched.thread.target.workspaceId],
+    );
+    const mismatchedDatabase = reopenFixtureDatabase(
+      mismatched.directory,
+      mismatched.database,
+    );
+    expect(
+      () => new FactoryService(mismatchedDatabase, bootstrapSecret),
+    ).toThrow(/Node workspace observation disagrees with workspace ownership/);
+    expect(
+      mismatchedDatabase
+        .all<{ name: string }>("PRAGMA table_info(workspaces)")
+        .map((column) => column.name),
+    ).not.toContain("ownership_generation");
+
+    const wrongNode = await provisionFixture(false);
+    await wrongNode.factory.provisionNode(
+      wrongNode.owner,
+      "node:laptop-b",
+      "Laptop B",
+    );
+    wrongNode.database.exec(
+      "INSERT INTO execution_node_workspaces(node_id, workspace_id, ownership_generation, state) VALUES (?, ?, 0, 'active')",
+      ["node:laptop-b", wrongNode.thread.target.workspaceId],
+    );
+    wrongNode.database.exec(
+      "ALTER TABLE workspaces DROP COLUMN ownership_generation",
+    );
+    const wrongNodeDatabase = reopenFixtureDatabase(
+      wrongNode.directory,
+      wrongNode.database,
+    );
+    expect(
+      () => new FactoryService(wrongNodeDatabase, bootstrapSecret),
+    ).toThrow(/Node workspace observation disagrees with workspace ownership/);
+    expect(
+      wrongNodeDatabase
+        .all<{ name: string }>("PRAGMA table_info(workspaces)")
+        .map((column) => column.name),
+    ).not.toContain("ownership_generation");
   });
 
   test("credential kind, actor attribution, and revocation gate later operations", async () => {

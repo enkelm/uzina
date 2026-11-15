@@ -358,6 +358,53 @@ export class CaptureTestFactory extends FactoryObject {
     };
   }
 
+  workspaceOwnershipHistoryForTest(action: "drop-authority-column" | "read") {
+    if (action === "drop-authority-column") {
+      this.#storage.transactionSync(() => {
+        this.#storage.sql.exec(
+          "ALTER TABLE workspaces DROP COLUMN ownership_generation",
+        );
+      });
+      return { prepared: true };
+    }
+    const rows = (query: string) => this.#storage.sql.exec(query).toArray();
+    return {
+      workspaces: rows(
+        "SELECT workspace_id, node_id, ownership_generation FROM workspaces ORDER BY workspace_id",
+      ),
+      threads: rows(
+        "SELECT thread_id, node_id, workspace_id, ownership_generation FROM threads ORDER BY thread_id",
+      ),
+      reports: rows(
+        "SELECT node_id, workspace_id, ownership_generation, state FROM execution_node_workspaces ORDER BY node_id, workspace_id",
+      ),
+      inputs: rows(
+        "SELECT job_id, request_id, thread_id, node_id, workspace_id, ownership_generation, status FROM dispatch_intents ORDER BY job_id",
+      ),
+      effects: rows(
+        "SELECT job_id, request_id, node_id, workspace_id, ownership_generation, status, payload_sha256, report_json, report_sha256 FROM execution_jobs ORDER BY job_id",
+      ),
+      controls: rows(
+        "SELECT request_id, control_id, capture_id, thread_id, node_id, workspace_id, ownership_generation, status, payload_sha256, report_json, report_sha256 FROM capture_control_requests ORDER BY request_id",
+      ),
+      snapshots: rows(
+        "SELECT request_id, snapshot_id, capture_id, thread_id, node_id, workspace_id, ownership_generation, status, manifest_reference, report_json, report_sha256 FROM workspace_snapshot_requests ORDER BY request_id",
+      ),
+      snapshotBlobs: rows(
+        "SELECT capture_id, reference, size_bytes FROM workspace_snapshot_blobs ORDER BY capture_id, reference",
+      ),
+      checkpoints: rows(
+        "SELECT request_id, capture_id, thread_id, node_id, workspace_id, ownership_generation, status, stage, manifest_reference FROM managed_work_checkpoint_requests ORDER BY request_id",
+      ),
+      checkpointArtifacts: rows(
+        "SELECT request_id, role, reference, size_bytes FROM managed_work_checkpoint_artifacts ORDER BY request_id, role, reference",
+      ),
+      relocations: rows(
+        "SELECT request_id, relocation_id, capture_id, snapshot_id, thread_id, source_node_id, source_workspace_id, destination_node_id, destination_workspace_id, ownership_generation, manifest_reference, status, report_json, report_sha256, receipt_sha256, previous_report_json, previous_report_sha256, previous_receipt_sha256 FROM workspace_relocations ORDER BY request_id",
+      ),
+    };
+  }
+
   workspaceRelocationSchemaForTest(action: "drop-history-columns" | "read") {
     if (action === "drop-history-columns") {
       const count = this.#storage.sql
@@ -898,6 +945,24 @@ export default {
         await checkpointBucket.put(key, request.body);
       }
       return new Response(null, { status: 204 });
+    }
+    if (
+      request.method === "POST" &&
+      url.pathname === "/__test/workspace-ownership-migration"
+    ) {
+      const input = (await request.json()) as {
+        action: "drop-authority-column" | "read";
+      };
+      const factory = environment.FACTORY.get(
+        environment.FACTORY.idFromName("uzina-single-factory"),
+      ) as FactoryRpc & {
+        workspaceOwnershipHistoryForTest(
+          action: "drop-authority-column" | "read",
+        ): ReturnType<CaptureTestFactory["workspaceOwnershipHistoryForTest"]>;
+      };
+      return Response.json(
+        await factory.workspaceOwnershipHistoryForTest(input.action),
+      );
     }
     if (
       request.method === "POST" &&

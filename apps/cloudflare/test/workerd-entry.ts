@@ -79,6 +79,30 @@ export class TestFactory extends FactoryObject {
     environment: ConstructorParameters<typeof FactoryObject>[1],
   ) {
     super(state, environment);
+    this.#fixtureStorage = state.storage;
+  }
+
+  readonly #fixtureStorage: FactoryState["storage"];
+
+  async fetch(request: Request): Promise<Response> {
+    const path = new URL(request.url).pathname;
+    if (path === "/__test/drop-workspace-authority") {
+      this.#fixtureStorage.transactionSync(() => {
+        this.#fixtureStorage.sql.exec(
+          "ALTER TABLE workspaces DROP COLUMN ownership_generation",
+        );
+      });
+      return Response.json({ prepared: true });
+    }
+    if (path === "/__test/workspace-authority") {
+      const rows = this.#fixtureStorage.sql
+        .exec(
+          "SELECT workspace_id, node_id, ownership_generation FROM workspaces ORDER BY workspace_id",
+        )
+        .toArray();
+      return Response.json(rows);
+    }
+    return super.fetch(request);
   }
 }
 
