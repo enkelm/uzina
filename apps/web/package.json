@@ -1,0 +1,24 @@
+{
+  "name": "@uzina/web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit -p tsconfig.json && vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test:browser": "bun scripts/verify-browser.ts"
+  },
+  "dependencies": {
+    "@uzina/client": "workspace:*",
+    "@uzina/contracts": "workspace:*",
+    "react": "19.2.7",
+    "react-dom": "19.2.7"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.3",
+    "playwright": "1.62.1",
+    "vite": "8.3.0"
+  }
+}

@@ -8,11 +8,13 @@
     "apps/*"
   ],
   "scripts": {
-    "format": "prettier --write \"README.md\" \"GLOSSARY.md\" \"plans/**/*.md\" \"apps/**/README.md\" \"packages/**/README.md\" \"package.json\" \"tsconfig.json\" \"apps/**/*.ts\" \"apps/**/package.json\" \"packages/**/*.ts\" \"packages/**/package.json\" \"packages/**/tsconfig*.json\"",
-    "check": "prettier --check \"README.md\" \"GLOSSARY.md\" \"plans/**/*.md\" \"apps/**/README.md\" \"packages/**/README.md\" \"package.json\" \"tsconfig.json\" \"apps/**/*.ts\" \"apps/**/package.json\" \"packages/**/*.ts\" \"packages/**/package.json\" \"packages/**/tsconfig*.json\"",
+    "format": "prettier --write \"README.md\" \"GLOSSARY.md\" \"plans/**/*.md\" \"apps/**/{README,PRODUCT,DESIGN}.md\" \"packages/**/README.md\" \"package.json\" \"tsconfig.json\" \"apps/**/*.{ts,tsx,css,html}\" \"apps/**/{package,tsconfig}.json\" \"packages/**/*.ts\" \"packages/**/package.json\" \"packages/**/tsconfig*.json\"",
+    "check": "prettier --check \"README.md\" \"GLOSSARY.md\" \"plans/**/*.md\" \"apps/**/{README,PRODUCT,DESIGN}.md\" \"packages/**/README.md\" \"package.json\" \"tsconfig.json\" \"apps/**/*.{ts,tsx,css,html}\" \"apps/**/{package,tsconfig}.json\" \"packages/**/*.ts\" \"packages/**/package.json\" \"packages/**/tsconfig*.json\"",
     "typecheck": "tsc --noEmit",
     "test": "bun test packages apps",
-    "build": "bun run build:daemon && bun run build:cloudflare",
+    "build": "bun run build:daemon && bun run build:cloudflare && bun run build:web",
+    "build:web": "bun run --cwd apps/web build",
+    "dev:web": "bun run --cwd apps/web dev",
     "build:daemon": "bun build apps/daemon/src/index.ts --target=bun --outdir=build/daemon",
     "build:cloudflare": "bun apps/cloudflare/scripts/build-worker.ts && wrangler deploy --dry-run --config apps/cloudflare/wrangler.toml --outdir build/cloudflare",
     "dev:daemon": "bun --watch apps/daemon/src/index.ts",

@@ -8,6 +8,65 @@ import { join } from "node:path";
 import { BunFactoryDatabase } from "../src/factory/sqlite";
 
 describe("FactoryClient over the authorized Factory HTTP boundary", () => {
+  test("creates projects and explicitly targeted Work items through authorized Core HTTP", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "uzina-client-create-"));
+    const database = new BunFactoryDatabase(join(directory, "factory.sqlite"));
+    const factory = new FactoryService(database, "client-create-bootstrap");
+    const ownerCredential = await factory.bootstrap(
+      "client-create-bootstrap",
+      "Client test owner",
+    );
+    const owner = await factory.authenticate(ownerCredential.credential);
+    const { node } = await factory.provisionNode(
+      owner,
+      "node:client-create",
+      "Create test node",
+    );
+    const workspace = factory.createWorkspace(
+      owner,
+      "workspace:client-create",
+      node.nodeId,
+      "Create test workspace",
+    );
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: createFactoryHttpHandler(factory),
+    });
+    const client = new FactoryClient({
+      baseUrl: server.url,
+      credential: ownerCredential.credential,
+    });
+    try {
+      const project = await client.createProject(
+        "A real project",
+        "project:client-create",
+      );
+      const thread = await client.createThread({
+        projectId: project.projectId,
+        title: "An explicitly placed Work item",
+        target: { nodeId: node.nodeId, workspaceId: workspace.workspaceId },
+      });
+      expect(await client.listProjects()).toMatchObject({
+        projects: [{ projectId: project.projectId, name: "A real project" }],
+      });
+      expect(
+        await client.listThreads({ projectId: project.projectId }),
+      ).toMatchObject({
+        threads: [
+          {
+            threadId: thread.threadId,
+            target: { nodeId: node.nodeId, workspaceId: workspace.workspaceId },
+          },
+        ],
+      });
+    } finally {
+      server.stop(true);
+      database.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   test("an aborted submit acknowledgement remains uncertain and reconciles/retries with the same ID", async () => {
     const directory = mkdtempSync(join(tmpdir(), "uzina-client-abort-"));
     const database = new BunFactoryDatabase(join(directory, "factory.sqlite"));

@@ -4,6 +4,8 @@ import {
   capabilitySetSchema,
 } from "@uzina/contracts";
 import {
+  createProjectRequestSchema,
+  createThreadRequestSchema,
   factoryCommandReceiptSchema,
   factoryEventSchema,
   factoryParticipantSchema,
@@ -228,6 +230,38 @@ export class FactoryClient {
     );
   }
 
+  async createProject(
+    name: string,
+    projectId?: string,
+    options: RequestOptions = {},
+  ) {
+    const input = createProjectRequestSchema.parse({
+      name,
+      ...(projectId ? { projectId } : {}),
+    });
+    return this.#request(
+      "/v1/projects",
+      "POST",
+      input,
+      factoryProjectSchema,
+      options.signal,
+    );
+  }
+
+  async createThread(
+    input: z.input<typeof createThreadRequestSchema>,
+    options: RequestOptions = {},
+  ) {
+    const request = createThreadRequestSchema.parse(input);
+    return this.#request(
+      "/v1/threads",
+      "POST",
+      request,
+      factoryThreadSchema,
+      options.signal,
+    );
+  }
+
   async listProjects(options: RequestOptions & { limit?: number } = {}) {
     const limit = limitSchema.parse(options.limit ?? 100);
     return this.#get(
@@ -369,7 +403,8 @@ export class FactoryClient {
       throw new TypeError("Factory request escaped its configured origin");
     let response: Response;
     try {
-      response = await this.#fetch(url, {
+      const fetchRequest = this.#fetch;
+      response = await fetchRequest(url, {
         method,
         redirect: "error",
         headers: {

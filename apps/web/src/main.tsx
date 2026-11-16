@@ -1,0 +1,1707 @@
+import React, {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { createRoot } from "react-dom/client";
+import { FactoryClient, FactoryClientError } from "@uzina/client";
+import { factoryThreadSchema } from "@uzina/contracts/factory";
+type Identity = Awaited<ReturnType<FactoryClient["me"]>>;
+type Project = Awaited<
+  ReturnType<FactoryClient["listProjects"]>
+>["projects"][number];
+type Thread = Awaited<
+  ReturnType<FactoryClient["listThreads"]>
+>["threads"][number];
+type Node = Awaited<ReturnType<FactoryClient["listNodes"]>>["nodes"][number];
+type Workspace = Awaited<
+  ReturnType<FactoryClient["listWorkspaces"]>
+>["workspaces"][number];
+type Receipt = Awaited<ReturnType<FactoryClient["submitInput"]>>;
+import "./style.css";
+
+function Icon({ name }: { name: "plus" | "close" | "back" | "chat" }) {
+  const paths = {
+    plus: "M12 5v14M5 12h14",
+    close: "m6 6 12 12M18 6 6 18",
+    back: "m12 5-7 7 7 7M5 12h14",
+    chat: "M5 4h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H9l-6 4V6a2 2 0 0 1 2-2Z",
+  };
+  return (
+    <svg
+      aria-hidden="true"
+      focusable="false"
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d={paths[name]} />
+    </svg>
+  );
+}
+
+type Message = { role: "user" | "assistant"; text: string };
+const EMPTY_MESSAGES: Message[] = [];
+const EMPTY_RUNS: Receipt[] = [];
+function ownValue<T>(values: Record<string, T>, key: string): T | undefined {
+  return Object.hasOwn(values, key) ? values[key] : undefined;
+}
+function visibleMessages(value: unknown): Message[] {
+  if (!value || typeof value !== "object") return [];
+  const runtime = (value as { runtime?: unknown }).runtime;
+  if (
+    !runtime ||
+    typeof runtime !== "object" ||
+    !Array.isArray((runtime as { messages?: unknown }).messages)
+  )
+    return [];
+  const out: Message[] = [];
+  for (const raw of (runtime as { messages: unknown[] }).messages) {
+    if (!raw || typeof raw !== "object") continue;
+    const item = raw as { role?: unknown; content?: unknown };
+    if (item.role !== "assistant" && item.role !== "user") continue;
+    const parts = Array.isArray(item.content) ? item.content : [];
+    const text =
+      typeof item.content === "string" && item.role === "user"
+        ? item.content
+        : parts
+            .filter(
+              (part): part is { type: string; text: string } =>
+                !!part &&
+                typeof part === "object" &&
+                (part as { type?: unknown }).type === "text" &&
+                typeof (part as { text?: unknown }).text === "string",
+            )
+            .map((part) => part.text)
+            .join("");
+    if (text) out.push({ role: item.role, text });
+  }
+  return out;
+}
+function message(error: unknown): string {
+  if (error instanceof FactoryClientError) {
+    if (error.status === 401 || error.status === 403)
+      return "Access was denied or revoked. Sign in again or ask the Factory Owner to check your access.";
+    if (error.status === 0)
+      return "Factory is unavailable. Check that it is running, then retry.";
+    return `Factory request could not be completed (${error.code}).`;
+  }
+  return error instanceof Error ? error.message : "Something went wrong.";
+}
+function statusUnavailable(error: unknown): boolean {
+  return error instanceof FactoryClientError && error.status >= 500;
+}
+function Modal({
+  open,
+  onClose,
+  labelledBy,
+  children,
+}: {
+  open: boolean;
+  onClose: () => void;
+  labelledBy: string;
+  children: React.ReactNode;
+}) {
+  const ref = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    const dialog = ref.current;
+    if (!dialog) return;
+    if (open && !dialog.open) dialog.showModal();
+    else if (!open && dialog.open) dialog.close();
+  }, [open]);
+  return (
+    <dialog
+      ref={ref}
+      className="modal-backdrop"
+      aria-labelledby={labelledBy}
+      onCancel={(event) => {
+        event.preventDefault();
+        onClose();
+      }}
+      onClose={onClose}
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      {children}
+    </dialog>
+  );
+}
+
+function App() {
+  const [credential, setCredential] = useState("");
+  const [identity, setIdentity] = useState<Identity | null>(null);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [threads, setThreads] = useState<Thread[]>([]);
+  const threadsRef = useRef(threads);
+  threadsRef.current = threads;
+  const identityRef = useRef(identity);
+  identityRef.current = identity;
+  const [threadBatchFull, setThreadBatchFull] = useState(false);
+  const listedProject = useRef("");
+  const [workId, setWorkId] = useState("");
+  const [metadataUnavailableId, setMetadataUnavailableId] = useState("");
+  const [nodes, setNodes] = useState<Node[]>([]);
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [selectedProject, setSelectedProject] = useState("");
+  const [selectedId, setSelectedId] = useState("");
+  const [conversations, setConversations] = useState<Record<string, Message[]>>(
+    {},
+  );
+  const [threadRuns, setThreadRuns] = useState<Record<string, Receipt[]>>({});
+  const conversation = ownValue(conversations, selectedId) ?? EMPTY_MESSAGES;
+  const runs = ownValue(threadRuns, selectedId) ?? EMPTY_RUNS;
+  const [filter, setFilter] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [connected, setConnected] = useState(false);
+  const [receiptsByThread, setReceiptsByThread] = useState<
+    Record<string, Receipt>
+  >({});
+  const [pendingInputs, setPendingInputs] = useState<
+    Record<string, { threadId: string; requestId: string; text: string }>
+  >({});
+  const [draftsByThread, setDraftsByThread] = useState<Record<string, string>>(
+    {},
+  );
+  const pendingInput = selectedId
+    ? (ownValue(pendingInputs, selectedId) ?? null)
+    : null;
+  const draft =
+    pendingInput?.text ??
+    (selectedId ? (ownValue(draftsByThread, selectedId) ?? "") : "");
+  const receipt = selectedId
+    ? (ownValue(receiptsByThread, selectedId) ?? null)
+    : null;
+  const setDraft = (value: string) => {
+    if (selectedId)
+      setDraftsByThread((current) => ({ ...current, [selectedId]: value }));
+  };
+  const [showCreateProject, setShowCreateProject] = useState(false);
+  const [showCreateThread, setShowCreateThread] = useState(false);
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const [projectName, setProjectName] = useState("");
+  const [threadTitle, setThreadTitle] = useState("");
+  const [targetNode, setTargetNode] = useState("");
+  const [targetWorkspace, setTargetWorkspace] = useState("");
+  const selectedIdRef = useRef(selectedId);
+  selectedIdRef.current = selectedId;
+  const selectedProjectRef = useRef(selectedProject);
+  selectedProjectRef.current = selectedProject;
+  const projectNameRef = useRef(projectName);
+  projectNameRef.current = projectName;
+  const threadTitleRef = useRef(threadTitle);
+  threadTitleRef.current = threadTitle;
+  const projectDialogRef = useRef(showCreateProject);
+  projectDialogRef.current = showCreateProject;
+  const threadDialogRef = useRef(showCreateThread);
+  threadDialogRef.current = showCreateThread;
+  const projectDialogVersion = useRef(0);
+  const threadDialogVersion = useRef(0);
+  const aborts = useRef(new Set<AbortController>());
+  const inputAborts = useRef(new Map<string, Set<AbortController>>());
+  const authGeneration = useRef(0);
+  const refreshSequence = useRef(0);
+  const connectedRef = useRef(connected);
+  connectedRef.current = connected;
+  const conversationElement = useRef<HTMLElement>(null);
+  const followConversation = useRef(true);
+  const conversationThread = useRef("");
+  useLayoutEffect(() => {
+    if (conversationThread.current !== selectedId)
+      followConversation.current = true;
+    conversationThread.current = selectedId;
+    const element = conversationElement.current;
+    if (element && followConversation.current)
+      element.scrollTop = element.scrollHeight;
+  }, [selectedId, conversation]);
+  const client = useMemo(
+    () =>
+      credential
+        ? new FactoryClient({ baseUrl: window.location.origin, credential })
+        : null,
+    [credential],
+  );
+  const stopRequests = () => {
+    for (const controller of aborts.current) controller.abort();
+    aborts.current.clear();
+  };
+  const request = async <T,>(
+    fn: (signal: AbortSignal) => Promise<T>,
+    threadId?: string,
+  ) => {
+    const controller = new AbortController();
+    aborts.current.add(controller);
+    if (threadId) {
+      const scoped =
+        inputAborts.current.get(threadId) ?? new Set<AbortController>();
+      scoped.add(controller);
+      inputAborts.current.set(threadId, scoped);
+    }
+    try {
+      return await fn(controller.signal);
+    } finally {
+      aborts.current.delete(controller);
+      if (threadId) {
+        const scoped = inputAborts.current.get(threadId);
+        scoped?.delete(controller);
+        if (!scoped?.size) inputAborts.current.delete(threadId);
+      }
+    }
+  };
+  const updateConversation = (threadId: string, messages: Message[]) => {
+    setConversations((current) => ({ ...current, [threadId]: messages }));
+  };
+  const updateRuns = (
+    threadId: string,
+    update: Receipt[] | ((current: Receipt[]) => Receipt[]),
+  ) => {
+    setThreadRuns((current) => ({
+      ...current,
+      [threadId]:
+        typeof update === "function"
+          ? update(ownValue(current, threadId) ?? [])
+          : update,
+    }));
+  };
+  useEffect(
+    () => () => {
+      for (const controller of inputAborts.current.get(selectedId) ?? [])
+        controller.abort();
+    },
+    [selectedId],
+  );
+  const clearPrivate = useCallback(() => {
+    authGeneration.current += 1;
+    projectDialogVersion.current += 1;
+    threadDialogVersion.current += 1;
+    stopRequests();
+    setIdentity(null);
+    setProjects([]);
+    setThreads([]);
+    setNodes([]);
+    setWorkspaces([]);
+    setSelectedProject("");
+    setSelectedId("");
+    listedProject.current = "";
+    setThreadBatchFull(false);
+    setWorkId("");
+    setMetadataUnavailableId("");
+    setConversations({});
+    setThreadRuns({});
+    setReceiptsByThread({});
+    setPendingInputs({});
+    setDraftsByThread({});
+    setBusy(false);
+    setShowCreateProject(false);
+    setShowCreateThread(false);
+    setDetailsOpen(false);
+    setProjectName("");
+    setThreadTitle("");
+    setTargetNode("");
+    setTargetWorkspace("");
+    setFilter("");
+    setCredential("");
+    setConnected(false);
+    setError("");
+  }, []);
+  function openProjectDialog() {
+    projectDialogVersion.current += 1;
+    setShowCreateProject(true);
+  }
+  function closeProjectDialog() {
+    projectDialogVersion.current += 1;
+    setShowCreateProject(false);
+  }
+  function openThreadDialog() {
+    threadDialogVersion.current += 1;
+    setTargetNode("");
+    setTargetWorkspace("");
+    setShowCreateThread(true);
+  }
+  function closeThreadDialog() {
+    threadDialogVersion.current += 1;
+    setShowCreateThread(false);
+  }
+  const disconnect = useCallback((reason: string) => {
+    authGeneration.current += 1;
+    refreshSequence.current += 1;
+    projectDialogVersion.current += 1;
+    threadDialogVersion.current += 1;
+    stopRequests();
+    connectedRef.current = false;
+    setConnected(false);
+    setBusy(false);
+    setConversations({});
+    setThreadRuns({});
+    setReceiptsByThread({});
+    setDraftsByThread({});
+    setMetadataUnavailableId("");
+    // Unknown admission is not cancellation. Keep the original IDs and bytes
+    // quarantined in memory; the disconnected render exposes none of them.
+    setShowCreateProject(false);
+    setShowCreateThread(false);
+    setDetailsOpen(false);
+    setProjectName("");
+    setThreadTitle("");
+    setTargetNode("");
+    setTargetWorkspace("");
+    setFilter("");
+    setWorkId("");
+    setError(reason);
+  }, []);
+  const refresh = useCallback(
+    async (api: FactoryClient, wantedProject = selectedProjectRef.current) => {
+      const generation = authGeneration.current;
+      const sequence = ++refreshSequence.current;
+      try {
+        const me = await request((signal) => api.me({ signal }));
+        if (
+          generation !== authGeneration.current ||
+          sequence !== refreshSequence.current
+        )
+          return;
+        if (me.actor.kind !== "human") {
+          throw new Error(
+            "This screen accepts human Factory credentials only.",
+          );
+        }
+        const projectResult = await request((signal) =>
+          api.listProjects({ signal }),
+        );
+        if (
+          generation !== authGeneration.current ||
+          sequence !== refreshSequence.current
+        )
+          return;
+        const projectId =
+          wantedProject || projectResult.projects[0]?.projectId || "";
+        const isOwner = me.participant?.role === "owner";
+        const [threadResult, nodeResult, workspaceResult] = await Promise.all([
+          projectId
+            ? request((signal) => api.listThreads({ projectId, signal }))
+            : Promise.resolve({ threads: [] as Thread[] }),
+          isOwner
+            ? request((signal) => api.listNodes({ signal }))
+            : Promise.resolve({ nodes: [] as Node[] }),
+          isOwner
+            ? request((signal) => api.listWorkspaces({ signal }))
+            : Promise.resolve({ workspaces: [] as Workspace[] }),
+        ]);
+        if (
+          generation !== authGeneration.current ||
+          sequence !== refreshSequence.current
+        )
+          return;
+        const batch = [...threadResult.threads];
+        const known = threadsRef.current.find(
+          (thread) =>
+            thread.threadId === selectedIdRef.current &&
+            thread.projectId === projectId,
+        );
+        let deniedId: string | undefined;
+        let unavailableId = "";
+        if (
+          known &&
+          !batch.some((thread) => thread.threadId === known.threadId)
+        ) {
+          try {
+            let current = known;
+            try {
+              const status = await request((signal) =>
+                api.getStatus(known.threadId, { signal }),
+              );
+              current = factoryThreadSchema.parse(status.thread);
+              if (
+                current.threadId !== known.threadId ||
+                current.projectId !== projectId
+              )
+                throw new Error("Work item binding changed.");
+            } catch (error) {
+              if (!statusUnavailable(error)) throw error;
+              // A runtime failure is not an authorization result. Check current
+              // thread access through the independent Core history resource.
+              await request((signal) =>
+                api.listRuns(known.threadId, { signal }),
+              );
+              unavailableId = known.threadId;
+            }
+            batch.push(current);
+          } catch (error) {
+            if (
+              error instanceof FactoryClientError &&
+              [403, 404].includes(error.status)
+            )
+              deniedId = known.threadId;
+            else throw error;
+          }
+        }
+        if (
+          generation !== authGeneration.current ||
+          sequence !== refreshSequence.current ||
+          wantedProject !== selectedProjectRef.current
+        )
+          return;
+        // A bounded list is not evidence of revocation. Forget recovery data only
+        // after a specific authoritative denial, never because a page omitted it.
+        if (deniedId) forgetThread(deniedId);
+        listedProject.current = projectId;
+        setThreadBatchFull(threadResult.threads.length === 100);
+        setMetadataUnavailableId(unavailableId);
+        setIdentity(me);
+        setProjects(projectResult.projects);
+        setThreads(batch);
+        setNodes(nodeResult.nodes);
+        setWorkspaces(workspaceResult.workspaces);
+        setConnected(true);
+        selectedProjectRef.current = projectId;
+        setSelectedProject(projectId);
+      } catch (error) {
+        if (
+          generation !== authGeneration.current ||
+          sequence !== refreshSequence.current ||
+          wantedProject !== selectedProjectRef.current
+        )
+          return;
+        throw error;
+      }
+    },
+    [],
+  );
+  useEffect(() => {
+    if (!client) return;
+    let active = true;
+    let inFlight = false;
+    let initial = true;
+    const load = async () => {
+      if (
+        !active ||
+        inFlight ||
+        document.visibilityState !== "visible" ||
+        (!initial && !connectedRef.current)
+      )
+        return;
+      inFlight = true;
+      try {
+        await refresh(client);
+        if (active && initial) setError("");
+      } catch (e: unknown) {
+        if (active) {
+          if (
+            !identityRef.current ||
+            (e instanceof FactoryClientError && [401, 403].includes(e.status))
+          ) {
+            clearPrivate();
+            setError(message(e));
+          } else disconnect(message(e));
+        }
+      } finally {
+        if (active && initial) setBusy(false);
+        initial = false;
+        inFlight = false;
+      }
+    };
+    void load();
+    const interval = window.setInterval(() => void load(), 8000);
+    const onVisibility = () => void load();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisibility);
+      stopRequests();
+    };
+  }, [client, refresh, clearPrivate, disconnect]);
+  useEffect(() => {
+    if (
+      !client ||
+      !identity ||
+      !connected ||
+      listedProject.current === selectedProject
+    )
+      return;
+    const generation = authGeneration.current;
+    void refresh(client, selectedProject).catch((error) => {
+      if (generation !== authGeneration.current) return;
+      if (!handleAccessFailure(error)) disconnect(message(error));
+    });
+  }, [
+    client,
+    selectedProject,
+    Boolean(identity),
+    connected,
+    refresh,
+    disconnect,
+  ]);
+  const selected =
+    threads.find((thread) => thread.threadId === selectedId) ?? null;
+  useEffect(() => {
+    if (!client || !selected || !connected) {
+      if (!client || !connected) {
+        setConversations({});
+        setThreadRuns({});
+      }
+      return;
+    }
+    const controller = new AbortController();
+    const generation = authGeneration.current;
+    aborts.current.add(controller);
+    let active = true;
+    let inFlight = false;
+    const load = async () => {
+      if (inFlight || document.visibilityState !== "visible") return;
+      inFlight = true;
+      try {
+        const [contextResult, runResult] = await Promise.allSettled([
+          client.getContext(selected.threadId, { signal: controller.signal }),
+          client.listRuns(selected.threadId, { signal: controller.signal }),
+        ]);
+        if (!active || generation !== authGeneration.current) return;
+        const unavailable = [contextResult, runResult].find(
+          (result) =>
+            result.status === "rejected" &&
+            result.reason instanceof FactoryClientError &&
+            result.reason.status === 0,
+        );
+        if (unavailable?.status === "rejected") {
+          disconnect(message(unavailable.reason));
+          return;
+        }
+        if (contextResult.status === "fulfilled") {
+          updateConversation(
+            selected.threadId,
+            visibleMessages(contextResult.value),
+          );
+        } else if (!(
+          contextResult.reason instanceof Error &&
+          contextResult.reason.name === "AbortError"
+        )) {
+          updateConversation(selected.threadId, []);
+          if (
+            contextResult.reason instanceof FactoryClientError &&
+            contextResult.reason.status === 0
+          )
+            setConnected(false);
+          setError(message(contextResult.reason));
+        }
+        if (runResult.status === "fulfilled") {
+          updateRuns(selected.threadId, runResult.value.runs);
+          const currentReceipt = ownValue(receiptsByThread, selected.threadId);
+          if (currentReceipt) {
+            const updated = runResult.value.runs.find(
+              (run) => run.requestId === currentReceipt.requestId,
+            );
+            if (
+              updated &&
+              updated.dispatchStatus !== currentReceipt.dispatchStatus
+            )
+              setReceiptsByThread((current) => ({
+                ...current,
+                [selected.threadId]: updated,
+              }));
+          }
+        } else if (!(
+          runResult.reason instanceof Error &&
+          runResult.reason.name === "AbortError"
+        )) {
+          if (
+            runResult.reason instanceof FactoryClientError &&
+            runResult.reason.status === 0
+          )
+            setConnected(false);
+          setError(
+            `Command history is unavailable. ${message(runResult.reason)}`,
+          );
+        }
+        const denied = [contextResult, runResult].some(
+          (result) =>
+            result.status === "rejected" &&
+            result.reason instanceof FactoryClientError &&
+            [401, 403].includes(result.reason.status),
+        );
+        if (denied) {
+          updateConversation(selected.threadId, []);
+          updateRuns(selected.threadId, []);
+          const denial = [contextResult, runResult].find(
+            (result) =>
+              result.status === "rejected" &&
+              result.reason instanceof FactoryClientError &&
+              [401, 403].includes(result.reason.status),
+          );
+          if (denial?.status === "rejected")
+            handleAccessFailure(denial.reason, selected.threadId);
+        } else if (
+          contextResult.status === "fulfilled" &&
+          runResult.status === "fulfilled"
+        ) {
+          setError("");
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
+    void load();
+    const interval = window.setInterval(() => {
+      if (connected) void load();
+    }, 8000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+      controller.abort();
+      aborts.current.delete(controller);
+    };
+  }, [
+    client,
+    selected?.threadId,
+    clearPrivate,
+    refresh,
+    connected,
+    receiptsByThread,
+    disconnect,
+  ]);
+  useEffect(() => {
+    if (!selected) setSelectedId("");
+  }, [selected]);
+  function forgetThread(threadId: string) {
+    const remove = <T,>(current: Record<string, T>) => {
+      const next = { ...current };
+      delete next[threadId];
+      return next;
+    };
+    setSelectedId((current) => (current === threadId ? "" : current));
+    setMetadataUnavailableId((current) =>
+      current === threadId ? "" : current,
+    );
+    setConversations(remove);
+    setThreadRuns(remove);
+    setDraftsByThread(remove);
+    setPendingInputs(remove);
+    setReceiptsByThread(remove);
+  }
+  function handleAccessFailure(error: unknown, threadId?: string): boolean {
+    if (
+      !(error instanceof FactoryClientError) ||
+      (error.status !== 401 && error.status !== 403)
+    )
+      return false;
+    if (error.status === 401) {
+      clearPrivate();
+      setError(message(error));
+      return true;
+    }
+    if (threadId) forgetThread(threadId);
+    const generation = authGeneration.current;
+    if (client)
+      void refresh(client).catch((refreshError: unknown) => {
+        if (generation === authGeneration.current)
+          setError(message(refreshError));
+      });
+    return true;
+  }
+  const shownThreads = threads.filter(
+    (thread) =>
+      thread.projectId === selectedProject &&
+      `${thread.title} ${thread.threadId}`
+        .toLowerCase()
+        .includes(filter.toLowerCase()),
+  );
+  async function retryConnection() {
+    if (!client || busy) return;
+    const generation = authGeneration.current;
+    setBusy(true);
+    try {
+      await refresh(client);
+      if (generation === authGeneration.current) setError("");
+    } catch (error) {
+      if (generation === authGeneration.current) {
+        if (
+          error instanceof FactoryClientError &&
+          [401, 403].includes(error.status)
+        ) {
+          clearPrivate();
+          setError(message(error));
+        } else disconnect(message(error));
+      }
+    } finally {
+      if (generation === authGeneration.current) setBusy(false);
+    }
+  }
+  async function openWork(event: React.FormEvent) {
+    event.preventDefault();
+    if (!client || busy || !connected || !workId.trim()) return;
+    const generation = authGeneration.current;
+    const projectId = selectedProject;
+    const selection = selectedId;
+    const id = workId.trim();
+    setBusy(true);
+    try {
+      const status = await request((signal) =>
+        client.getStatus(id, { signal }),
+      );
+      const current = factoryThreadSchema.parse(status.thread);
+      if (current.threadId !== id)
+        throw new Error("Work item binding changed.");
+      if (
+        generation !== authGeneration.current ||
+        projectId !== selectedProjectRef.current ||
+        selection !== selectedIdRef.current
+      )
+        return;
+      selectedProjectRef.current = current.projectId;
+      setSelectedProject(current.projectId);
+      setThreads((rows) => [
+        ...rows.filter(
+          (row) => row.projectId === current.projectId && row.threadId !== id,
+        ),
+        current,
+      ]);
+      setSelectedId(id);
+      setWorkId("");
+      setError("");
+    } catch (error) {
+      if (
+        generation !== authGeneration.current ||
+        handleAccessFailure(error, id)
+      )
+        return;
+      if (
+        projectId !== selectedProjectRef.current ||
+        selection !== selectedIdRef.current
+      )
+        return;
+      setError(
+        statusUnavailable(error)
+          ? "This Factory cannot supply Work item details by ID while runtime status is unavailable. Select a shown Work item to read its command history."
+          : message(error),
+      );
+    } finally {
+      if (generation === authGeneration.current) setBusy(false);
+    }
+  }
+  async function connect(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const token = String(form.get("credential") ?? "").trim();
+    event.currentTarget.reset();
+    if (!token || /\s/.test(token)) {
+      setError("Enter a valid Factory human credential.");
+      return;
+    }
+    clearPrivate();
+    setBusy(true);
+    setError("");
+    setCredential(token);
+  }
+  async function createProject(event: React.FormEvent) {
+    event.preventDefault();
+    if (!client || !projectName.trim() || busy) return;
+    const generation = authGeneration.current;
+    const dialogVersion = projectDialogVersion.current;
+    const name = projectName.trim();
+    setBusy(true);
+    try {
+      const created = await request((signal) =>
+        client.createProject(name, undefined, { signal }),
+      );
+      if (generation !== authGeneration.current) return;
+      await refresh(client);
+      if (generation !== authGeneration.current) return;
+      if (
+        selectedProjectRef.current === selectedProject &&
+        projectDialogVersion.current === dialogVersion &&
+        projectDialogRef.current &&
+        projectNameRef.current.trim() === name
+      )
+        setSelectedProject(created.projectId);
+      if (
+        projectDialogVersion.current === dialogVersion &&
+        projectDialogRef.current &&
+        projectNameRef.current.trim() === name
+      ) {
+        closeProjectDialog();
+        setProjectName("");
+      }
+    } catch (e) {
+      if (generation === authGeneration.current && handleAccessFailure(e))
+        return;
+      if (
+        generation === authGeneration.current &&
+        projectDialogVersion.current === dialogVersion
+      )
+        setError(message(e));
+    } finally {
+      if (generation === authGeneration.current) setBusy(false);
+    }
+  }
+  async function createThread(event: React.FormEvent) {
+    event.preventDefault();
+    if (
+      !client ||
+      !selectedProject ||
+      !targetNode ||
+      !targetWorkspace ||
+      !threadTitle.trim() ||
+      busy
+    )
+      return;
+    const generation = authGeneration.current;
+    const dialogVersion = threadDialogVersion.current;
+    const projectId = selectedProject;
+    const title = threadTitle.trim();
+    setBusy(true);
+    try {
+      const created = await request((signal) =>
+        client.createThread(
+          {
+            projectId,
+            title,
+            target: { nodeId: targetNode, workspaceId: targetWorkspace },
+          },
+          { signal },
+        ),
+      );
+      if (generation !== authGeneration.current) return;
+      await refresh(client);
+      if (generation !== authGeneration.current) return;
+      if (
+        selectedProjectRef.current === projectId &&
+        threadDialogVersion.current === dialogVersion
+      ) {
+        setThreads((rows) => [
+          ...rows.filter((row) => row.threadId !== created.threadId),
+          created,
+        ]);
+        setSelectedId(created.threadId);
+      }
+      if (
+        threadDialogVersion.current === dialogVersion &&
+        threadDialogRef.current &&
+        selectedProjectRef.current === projectId &&
+        threadTitleRef.current.trim() === title
+      ) {
+        closeThreadDialog();
+        setThreadTitle("");
+      }
+    } catch (e) {
+      if (generation === authGeneration.current && handleAccessFailure(e))
+        return;
+      if (
+        generation === authGeneration.current &&
+        threadDialogVersion.current === dialogVersion
+      )
+        setError(message(e));
+    } finally {
+      if (generation === authGeneration.current) setBusy(false);
+    }
+  }
+  async function send(event: React.FormEvent) {
+    event.preventDefault();
+    if (
+      !client ||
+      !selected ||
+      !draft.trim() ||
+      pendingInput ||
+      !connected ||
+      busy ||
+      identity?.participant?.role === "viewer"
+    )
+      return;
+    const threadId = selected.threadId;
+    const generation = authGeneration.current;
+    const text = draft;
+    const requestId = `input-${crypto.randomUUID()}`;
+    const pending = { threadId, requestId, text };
+    setPendingInputs((current) => ({ ...current, [threadId]: pending }));
+    setReceiptsByThread((current) => {
+      const next = { ...current };
+      delete next[threadId];
+      return next;
+    });
+    setBusy(true);
+    setError("");
+    try {
+      const accepted = await request(
+        (signal) => client.submitInput(threadId, requestId, text, { signal }),
+        threadId,
+      );
+      if (generation !== authGeneration.current) return;
+      setPendingInputs((current) => {
+        const next = { ...current };
+        if (next[threadId]?.requestId === requestId) delete next[threadId];
+        return next;
+      });
+      setReceiptsByThread((current) => ({ ...current, [threadId]: accepted }));
+      updateRuns(threadId, (current) => [
+        accepted,
+        ...current.filter((r) => r.requestId !== accepted.requestId),
+      ]);
+      setDraftsByThread((current) => {
+        const next = { ...current };
+        if (ownValue(next, threadId) === text) delete next[threadId];
+        return next;
+      });
+    } catch (e) {
+      if (
+        generation === authGeneration.current &&
+        handleAccessFailure(e, threadId)
+      )
+        return;
+      if (
+        generation === authGeneration.current &&
+        selectedIdRef.current === threadId
+      ) {
+        setError(
+          `${message(e)} The same request and text are held in this tab only. Check its receipt before retrying.`,
+        );
+        setReceiptsByThread((current) => {
+          const next = { ...current };
+          delete next[threadId];
+          return next;
+        });
+      }
+    } finally {
+      if (generation === authGeneration.current) setBusy(false);
+    }
+  }
+  async function reconcile() {
+    if (
+      !client ||
+      (!receipt && !pendingInput) ||
+      !selected ||
+      selected.threadId !== (pendingInput?.threadId ?? selected.threadId) ||
+      busy
+    )
+      return;
+    const generation = authGeneration.current;
+    const threadId = pendingInput?.threadId ?? selected.threadId;
+    const requestId = receipt?.requestId ?? pendingInput!.requestId;
+    const pending = pendingInput;
+    setBusy(true);
+    try {
+      const found = await request(
+        (signal) => client.getReceipt(requestId, { signal }),
+        threadId,
+      );
+      if (
+        generation !== authGeneration.current ||
+        selectedIdRef.current !== threadId
+      )
+        return;
+      if (found.threadId !== threadId)
+        throw new Error(
+          "Receipt belongs to a different Work item; no retry was made.",
+        );
+      setReceiptsByThread((current) => ({ ...current, [threadId]: found }));
+      if (pending) {
+        setPendingInputs((current) => {
+          const next = { ...current };
+          if (next[threadId]?.requestId === requestId) delete next[threadId];
+          return next;
+        });
+        setDraftsByThread((current) => {
+          const next = { ...current };
+          if (ownValue(next, threadId) === pending.text) delete next[threadId];
+          return next;
+        });
+      }
+      updateRuns(threadId, (current) => [
+        found,
+        ...current.filter((r) => r.requestId !== found.requestId),
+      ]);
+    } catch (lookupError) {
+      if (
+        generation === authGeneration.current &&
+        handleAccessFailure(lookupError, threadId)
+      )
+        return;
+      if (
+        generation !== authGeneration.current ||
+        selectedIdRef.current !== threadId
+      )
+        return;
+      if (
+        !(lookupError instanceof FactoryClientError) ||
+        lookupError.status !== 404 ||
+        !pending ||
+        pending.threadId !== threadId
+      ) {
+        setError(
+          `Receipt status is still unknown. ${message(lookupError)} No request was sent to another Work item.`,
+        );
+        return;
+      }
+      try {
+        if (identity?.participant?.role === "viewer") {
+          setError("Your current access is read-only. No input was retried.");
+          return;
+        }
+        const retried = await request(
+          (signal) =>
+            client.submitInput(
+              pending.threadId,
+              pending.requestId,
+              pending.text,
+              { signal },
+            ),
+          threadId,
+        );
+        if (
+          generation !== authGeneration.current ||
+          selectedIdRef.current !== threadId
+        )
+          return;
+        setPendingInputs((current) => {
+          const next = { ...current };
+          if (next[threadId]?.requestId === requestId) delete next[threadId];
+          return next;
+        });
+        setReceiptsByThread((current) => ({ ...current, [threadId]: retried }));
+        setDraftsByThread((current) => {
+          const next = { ...current };
+          if (ownValue(next, threadId) === pending.text) delete next[threadId];
+          return next;
+        });
+        updateRuns(threadId, (current) => [
+          retried,
+          ...current.filter((r) => r.requestId !== retried.requestId),
+        ]);
+      } catch (retryError) {
+        if (
+          generation === authGeneration.current &&
+          handleAccessFailure(retryError, threadId)
+        )
+          return;
+        if (
+          generation === authGeneration.current &&
+          selectedIdRef.current === threadId
+        )
+          setError(
+            `Receipt status is still unknown. ${message(retryError)} The same request ID and text remain available.`,
+          );
+      }
+    } finally {
+      if (generation === authGeneration.current) setBusy(false);
+    }
+  }
+  const canCreate = identity?.participant?.role === "owner";
+  const canSteer =
+    identity?.participant?.role === "owner" ||
+    identity?.participant?.role === "guest";
+  if (!identity)
+    return (
+      <main className="connect-page">
+        <section className="connect-panel">
+          <div className="brand">
+            <span className="brand-mark" aria-hidden="true">
+              U
+            </span>
+            <span>
+              UZINA <small>FACTORY</small>
+            </span>
+          </div>
+          <h1>Connect to your Factory</h1>
+          <p>
+            Use a current human credential for this Factory. The credential
+            remains in this browser tab’s memory only.
+          </p>
+          <form onSubmit={connect} className="connect-form">
+            <label htmlFor="credential">Human credential</label>
+            <input
+              id="credential"
+              name="credential"
+              type="password"
+              autoComplete="off"
+              required
+              autoFocus
+            />
+            <button className="primary" disabled={busy}>
+              {busy ? "Connecting…" : "Connect"}
+            </button>
+          </form>
+          <p className="help">
+            Start the Factory service first. Ask its Owner for a human
+            credential using the configured access flow. Do not use an
+            execution-node credential or a model-provider key.
+          </p>
+          {error && (
+            <p className="alert" role="alert">
+              {error}
+            </p>
+          )}
+        </section>
+      </main>
+    );
+  const header = (
+    <header className="topbar">
+      <div className="brand">
+        <span className="brand-mark" aria-hidden="true">
+          U
+        </span>
+        <span>
+          UZINA <small>FACTORY</small>
+        </span>
+      </div>
+      <div className="top-right">
+        <span className={`connection ${connected ? "online" : "offline"}`}>
+          <i /> {connected ? "Connected" : "Unavailable"}
+        </span>
+        <span className="role">
+          {identity.participant?.role ?? identity.actor.kind}
+        </span>
+        <button className="quiet" onClick={clearPrivate}>
+          Sign out
+        </button>
+      </div>
+    </header>
+  );
+  if (!connected)
+    return (
+      <div className="app-shell">
+        {header}
+        <main className="disconnected">
+          <h1>Factory unavailable</h1>
+          <p role="alert">
+            {error || "Check that the Factory is running, then retry."}
+          </p>
+          <p>
+            Private work is hidden. Unsent drafts and forms were cleared.
+            Uncertain input stays in this tab with its original Work item,
+            request ID, and text. Retry to check current access before recovery.
+          </p>
+          <button className="primary" onClick={retryConnection} disabled={busy}>
+            {busy ? "Connecting…" : "Retry connection"}
+          </button>
+        </main>
+      </div>
+    );
+  return (
+    <div className="app-shell">
+      {header}
+      {error && (
+        <div className="alert banner" role="alert">
+          {error}
+        </div>
+      )}
+      <div className="layout">
+        <aside className="sidebar" aria-label="Work navigation">
+          <div className="section-head">
+            <label htmlFor="project-select">PROJECT</label>
+            {canCreate && (
+              <button
+                className="icon-button"
+                aria-label="Create project"
+                onClick={openProjectDialog}
+              >
+                <Icon name="plus" />
+              </button>
+            )}
+          </div>
+          {projects.length ? (
+            <select
+              id="project-select"
+              value={selectedProject}
+              onChange={(e) => {
+                setSelectedProject(e.target.value);
+                setSelectedId("");
+              }}
+            >
+              <option value="" disabled>
+                Choose a project
+              </option>
+              {selectedProject &&
+                !projects.some((p) => p.projectId === selectedProject) && (
+                  <option value={selectedProject}>{selectedProject}</option>
+                )}
+              {projects.map((p) => (
+                <option key={p.projectId} value={p.projectId}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <p className="empty small">No accessible projects.</p>
+          )}
+          <div className="section-head work-head">
+            <h2>Work items</h2>
+            {canCreate && selectedProject && (
+              <button
+                className="icon-button"
+                aria-label="Create Work item"
+                onClick={openThreadDialog}
+              >
+                <Icon name="plus" />
+              </button>
+            )}
+          </div>
+          <label className="sr-only" htmlFor="work-search">
+            Search Work items
+          </label>
+          {projects.length === 100 && (
+            <p className="list-limit">
+              First 100 projects shown. Open a Work item by ID if its project is
+              not listed.
+            </p>
+          )}
+          <details className="open-work">
+            <summary>Open Work item by ID</summary>
+            <form onSubmit={openWork}>
+              <label htmlFor="work-id">Work item ID</label>
+              <input
+                id="work-id"
+                value={workId}
+                onChange={(event) => setWorkId(event.target.value)}
+                required
+                maxLength={128}
+              />
+              <button className="primary" disabled={busy}>
+                Open Work item
+              </button>
+            </form>
+          </details>
+          {threadBatchFull && (
+            <p className="list-limit">
+              First 100 Work items in this project shown, oldest first. More may
+              exist. Open a Work item by ID; search covers only the shown list.
+            </p>
+          )}
+          <input
+            id="work-search"
+            className="search"
+            placeholder="Search Work items"
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+          />
+          <nav className="thread-list" aria-label="Work items">
+            {shownThreads.map((thread) => (
+              <button
+                className={`thread-item ${selectedId === thread.threadId ? "active" : ""}`}
+                key={thread.threadId}
+                aria-current={
+                  selectedId === thread.threadId ? "page" : undefined
+                }
+                onClick={() => {
+                  setError("");
+                  setSelectedId(thread.threadId);
+                }}
+              >
+                <span className="thread-title">{thread.title}</span>
+                <span className="thread-meta">{thread.threadId}</span>
+              </button>
+            ))}
+            {!shownThreads.length && (
+              <p className="empty">
+                {threads.length
+                  ? "No Work items match this search."
+                  : "No Work items in this project yet."}
+              </p>
+            )}
+          </nav>
+          <div className="sidebar-foot">
+            <span className="avatar">
+              {(identity.participant?.displayName ?? identity.actor.kind)
+                .slice(0, 1)
+                .toUpperCase()}
+            </span>
+            <span className="user-name">
+              {identity.participant?.displayName ?? identity.actor.kind}
+            </span>
+          </div>
+        </aside>
+        <main className="work-area">
+          {selected ? (
+            <>
+              <div className="work-heading">
+                <button
+                  className="mobile-back"
+                  onClick={() => setSelectedId("")}
+                >
+                  <Icon name="back" /> Work items
+                </button>
+                <div>
+                  <p className="breadcrumb">
+                    {projects.find((p) => p.projectId === selected.projectId)
+                      ?.name ?? "Project"}
+                  </p>
+                  <h1>{selected.title}</h1>
+                </div>
+                <button
+                  className="details-toggle"
+                  onClick={() => setDetailsOpen(!detailsOpen)}
+                  aria-expanded={detailsOpen}
+                >
+                  Work details
+                </button>
+              </div>
+              {metadataUnavailableId === selected.threadId && (
+                <p className="list-limit" role="status">
+                  Runtime status is unavailable. Showing last-known Work item
+                  details; command history has current access checks.
+                </p>
+              )}
+              <div className="target-strip">
+                <span className="target-label">EXECUTION TARGET</span>
+                <strong>
+                  {nodes.find((n) => n.nodeId === selected.target.nodeId)
+                    ?.name ?? selected.target.nodeId}
+                </strong>
+                <span className="slash">/</span>
+                <strong>
+                  {workspaces.find(
+                    (w) => w.workspaceId === selected.target.workspaceId,
+                  )?.name ?? selected.target.workspaceId}
+                </strong>
+                <span
+                  className={`availability ${nodes.find((n) => n.nodeId === selected.target.nodeId)?.availability ?? "unavailable"}`}
+                >
+                  {nodes.find((n) => n.nodeId === selected.target.nodeId)
+                    ?.availability ?? "Status unavailable to this role"}
+                </span>
+              </div>
+              <section
+                ref={conversationElement}
+                className="conversation"
+                tabIndex={0}
+                onScroll={(event) => {
+                  const element = event.currentTarget;
+                  followConversation.current =
+                    element.scrollHeight -
+                      element.scrollTop -
+                      element.clientHeight <
+                    48;
+                }}
+                aria-label="Conversation"
+                aria-live="polite"
+              >
+                {conversation.length ? (
+                  conversation.map((entry, i) => (
+                    <article
+                      className={`message ${entry.role}`}
+                      key={`${i}-${entry.role}`}
+                    >
+                      <div className="message-label">
+                        {entry.role === "user" ? "Human" : "Assistant"}
+                      </div>
+                      <div className="message-text">{entry.text}</div>
+                    </article>
+                  ))
+                ) : (
+                  <div className="conversation-empty">
+                    <div className="empty-icon" aria-hidden="true">
+                      <Icon name="chat" />
+                    </div>
+                    <h2>Conversation will appear here</h2>
+                    <p>
+                      {canSteer
+                        ? "Send input to this Work item. Accepted input does not mean execution is complete."
+                        : "No visible conversation is available for this Work item yet."}
+                    </p>
+                  </div>
+                )}
+                {(receipt || pendingInput) && (
+                  <article className="receipt">
+                    <strong>
+                      {receipt ? "Input accepted" : "Acknowledgement unknown"}
+                    </strong>
+                    <span>
+                      {receipt
+                        ? `Command status: ${receipt.dispatchStatus}. This receipt records admission; assistant text appears separately in the conversation.`
+                        : "Check the existing request receipt. If no receipt exists, the same request ID and text will be retried."}
+                    </span>
+                    <button
+                      className="quiet"
+                      onClick={reconcile}
+                      disabled={busy}
+                    >
+                      {receipt ? "Check receipt" : "Reconcile request"}
+                    </button>
+                  </article>
+                )}
+              </section>
+              {canSteer ? (
+                <form className="composer" onSubmit={send}>
+                  <label htmlFor="composer-input">Message</label>
+                  <textarea
+                    id="composer-input"
+                    value={draft}
+                    onChange={(e) => setDraft(e.target.value)}
+                    readOnly={Boolean(pendingInput)}
+                    aria-describedby={
+                      pendingInput ? "pending-input-note" : undefined
+                    }
+                    placeholder="Add direction to this Work item…"
+                    rows={3}
+                    onKeyDown={(e) => {
+                      if (
+                        e.key === "Enter" &&
+                        !e.shiftKey &&
+                        !e.nativeEvent.isComposing
+                      ) {
+                        e.preventDefault();
+                        e.currentTarget.form?.requestSubmit();
+                      }
+                    }}
+                  />
+                  <div className="composer-footer">
+                    <span>
+                      {pendingInput ? (
+                        <span id="pending-input-note">
+                          Input locked until its original receipt is reconciled.
+                        </span>
+                      ) : (
+                        "Enter to send · Shift + Enter for a new line"
+                      )}
+                    </span>
+                    <button
+                      className="primary"
+                      disabled={
+                        busy ||
+                        !connected ||
+                        Boolean(pendingInput) ||
+                        !draft.trim()
+                      }
+                    >
+                      {busy ? "Sending…" : "Send input"}
+                    </button>
+                  </div>
+                </form>
+              ) : (
+                <p className="read-only-note">
+                  Your Viewer access is read-only. Ask the Owner for Guest
+                  access to send input.
+                </p>
+              )}
+              <aside
+                className={`details ${detailsOpen ? "expanded" : ""}`}
+                aria-label="Work item details"
+              >
+                <div className="details-title">
+                  <h2>Execution &amp; history</h2>
+                  <button
+                    className="icon-button close-details"
+                    aria-label="Close work details"
+                    onClick={() => setDetailsOpen(false)}
+                  >
+                    <Icon name="close" />
+                  </button>
+                </div>
+                <dl>
+                  <dt>Work item</dt>
+                  <dd>{selected.threadId}</dd>
+                  <dt>Node</dt>
+                  <dd>{selected.target.nodeId}</dd>
+                  <dt>Workspace</dt>
+                  <dd>{selected.target.workspaceId}</dd>
+                  <dt>Command history</dt>
+                  <dd>
+                    {runs.length
+                      ? `${runs.length} command${runs.length === 1 ? "" : "s"}`
+                      : "No commands yet"}
+                  </dd>
+                </dl>
+                {runs.length >= 100 && (
+                  <p className="list-limit">
+                    First 100 commands shown, oldest first. Newer commands may
+                    be absent. This API has no history pagination; use Check
+                    receipt for this tab’s last accepted input.
+                  </p>
+                )}
+                {runs.map((run) => (
+                  <div className="run" key={run.requestId}>
+                    <b>{run.dispatchStatus}</b>
+                    <span>
+                      {run.acceptedAt
+                        ? new Date(run.acceptedAt).toLocaleString()
+                        : ""}
+                    </span>
+                    <code>{run.requestId}</code>
+                  </div>
+                ))}
+                <p className="muted">
+                  History shows command acceptance and status only. It does not
+                  infer completion from an acknowledgement.
+                </p>
+              </aside>
+            </>
+          ) : (
+            <section className="welcome">
+              <div className="welcome-top">
+                <p className="breadcrumb">
+                  {projects.find((p) => p.projectId === selectedProject)
+                    ?.name ?? "Factory"}
+                </p>
+                <h1>Work items</h1>
+                <p>
+                  Select a Work item to read its conversation and execution
+                  history.
+                </p>
+              </div>
+              {threads.length === 0 && (
+                <div className="empty-state">
+                  <h2>Nothing here yet</h2>
+                  <p>
+                    Create a project and Work item to begin. Work items require
+                    an explicit existing node and Workspace.
+                  </p>
+                  {canCreate && (
+                    <button
+                      className="primary"
+                      onClick={() =>
+                        projects.length
+                          ? openThreadDialog()
+                          : openProjectDialog()
+                      }
+                    >
+                      {projects.length ? "Create Work item" : "Create project"}
+                    </button>
+                  )}
+                </div>
+              )}
+            </section>
+          )}
+        </main>
+        <Modal
+          open={showCreateProject}
+          onClose={closeProjectDialog}
+          labelledBy="project-title"
+        >
+          <section className="dialog">
+            <button
+              className="dialog-close"
+              aria-label="Close"
+              onClick={closeProjectDialog}
+            >
+              <Icon name="close" />
+            </button>
+            <h2 id="project-title">Create project</h2>
+            <form onSubmit={createProject}>
+              <label htmlFor="project-name">Project name</label>
+              <input
+                id="project-name"
+                value={projectName}
+                onChange={(e) => setProjectName(e.target.value)}
+                required
+                maxLength={160}
+                autoFocus
+              />
+              <div className="dialog-actions">
+                <button
+                  type="button"
+                  className="quiet"
+                  onClick={closeProjectDialog}
+                >
+                  Cancel
+                </button>
+                <button className="primary" disabled={busy}>
+                  Create project
+                </button>
+              </div>
+            </form>
+          </section>
+        </Modal>
+        <Modal
+          open={showCreateThread}
+          onClose={closeThreadDialog}
+          labelledBy="thread-title"
+        >
+          <section className="dialog">
+            <button
+              className="dialog-close"
+              aria-label="Close"
+              onClick={closeThreadDialog}
+            >
+              <Icon name="close" />
+            </button>
+            <h2 id="thread-title">Create Work item</h2>
+            <p className="muted">
+              Choose a registered node and its existing Workspace. No target is
+              selected automatically.
+            </p>
+            <form onSubmit={createThread}>
+              <label htmlFor="work-title">Work item name</label>
+              <input
+                id="work-title"
+                value={threadTitle}
+                onChange={(e) => setThreadTitle(e.target.value)}
+                required
+                maxLength={160}
+              />
+              <label htmlFor="node-select">Execution node</label>
+              <select
+                id="node-select"
+                value={targetNode}
+                onChange={(e) => {
+                  setTargetNode(e.target.value);
+                  setTargetWorkspace("");
+                }}
+                required
+              >
+                <option value="">Choose a node</option>
+                {nodes.map((node) => (
+                  <option key={node.nodeId} value={node.nodeId}>
+                    {node.name} · {node.availability}
+                  </option>
+                ))}
+              </select>
+              <label htmlFor="workspace-select">Workspace</label>
+              <select
+                id="workspace-select"
+                value={targetWorkspace}
+                onChange={(e) => setTargetWorkspace(e.target.value)}
+                required
+                disabled={!targetNode}
+              >
+                <option value="">Choose a Workspace</option>
+                {workspaces
+                  .filter((w) => w.nodeId === targetNode)
+                  .map((w) => (
+                    <option key={w.workspaceId} value={w.workspaceId}>
+                      {w.name}
+                    </option>
+                  ))}
+              </select>
+              {!nodes.length && (
+                <p className="empty">
+                  No execution nodes are registered. An Owner must configure a
+                  node and Workspace first.
+                </p>
+              )}
+              <div className="dialog-actions">
+                <button
+                  type="button"
+                  className="quiet"
+                  onClick={closeThreadDialog}
+                >
+                  Cancel
+                </button>
+                <button
+                  className="primary"
+                  disabled={
+                    busy ||
+                    !nodes.length ||
+                    !workspaces.some((w) => w.nodeId === targetNode)
+                  }
+                >
+                  Create Work item
+                </button>
+              </div>
+            </form>
+          </section>
+        </Modal>
+      </div>
+    </div>
+  );
+}
+
+createRoot(document.getElementById("root")!).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>,
+);
