@@ -16,6 +16,7 @@ import {
   submitInputRequestSchema,
   workspaceSnapshotRequestSchema,
   managedWorkCheckpointRequestSchema,
+  managedWorkTransferHoldRequestSchema,
   managedWorkImportRequestSchema,
   type ManagedWorkImportHostBinding,
   type ManagedWorkImportOutcome,
@@ -441,6 +442,34 @@ export function createFactoryHttpHandler(
           await factory.getManagedWorkCheckpointStatus(
             session,
             decodeURIComponent(managedWorkCheckpointStatusMatch[1]!),
+          ),
+        );
+      }
+      const managedWorkTransferHoldAdmissionMatch = path.match(
+        /^\/v1\/threads\/([^/]+)\/managed-work-transfer-holds$/,
+      );
+      if (request.method === "POST" && managedWorkTransferHoldAdmissionMatch) {
+        if (!managedWork?.exportCheckpoint || !checkpointPrivateStorage) {
+          throw new FactoryError(503, "managed_work_transfer_hold_unavailable");
+        }
+        const input = await body(request, managedWorkTransferHoldRequestSchema);
+        return json(
+          await factory.requestManagedWorkTransferHold(
+            session,
+            decodeURIComponent(managedWorkTransferHoldAdmissionMatch[1]!),
+            input,
+          ),
+          202,
+        );
+      }
+      const managedWorkTransferHoldStatusMatch = path.match(
+        /^\/v1\/managed-work-transfer-holds\/([^/]+)$/,
+      );
+      if (request.method === "GET" && managedWorkTransferHoldStatusMatch) {
+        return json(
+          await factory.getManagedWorkTransferHoldStatus(
+            session,
+            decodeURIComponent(managedWorkTransferHoldStatusMatch[1]!),
           ),
         );
       }

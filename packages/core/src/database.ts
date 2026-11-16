@@ -603,7 +603,41 @@ const schema = [
       OR status = 'uncertain'
     )
   )`,
+  `CREATE TABLE IF NOT EXISTS managed_work_transfer_holds (
+    request_id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL REFERENCES factory_users(user_id),
+    actor_json TEXT NOT NULL,
+    capture_request_id TEXT NOT NULL UNIQUE REFERENCES capture_control_requests(request_id),
+    checkpoint_request_id TEXT NOT NULL UNIQUE REFERENCES managed_work_checkpoint_requests(request_id),
+    workspace_snapshot_request_id TEXT NOT NULL UNIQUE REFERENCES workspace_snapshot_requests(request_id),
+    capture_id TEXT NOT NULL UNIQUE REFERENCES managed_work_captures(capture_id),
+    snapshot_id TEXT NOT NULL UNIQUE REFERENCES workspace_snapshot_requests(snapshot_id),
+    project_id TEXT NOT NULL REFERENCES projects(project_id),
+    thread_id TEXT NOT NULL REFERENCES threads(thread_id),
+    source_node_id TEXT NOT NULL REFERENCES nodes(node_id),
+    source_workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id),
+    ownership_generation INTEGER NOT NULL CHECK (ownership_generation >= 0),
+    control_id TEXT NOT NULL UNIQUE,
+    control_payload_sha256 TEXT NOT NULL CHECK (length(control_payload_sha256) = 64 AND control_payload_sha256 NOT GLOB '*[^a-f0-9]*'),
+    source_capture_report_sha256 TEXT NOT NULL CHECK (length(source_capture_report_sha256) = 64 AND source_capture_report_sha256 NOT GLOB '*[^a-f0-9]*'),
+    source_fence_json TEXT NOT NULL,
+    workspace_snapshot_report_sha256 TEXT NOT NULL CHECK (length(workspace_snapshot_report_sha256) = 64 AND workspace_snapshot_report_sha256 NOT GLOB '*[^a-f0-9]*'),
+    workspace_manifest_reference TEXT NOT NULL CHECK (length(workspace_manifest_reference) = 64 AND workspace_manifest_reference NOT GLOB '*[^a-f0-9]*'),
+    coherent_checkpoint_manifest_reference TEXT NOT NULL CHECK (length(coherent_checkpoint_manifest_reference) = 64 AND coherent_checkpoint_manifest_reference NOT GLOB '*[^a-f0-9]*'),
+    status TEXT NOT NULL CHECK (status = 'held-awaiting-local-preparation'),
+    accepted_at TEXT NOT NULL,
+    binding_sha256 TEXT NOT NULL CHECK (length(binding_sha256) = 64 AND binding_sha256 NOT GLOB '*[^a-f0-9]*'),
+    UNIQUE (source_node_id, source_workspace_id, ownership_generation)
+  )`,
+  `CREATE TRIGGER IF NOT EXISTS managed_work_transfer_holds_no_update
+   BEFORE UPDATE ON managed_work_transfer_holds
+   BEGIN SELECT RAISE(ABORT, 'managed_work_transfer_hold_immutable'); END`,
+  `CREATE TRIGGER IF NOT EXISTS managed_work_transfer_holds_no_delete
+   BEFORE DELETE ON managed_work_transfer_holds
+   BEGIN SELECT RAISE(ABORT, 'managed_work_transfer_hold_immutable'); END`,
   `CREATE INDEX IF NOT EXISTS workspace_relocation_activation_queue ON workspace_relocation_activations(status, destination_node_id, intent_at)`,
+  `CREATE INDEX IF NOT EXISTS managed_work_transfer_holds_by_source ON managed_work_transfer_holds(source_node_id, source_workspace_id, ownership_generation)`,
+
   `CREATE INDEX IF NOT EXISTS workspace_relocation_queue_by_node ON workspace_relocations(status, destination_node_id, accepted_at)`,
   `CREATE INDEX IF NOT EXISTS workspace_snapshot_queue_by_node ON workspace_snapshot_requests(status, node_id, accepted_at)`,
   `CREATE INDEX IF NOT EXISTS capture_control_queue_by_node ON capture_control_requests(status, node_id, accepted_at)`,

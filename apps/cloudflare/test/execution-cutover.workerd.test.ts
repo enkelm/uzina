@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import { Miniflare } from "miniflare";
 import { buildCloudflareWorkerArtifact } from "../scripts/build-worker";
+import { CaptureStateBarrier } from "./capture-state-barrier";
 import { ExecutionDaemon } from "../../daemon/src/execution/daemon";
 import {
   ControllerTransportError,
@@ -959,6 +960,54 @@ describe("execution cutover in production-shaped workerd + R2", () => {
     );
     const durableObjectsPath = join(directory, "durable-objects");
     const r2Path = join(directory, "r2");
+    const captureStateBarrier = new CaptureStateBarrier();
+    const pendingAdmissionRequests = new Map<Promise<unknown>, () => void>();
+    const trackedAdmissionPost = <T>(
+      baseUrl: string,
+      path: string,
+      credential: string,
+      body: unknown,
+    ) => {
+      const controller = new AbortController();
+      const promise = (async () => {
+        const response = await fetch(new URL(path, baseUrl), {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${credential}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        });
+        const text = await response.text();
+        return { status: response.status, value: JSON.parse(text) as T };
+      })();
+      pendingAdmissionRequests.set(promise, () => controller.abort());
+      void promise.then(
+        () => pendingAdmissionRequests.delete(promise),
+        () => undefined,
+      );
+      return promise;
+    };
+    const waitForCaptureStateBarrier = async (
+      entered: Promise<void>,
+      label: string,
+    ) => {
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          entered,
+          new Promise<never>((_, reject) => {
+            timeout = setTimeout(
+              () => reject(new Error(`Timed out waiting for ${label}`)),
+              15_000,
+            );
+          }),
+        ]);
+      } finally {
+        if (timeout) clearTimeout(timeout);
+      }
+    };
     let ownerReadBarrierEntered = false;
     let releaseOwnerRead: (() => void) | undefined;
     const ownerReadBarrier = Bun.serve({
@@ -997,6 +1046,7 @@ describe("execution cutover in production-shaped workerd + R2", () => {
             "/owner-blob",
             ownerReadBarrier.url,
           ).toString(),
+          UZINA_TEST_CAPTURE_STATE_BARRIER_URL: captureStateBarrier.url,
         },
         durableObjects: {
           FACTORY: { className: "CaptureTestFactory", useSQLite: true },
@@ -1024,13 +1074,23 @@ describe("execution cutover in production-shaped workerd + R2", () => {
         return miniflare;
       },
       async close() {
+        const failures: unknown[] = [];
+        captureStateBarrier.releaseAll();
+        const pending = [...pendingAdmissionRequests];
+        for (const [, abort] of pending) abort();
+        const admissionResults = await Promise.allSettled(
+          pending.map(([request]) => request),
+        );
+        for (const result of admissionResults) {
+          if (result.status === "rejected") failures.push(result.reason);
+        }
+        pendingAdmissionRequests.clear();
         releaseCommitGate?.();
         releaseReadinessDropGate?.();
         releaseActivationClaimGate?.();
         releaseActivationAckGate?.();
         releaseFaultReadinessGate?.();
         releaseOwnerRead?.();
-        const failures: unknown[] = [];
         for (const runner of runners) {
           try {
             await stopNode(runner);
@@ -1040,8 +1100,18 @@ describe("execution cutover in production-shaped workerd + R2", () => {
         }
         try {
           await miniflare.dispose();
-        } finally {
+        } catch (error) {
+          failures.push(error);
+        }
+        try {
           await ownerReadBarrier.stop(true);
+        } catch (error) {
+          failures.push(error);
+        }
+        try {
+          await captureStateBarrier.close();
+        } catch (error) {
+          failures.push(error);
         }
         if (failures.length > 0) {
           throw new AggregateError(
@@ -1351,18 +1421,37 @@ describe("execution cutover in production-shaped workerd + R2", () => {
       },
     };
     const relocationPath = `/v1/threads/${sourceThread.value.threadId}/workspace-relocations`;
-    const relocation = await call<{
+    await stopNode(sourceRunner);
+    const deniedHoldRequestId = "hold:denied-after-relocation-commit";
+    const pendingHoldGate = captureStateBarrier.arm({
+      kind: "managed-work-transfer-hold",
+      requestId: deniedHoldRequestId,
+      threadId: sourceThread.value.threadId,
+    });
+    const pendingHold = trackedAdmissionPost<{ error?: string }>(
+      baseUrl,
+      `/v1/threads/${sourceThread.value.threadId}/managed-work-transfer-holds`,
+      owner,
+      {
+        contractVersion: 1,
+        requestId: deniedHoldRequestId,
+        captureRequestId,
+        checkpointRequestId,
+      },
+    );
+    await waitForCaptureStateBarrier(
+      pendingHoldGate.entered,
+      "hold capture-state read before relocation admission",
+    );
+    const relocation = await trackedAdmissionPost<{
       relocationId: string;
       requestId: string;
       destination: { nodeId: string; workspaceId: string };
       ownershipGeneration: number;
       destinationOwnershipGeneration?: number;
       status: string;
-    }>(baseUrl, relocationPath, {
-      credential: owner,
-      body: destinationRequest,
-    });
-    expect(relocation.response.status).toBe(202);
+    }>(baseUrl, relocationPath, owner, destinationRequest);
+    expect(relocation.status).toBe(202);
     expect(relocation.value).toMatchObject({
       requestId: destinationRequest.requestId,
       destination: destinationRequest.destination,
@@ -1370,6 +1459,36 @@ describe("execution cutover in production-shaped workerd + R2", () => {
       destinationOwnershipGeneration: 0,
       status: "queued",
     });
+    pendingHoldGate.release();
+    expect(await pendingHold).toMatchObject({
+      status: 409,
+      value: { error: "managed_work_transfer_hold_relocation_exists" },
+    });
+    expect(
+      await call(
+        baseUrl,
+        `/v1/managed-work-transfer-holds/${deniedHoldRequestId}`,
+        { credential: owner },
+      ),
+    ).toMatchObject({ response: { status: 404 } });
+    sourceRunner = startNode(
+      directory,
+      sourceNodeIdentity.value.node.nodeId,
+      sourceNodeIdentity.value.credential,
+      [
+        {
+          workspaceId: workspaceA.value.workspaceId,
+          directory: sourceWorkspace,
+        },
+        {
+          workspaceId: workspaceX.value.workspaceId,
+          directory: unrelatedWorkspace,
+        },
+      ],
+      baseUrl,
+    );
+    runners.push(sourceRunner);
+    await waitOnline(sourceNodeIdentity.value.node.nodeId);
     const relocationStatusPath = `/v1/workspace-relocations/${destinationRequest.requestId}`;
     const unclaimedRead = await fetch(
       new URL(

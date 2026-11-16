@@ -20,9 +20,13 @@ import { tmpdir } from "node:os";
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { Miniflare } from "../../cloudflare/test/miniflare-test-support";
 import { buildCloudflareWorkerArtifact } from "../../cloudflare/scripts/build-worker";
+import { CaptureStateBarrier } from "../../cloudflare/test/capture-state-barrier";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { CONTRACT_VERSION } from "@uzina/contracts";
-import type { ManagedWorkImportStatus } from "@uzina/contracts/factory";
+import type {
+  ManagedWorkImportStatus,
+  ManagedWorkTransferHoldStatus,
+} from "@uzina/contracts/factory";
 import { ManagedPiWork, type ManagedModels } from "@uzina/pi-runtime";
 import {
   exportManagedWorkCheckpoint,
@@ -4838,30 +4842,135 @@ describe("authenticated cloud producer to standalone inactive consumer", () => {
         "../../cloudflare/test/capture-aware-workerd-entry.ts",
       ),
     );
-    const miniflare = new Miniflare({
-      name: "uzina-cloud-producer-offline-consumer",
-      script: workerArtifact.script,
-      modules: true,
-      compatibilityDate: "2026-05-01",
-      host: "127.0.0.1",
-      port: 0,
-      bindings: { UZINA_BOOTSTRAP_SECRET: "cloud-producer-test-bootstrap" },
-      durableObjects: {
-        FACTORY: { className: "CaptureTestFactory", useSQLite: true },
-        MANAGED_WORK: { className: "CaptureTestManagedWork", useSQLite: true },
-      },
-      durableObjectsPersist: join(sourceDirectory, "durable-objects"),
-      r2Buckets: ["CHECKPOINTS"],
-      r2Persist: join(sourceDirectory, "r2"),
-    });
+    const captureStateBarrier = new CaptureStateBarrier();
+    const pendingWorkerdRequests = new Map<Promise<unknown>, () => void>();
+    const trackWorkerdRequest = <T>(
+      operation: (signal: AbortSignal) => Promise<T>,
+    ): Promise<T> => {
+      const controller = new AbortController();
+      const promise = operation(controller.signal);
+      pendingWorkerdRequests.set(promise, () => controller.abort());
+      void promise.then(
+        () => pendingWorkerdRequests.delete(promise),
+        () => undefined,
+      );
+      return promise;
+    };
+    const waitForCaptureStateBarrier = async (
+      entered: Promise<void>,
+      label: string,
+    ) => {
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          entered,
+          new Promise<never>((_, reject) => {
+            timeout = setTimeout(
+              () => reject(new Error(`Timed out waiting for ${label}`)),
+              15_000,
+            );
+          }),
+        ]);
+      } finally {
+        if (timeout) clearTimeout(timeout);
+      }
+    };
+    const trackedJsonPost = <T>(
+      baseUrl: string,
+      path: string,
+      credential: string,
+      body: unknown,
+    ) =>
+      trackWorkerdRequest(async (signal) => {
+        const response = await fetch(new URL(path, baseUrl), {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${credential}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify(body),
+          signal,
+        });
+        return {
+          status: response.status,
+          value: (await response.json()) as T,
+        };
+      });
+    const trackedDiscardPost = (
+      baseUrl: string,
+      path: string,
+      credential: string,
+      body: unknown,
+    ) =>
+      trackWorkerdRequest(async (signal) => {
+        const response = await fetch(new URL(path, baseUrl), {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${credential}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify(body),
+          signal,
+        });
+        const status = response.status;
+        await response.body?.cancel();
+        return status;
+      });
+    const createSourceMiniflare = () =>
+      new Miniflare({
+        name: "uzina-cloud-producer-offline-consumer",
+        script: workerArtifact.script,
+        modules: true,
+        compatibilityDate: "2026-05-01",
+        host: "127.0.0.1",
+        port: 0,
+        bindings: {
+          UZINA_BOOTSTRAP_SECRET: "cloud-producer-test-bootstrap",
+          UZINA_TEST_CAPTURE_STATE_BARRIER_URL: captureStateBarrier.url,
+        },
+        durableObjects: {
+          FACTORY: { className: "CaptureTestFactory", useSQLite: true },
+          MANAGED_WORK: {
+            className: "CaptureTestManagedWork",
+            useSQLite: true,
+          },
+        },
+        durableObjectsPersist: join(sourceDirectory, "durable-objects"),
+        r2Buckets: ["CHECKPOINTS"],
+        r2Persist: join(sourceDirectory, "r2"),
+      });
+    let miniflare = createSourceMiniflare();
+    const sourceDaemonDatabasePath = join(sourceDirectory, "executor.sqlite");
     let sourceDaemon: ExecutionDaemon | undefined;
     let sourceAbort: AbortController | undefined;
     let sourceLoop: Promise<void> | undefined;
+    let unrelatedCloudDaemon: ExecutionDaemon | undefined;
+    let unrelatedCloudAbort: AbortController | undefined;
+    let unrelatedCloudLoop: Promise<void> | undefined;
     fixtures.push({
       directory: sourceDirectory,
       async close() {
-        sourceAbort?.abort();
+        captureStateBarrier.releaseAll();
         const failures: unknown[] = [];
+        const pending = [...pendingWorkerdRequests];
+        for (const [, abort] of pending) abort();
+        for (const [request] of pending) {
+          const result = await Promise.allSettled([request]);
+          if (result[0]?.status === "rejected") failures.push(result[0].reason);
+          pendingWorkerdRequests.delete(request);
+        }
+        unrelatedCloudAbort?.abort();
+        try {
+          await unrelatedCloudLoop;
+        } catch (error) {
+          failures.push(error);
+        }
+        try {
+          unrelatedCloudDaemon?.close();
+        } catch (error) {
+          failures.push(error);
+        }
+        sourceAbort?.abort();
         try {
           await sourceLoop;
         } catch (error) {
@@ -4877,6 +4986,11 @@ describe("authenticated cloud producer to standalone inactive consumer", () => {
         } catch (error) {
           failures.push(error);
         }
+        try {
+          await captureStateBarrier.close();
+        } catch (error) {
+          failures.push(error);
+        }
         if (failures.length > 0) {
           throw new AggregateError(
             failures,
@@ -4885,7 +4999,7 @@ describe("authenticated cloud producer to standalone inactive consumer", () => {
         }
       },
     });
-    const sourceBaseUrl = (await miniflare.ready).toString();
+    let sourceBaseUrl = (await miniflare.ready).toString();
     const bootstrap = await call<{ credential: string }>(
       sourceBaseUrl,
       "/v1/bootstrap",
@@ -4928,7 +5042,7 @@ describe("authenticated cloud producer to standalone inactive consumer", () => {
       },
     );
     sourceDaemon = new ExecutionDaemon({
-      databasePath: join(sourceDirectory, "executor.sqlite"),
+      databasePath: sourceDaemonDatabasePath,
       nodeId: sourceNode.value.node.nodeId,
       nodeCredential: sourceNode.value.credential,
       workspaces: [
@@ -5259,6 +5373,733 @@ describe("authenticated cloud producer to standalone inactive consumer", () => {
     );
     expect(nodePrivateBlob.status).toBe(403);
     await nodePrivateBlob.body?.cancel();
+
+    const destinationNodeId = "node:hold-relocation-refusal";
+    const destinationWorkspaceId = "workspace:hold-relocation-refusal";
+    const destinationNode = await call<{
+      node: { nodeId: string };
+      credential: string;
+    }>(sourceBaseUrl, "/v1/nodes", {
+      credential: cloudOwner,
+      body: { nodeId: destinationNodeId, name: "Unassigned refusal target" },
+    });
+    expect(destinationNode.status).toBe(201);
+    const destinationWorkspace = await call<{ workspaceId: string }>(
+      sourceBaseUrl,
+      "/v1/workspaces",
+      {
+        credential: cloudOwner,
+        body: {
+          workspaceId: destinationWorkspaceId,
+          nodeId: destinationNodeId,
+          name: "Unassigned refusal workspace",
+        },
+      },
+    );
+    expect(destinationWorkspace.status).toBe(201);
+    const unrelatedCloudWorkspace = join(
+      sourceDirectory,
+      "unrelated-cloud-workspace",
+    );
+    await makeDirtyGitWorkspace(unrelatedCloudWorkspace);
+
+    sourceAbort?.abort();
+    await sourceLoop;
+    sourceAbort = undefined;
+    sourceLoop = undefined;
+
+    const admissionOwnerCredential = await call<{
+      credentialId: string;
+      credential: string;
+      actor: unknown;
+    }>(sourceBaseUrl, "/v1/credentials", {
+      credential: cloudOwner,
+      body: { kind: "human", name: "Revoked during hold admission" },
+    });
+    expect(admissionOwnerCredential.status).toBe(201);
+    const holdPath = `/v1/threads/${sourceThreadId}/managed-work-transfer-holds`;
+    const revokedAdmissionRequest = {
+      contractVersion: CONTRACT_VERSION,
+      requestId: "hold:revoked-during-capture-state-read",
+      captureRequestId,
+      checkpointRequestId,
+    };
+    const revokedAdmissionGate = captureStateBarrier.arm({
+      kind: "managed-work-transfer-hold",
+      requestId: revokedAdmissionRequest.requestId,
+      threadId: sourceThreadId,
+    });
+    const pendingRevokedAdmission = trackedJsonPost<{
+      error?: string;
+    }>(
+      sourceBaseUrl,
+      holdPath,
+      admissionOwnerCredential.value.credential,
+      revokedAdmissionRequest,
+    );
+    await waitForCaptureStateBarrier(
+      revokedAdmissionGate.entered,
+      "hold capture-state read before credential revocation",
+    );
+    expect(
+      await call(
+        sourceBaseUrl,
+        `/v1/credentials/${admissionOwnerCredential.value.credentialId}/revoke`,
+        { credential: cloudOwner, body: {} },
+      ),
+    ).toMatchObject({ status: 200, value: { status: "revoked" } });
+    revokedAdmissionGate.release();
+    expect(await pendingRevokedAdmission).toMatchObject({ status: 401 });
+    expect(
+      await call(
+        sourceBaseUrl,
+        `/v1/managed-work-transfer-holds/${revokedAdmissionRequest.requestId}`,
+        { credential: cloudOwner },
+      ),
+    ).toMatchObject({ status: 404 });
+
+    const holdRequests = [
+      {
+        contractVersion: CONTRACT_VERSION,
+        requestId: "hold:cloud-producer-source-a",
+        captureRequestId,
+        checkpointRequestId,
+      },
+      {
+        contractVersion: CONTRACT_VERSION,
+        requestId: "hold:cloud-producer-source-b",
+        captureRequestId,
+        checkpointRequestId,
+      },
+    ] as const;
+    const relocationRequestId = "relocation:delayed-by-source-hold";
+    const relocationGate = captureStateBarrier.arm({
+      kind: "workspace-relocation",
+      requestId: relocationRequestId,
+      threadId: sourceThreadId,
+    });
+    const pendingRelocation = trackedJsonPost<{ error?: string }>(
+      sourceBaseUrl,
+      `/v1/threads/${sourceThreadId}/workspace-relocations`,
+      cloudOwner,
+      {
+        contractVersion: CONTRACT_VERSION,
+        requestId: relocationRequestId,
+        checkpointRequestId,
+        destination: {
+          nodeId: destinationNodeId,
+          workspaceId: destinationWorkspaceId,
+        },
+      },
+    );
+    await waitForCaptureStateBarrier(
+      relocationGate.entered,
+      "relocation capture-state read before source hold admission",
+    );
+    const discardedHoldPostStatuses = await Promise.all(
+      holdRequests.map((request) =>
+        trackedDiscardPost(sourceBaseUrl, holdPath, cloudOwner, request),
+      ),
+    );
+    expect(discardedHoldPostStatuses.sort()).toEqual([202, 409]);
+    const holdLookups = await Promise.all(
+      holdRequests.map(async (request) => ({
+        request,
+        response: await call<ManagedWorkTransferHoldStatus | { error: string }>(
+          sourceBaseUrl,
+          `/v1/managed-work-transfer-holds/${request.requestId}`,
+          { credential: cloudOwner },
+        ),
+      })),
+    );
+    const admittedHold = holdLookups.filter(
+      ({ response }) => response.status === 200,
+    );
+    const absentHold = holdLookups.filter(
+      ({ response }) => response.status === 404,
+    );
+    expect(admittedHold).toHaveLength(1);
+    expect(absentHold).toHaveLength(1);
+    const holdRequest = admittedHold[0]!.request;
+    const holdStatus = admittedHold[0]!.response
+      .value as ManagedWorkTransferHoldStatus;
+    expect(holdStatus).toMatchObject({
+      contractVersion: CONTRACT_VERSION,
+      requestId: holdRequest.requestId,
+      actor: { kind: "human" },
+      captureRequestId,
+      checkpointRequestId,
+      workspaceSnapshotRequestId: snapshotRequestId,
+      captureId: captureAdmission.value.captureId,
+      snapshotId: snapshotStatus.value.snapshotId,
+      projectId: sourceProjectId,
+      threadId: sourceThreadId,
+      source: { nodeId: sourceNodeId, workspaceId: sourceWorkspaceId },
+      ownershipGeneration: 0,
+      controlId: captureStatus.value.controlId,
+      sourceFence: captureStatus.value.sourceFence,
+      workspaceManifestReference: snapshotStatus.value.manifestReference,
+      coherentCheckpointManifestReference:
+        checkpointStatus.value.manifestReference,
+      status: "held-awaiting-local-preparation",
+    });
+    expect(holdStatus.sourceCaptureReportSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(holdStatus.controlPayloadSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(holdStatus.workspaceSnapshotReportSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(holdStatus.bindingSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(Date.parse(holdStatus.acceptedAt)).not.toBeNaN();
+    expect(admissionOwnerCredential.value.actor).toEqual(holdStatus.actor);
+    relocationGate.release();
+    expect(await pendingRelocation).toMatchObject({
+      status: 409,
+      value: { error: "workspace_relocation_transfer_hold_conflict" },
+    });
+    expect(
+      await call(
+        sourceBaseUrl,
+        `/v1/workspace-relocations/${relocationRequestId}`,
+        { credential: cloudOwner },
+      ),
+    ).toMatchObject({ status: 404 });
+    const idempotentHoldRetry = await call<ManagedWorkTransferHoldStatus>(
+      sourceBaseUrl,
+      holdPath,
+      { credential: cloudOwner, body: holdRequest },
+    );
+    expect(idempotentHoldRetry.status).toBe(202);
+    expect(idempotentHoldRetry.value).toEqual(holdStatus);
+    const secondaryOwnerCredential = await call<{
+      credentialId: string;
+      credential: string;
+      actor: unknown;
+    }>(sourceBaseUrl, "/v1/credentials", {
+      credential: cloudOwner,
+      body: { kind: "human", name: "Second source Owner credential" },
+    });
+    expect(secondaryOwnerCredential.status).toBe(201);
+    expect(secondaryOwnerCredential.value.actor).toEqual(holdStatus.actor);
+    expect(
+      await call<ManagedWorkTransferHoldStatus>(sourceBaseUrl, holdPath, {
+        credential: secondaryOwnerCredential.value.credential,
+        body: holdRequest,
+      }),
+    ).toMatchObject({ status: 202, value: holdStatus });
+    expect(
+      await call(
+        sourceBaseUrl,
+        `/v1/credentials/${secondaryOwnerCredential.value.credentialId}/revoke`,
+        {
+          credential: cloudOwner,
+          body: {},
+        },
+      ),
+    ).toMatchObject({ status: 200, value: { status: "revoked" } });
+    expect(
+      await call(
+        sourceBaseUrl,
+        `/v1/managed-work-transfer-holds/${holdRequest.requestId}`,
+        { credential: secondaryOwnerCredential.value.credential },
+      ),
+    ).toMatchObject({ status: 401 });
+    expect(
+      await call<ManagedWorkTransferHoldStatus>(sourceBaseUrl, holdPath, {
+        credential: cloudOwner,
+        body: holdRequest,
+      }),
+    ).toMatchObject({ status: 202, value: holdStatus });
+    const changedCaptureHold = await call<{ error: string }>(
+      sourceBaseUrl,
+      holdPath,
+      {
+        credential: cloudOwner,
+        body: {
+          ...holdRequest,
+          captureRequestId: "capture:changed-under-hold",
+        },
+      },
+    );
+    expect(changedCaptureHold).toMatchObject({
+      status: 409,
+      value: { error: "managed_work_transfer_hold_request_conflict" },
+    });
+    const changedCheckpointHold = await call<{ error: string }>(
+      sourceBaseUrl,
+      holdPath,
+      {
+        credential: cloudOwner,
+        body: {
+          ...holdRequest,
+          checkpointRequestId: "checkpoint:changed-under-hold",
+        },
+      },
+    );
+    expect(changedCheckpointHold).toMatchObject({
+      status: 409,
+      value: { error: "managed_work_transfer_hold_request_conflict" },
+    });
+    const changedThreadHold = await call<{ error: string }>(
+      sourceBaseUrl,
+      "/v1/threads/thread:changed-under-hold/managed-work-transfer-holds",
+      { credential: cloudOwner, body: holdRequest },
+    );
+    expect(changedThreadHold).toMatchObject({
+      status: 409,
+      value: { error: "managed_work_transfer_hold_request_conflict" },
+    });
+    const competingHold = await call<{ error: string }>(
+      sourceBaseUrl,
+      holdPath,
+      {
+        credential: cloudOwner,
+        body: {
+          ...holdRequest,
+          requestId: "hold:cloud-producer-competing-source",
+        },
+      },
+    );
+    expect(competingHold).toMatchObject({
+      status: 409,
+      value: { error: "managed_work_transfer_hold_source_already_reserved" },
+    });
+
+    const sourceViewerInvitation = await call<{ code: string }>(
+      sourceBaseUrl,
+      "/v1/invitations",
+      {
+        credential: cloudOwner,
+        body: {
+          role: "viewer",
+          grants: [],
+          expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        },
+      },
+    );
+    expect(sourceViewerInvitation.status).toBe(201);
+    const sourceViewer = await call<{ credential: string }>(
+      sourceBaseUrl,
+      "/v1/invitations/redeem",
+      {
+        body: {
+          code: sourceViewerInvitation.value.code,
+          displayName: "Source viewer",
+        },
+      },
+    );
+    expect(sourceViewer.status).toBe(201);
+    expect(
+      await call(sourceBaseUrl, holdPath, {
+        credential: sourceViewer.value.credential,
+        body: holdRequest,
+      }),
+    ).toMatchObject({ status: 403 });
+    expect(
+      await call(
+        sourceBaseUrl,
+        `/v1/managed-work-transfer-holds/${holdRequest.requestId}`,
+        { credential: sourceViewer.value.credential },
+      ),
+    ).toMatchObject({ status: 403 });
+    expect(
+      await call(
+        sourceBaseUrl,
+        `/v1/managed-work-transfer-holds/${holdRequest.requestId}`,
+        { credential: sourceNode.value.credential },
+      ),
+    ).toMatchObject({ status: 403 });
+    expect(
+      await call(
+        sourceBaseUrl,
+        `/v1/managed-work-transfer-holds/${holdRequest.requestId}`,
+        { credential: local.owner },
+      ),
+    ).toMatchObject({ status: 401 });
+
+    const heldManifestBlob = await fetch(
+      new URL(
+        `/v1/managed-work-checkpoints/${checkpointRequestId}/blobs/${checkpointStatus.value.manifestReference}`,
+        sourceBaseUrl,
+      ),
+      { headers: { authorization: `Bearer ${cloudOwner}` } },
+    );
+    expect(heldManifestBlob.status).toBe(200);
+    expect(heldManifestBlob.headers.get("x-content-sha256")).toBe(
+      checkpointStatus.value.manifestReference,
+    );
+    expect(sha256(new Uint8Array(await heldManifestBlob.arrayBuffer()))).toBe(
+      checkpointStatus.value.manifestReference,
+    );
+
+    const heldRelocation = await call<{ error: string }>(
+      sourceBaseUrl,
+      `/v1/threads/${sourceThreadId}/workspace-relocations`,
+      {
+        credential: cloudOwner,
+        body: {
+          contractVersion: CONTRACT_VERSION,
+          requestId: "relocation:refused-by-transfer-hold",
+          checkpointRequestId,
+          destination: {
+            nodeId: destinationNodeId,
+            workspaceId: destinationWorkspaceId,
+          },
+        },
+      },
+    );
+    expect(heldRelocation).toMatchObject({
+      status: 409,
+      value: { error: "workspace_relocation_transfer_hold_conflict" },
+    });
+
+    const unrelatedThreadId = "thread:unrelated-cloud-progress";
+    expect(
+      await call(sourceBaseUrl, "/v1/threads", {
+        credential: cloudOwner,
+        body: {
+          threadId: unrelatedThreadId,
+          projectId: sourceProjectId,
+          title: "Unrelated cloud work during source hold",
+          target: {
+            nodeId: destinationNodeId,
+            workspaceId: destinationWorkspaceId,
+          },
+        },
+      }),
+    ).toMatchObject({ status: 201 });
+    const unrelatedCloudDatabasePath = join(
+      sourceDirectory,
+      "unrelated-cloud-executor.sqlite",
+    );
+    unrelatedCloudDaemon = new ExecutionDaemon({
+      databasePath: unrelatedCloudDatabasePath,
+      nodeId: destinationNodeId,
+      nodeCredential: destinationNode.value.credential,
+      workspaces: [
+        {
+          workspaceId: destinationWorkspaceId,
+          directory: unrelatedCloudWorkspace,
+        },
+      ],
+      daemonVersion: "unrelated-cloud-hold-progress-test",
+    });
+    unrelatedCloudAbort = new AbortController();
+    unrelatedCloudLoop = new ExecutionLoop({
+      daemon: unrelatedCloudDaemon,
+      controller: new HttpExecutionControllerConnector({
+        controllerUrl: sourceBaseUrl,
+        nodeId: destinationNodeId,
+        credential: destinationNode.value.credential,
+      }),
+      pollIntervalMs: 20,
+      heartbeatIntervalMs: 100,
+    }).run(unrelatedCloudAbort.signal);
+    await until(async () => {
+      const nodes = await call<{
+        nodes: Array<{ nodeId: string; availability: string }>;
+      }>(sourceBaseUrl, "/v1/nodes", { credential: cloudOwner });
+      return nodes.value.nodes.some(
+        (node) =>
+          node.nodeId === destinationNodeId && node.availability === "online",
+      );
+    });
+    const unrelatedEffectPath = "unrelated-cloud-progress.txt";
+    const unrelatedEffectContent = "unrelated CLOUD execution continued\n";
+    expect(
+      (
+        await call(sourceBaseUrl, "/__test/model-tool-call", {
+          body: {
+            id: "call:unrelated-cloud-progress",
+            path: unrelatedEffectPath,
+            content: unrelatedEffectContent,
+          },
+        })
+      ).status,
+    ).toBe(200);
+    const unrelatedInput = await call(
+      sourceBaseUrl,
+      `/v1/threads/${unrelatedThreadId}/inputs`,
+      {
+        credential: cloudOwner,
+        body: {
+          requestId: "request:unrelated-cloud-progress",
+          text: "Write the unrelated cloud progress file.",
+        },
+      },
+    );
+    expect(unrelatedInput.status).toBe(202);
+    await until(async () => {
+      const receipt = await call<{
+        dispatchStatus: string;
+        executionEffects?: Array<{
+          status: string;
+          target?: { nodeId: string };
+        }>;
+      }>(sourceBaseUrl, "/v1/commands/request:unrelated-cloud-progress", {
+        credential: cloudOwner,
+      });
+      return (
+        receipt.value.dispatchStatus === "completed" &&
+        receipt.value.executionEffects?.some(
+          (effect) =>
+            effect.status === "completed" &&
+            effect.target?.nodeId === destinationNodeId,
+        ) === true
+      );
+    });
+    await expect(
+      waitForFile(join(unrelatedCloudWorkspace, unrelatedEffectPath)),
+    ).resolves.toBe(unrelatedEffectContent);
+    unrelatedCloudAbort.abort();
+    await unrelatedCloudLoop;
+    unrelatedCloudDaemon.close();
+    unrelatedCloudAbort = undefined;
+    unrelatedCloudLoop = undefined;
+    unrelatedCloudDaemon = undefined;
+    expect(
+      await readPublicStorageObservation(sourceBaseUrl, sourceThreadId),
+    ).toEqual(sourceStorage);
+    expect(
+      await call<ManagedWorkTransferHoldStatus>(
+        sourceBaseUrl,
+        `/v1/managed-work-transfer-holds/${holdRequest.requestId}`,
+        { credential: cloudOwner },
+      ),
+    ).toMatchObject({ status: 200, value: holdStatus });
+
+    const blockedSourceInput = await call<{ error: string }>(
+      sourceBaseUrl,
+      `/v1/threads/${sourceThreadId}/inputs`,
+      {
+        credential: cloudOwner,
+        body: {
+          requestId: "request:blocked-by-transfer-hold",
+          text: "A held source must not accept new work.",
+        },
+      },
+    );
+    expect(blockedSourceInput).toMatchObject({
+      status: 409,
+      value: { error: "managed_work_capture_active" },
+    });
+    const heldSourceWrite = join(sourceWorkspace, "held-source-write.txt");
+    await expect(
+      sourceDaemon!.executeJob({
+        contractVersion: 1,
+        jobId: "job:blocked-by-transfer-hold",
+        nodeId: sourceNodeId,
+        target: { nodeId: sourceNodeId, workspaceId: sourceWorkspaceId },
+        ownershipGeneration: 0,
+        operation: "write-file",
+        path: "held-source-write.txt",
+        contentBase64: Buffer.from("must not be written").toString("base64"),
+      }),
+    ).rejects.toThrow("workspace_capture_active");
+    await expect(lstat(heldSourceWrite)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+
+    const holdCaptureStatus = await call<Record<string, unknown>>(
+      sourceBaseUrl,
+      `/v1/capture-controls/${captureRequestId}`,
+      { credential: cloudOwner },
+    );
+    expect(holdCaptureStatus.value).toEqual(captureStatus.value);
+    const holdSnapshotStatus = await call<Record<string, unknown>>(
+      sourceBaseUrl,
+      `/v1/workspace-snapshots/${snapshotRequestId}`,
+      { credential: cloudOwner },
+    );
+    expect(holdSnapshotStatus.value).toEqual(snapshotStatus.value);
+    const holdCheckpointStatus = await call<Record<string, unknown>>(
+      sourceBaseUrl,
+      `/v1/managed-work-checkpoints/${checkpointRequestId}`,
+      { credential: cloudOwner },
+    );
+    expect(holdCheckpointStatus.value).toEqual(checkpointStatus.value);
+    expect(
+      await readPublicStorageObservation(sourceBaseUrl, sourceThreadId),
+    ).toEqual(sourceStorage);
+
+    await sourceLoop;
+    sourceDaemon?.close();
+    sourceAbort = undefined;
+    sourceLoop = undefined;
+    sourceDaemon = undefined;
+    await miniflare.dispose();
+    miniflare = createSourceMiniflare();
+    sourceBaseUrl = (await miniflare.ready).toString();
+    sourceDaemon = new ExecutionDaemon({
+      databasePath: sourceDaemonDatabasePath,
+      nodeId: sourceNodeId,
+      nodeCredential: sourceNode.value.credential,
+      workspaces: [
+        { workspaceId: sourceWorkspaceId, directory: sourceWorkspace },
+      ],
+      daemonVersion: "cloud-producer-c1-test",
+    });
+    sourceAbort = new AbortController();
+    sourceLoop = new ExecutionLoop({
+      daemon: sourceDaemon,
+      controller: new HttpExecutionControllerConnector({
+        controllerUrl: sourceBaseUrl,
+        nodeId: sourceNodeId,
+        credential: sourceNode.value.credential,
+      }),
+      pollIntervalMs: 20,
+      heartbeatIntervalMs: 100,
+    }).run(sourceAbort.signal);
+    await until(async () => {
+      const nodes = await call<{
+        nodes: Array<{ nodeId: string; availability: string }>;
+      }>(sourceBaseUrl, "/v1/nodes", { credential: cloudOwner });
+      return nodes.value.nodes.some(
+        (node) =>
+          node.nodeId === sourceNodeId && node.availability === "online",
+      );
+    });
+    expect(
+      (
+        await call<ManagedWorkTransferHoldStatus>(
+          sourceBaseUrl,
+          `/v1/managed-work-transfer-holds/${holdRequest.requestId}`,
+          { credential: cloudOwner },
+        )
+      ).value,
+    ).toEqual(holdStatus);
+    expect(
+      (
+        await call<Record<string, unknown>>(
+          sourceBaseUrl,
+          `/v1/capture-controls/${captureRequestId}`,
+          { credential: cloudOwner },
+        )
+      ).value,
+    ).toEqual(captureStatus.value);
+    const postRestartInput = await call<{ error: string }>(
+      sourceBaseUrl,
+      `/v1/threads/${sourceThreadId}/inputs`,
+      {
+        credential: cloudOwner,
+        body: {
+          requestId: "request:blocked-after-workerd-restart",
+          text: "Cold source capture remains blocked after restart.",
+        },
+      },
+    );
+    expect(postRestartInput).toMatchObject({
+      status: 409,
+      value: { error: "managed_work_capture_active" },
+    });
+    for (const path of [
+      `/v1/threads/${sourceThreadId}/context`,
+      `/v1/threads/${sourceThreadId}/status`,
+    ]) {
+      const response = await fetch(new URL(path, sourceBaseUrl), {
+        headers: { authorization: `Bearer ${cloudOwner}` },
+      });
+      expect(response.status).toBeGreaterThanOrEqual(400);
+      await response.body?.cancel();
+    }
+    const managedWorkTest = <T>(operation: Record<string, unknown>) =>
+      call<T>(sourceBaseUrl, "/__test/managed-work", {
+        body: { threadId: sourceThreadId, operation },
+      });
+    const coldOpenObservation = await managedWorkTest<{
+      modelCalls: number;
+      alarmCalls: number;
+    }>({ kind: "observe" });
+    expect(coldOpenObservation.value.modelCalls).toBe(0);
+    const coldOpenRefusals = await managedWorkTest<Record<string, string>>({
+      kind: "refusals",
+    });
+    expect(coldOpenRefusals.value).toMatchObject({
+      acceptManagedInput: expect.stringContaining("active capture lock"),
+      submit: expect.stringContaining("active capture lock"),
+      context: expect.stringContaining("active capture lock"),
+      status: expect.stringContaining("active capture lock"),
+      resume: expect.stringContaining("active capture lock"),
+    });
+    expect(
+      await managedWorkTest<null>({
+        kind: "schedule-alarm",
+        at: Date.now() + 20,
+      }),
+    ).toMatchObject({ status: 200 });
+    await until(async () => {
+      const observation = await managedWorkTest<{
+        modelCalls: number;
+        alarmCalls: number;
+      }>({ kind: "observe" });
+      const pendingAlarm = await managedWorkTest<number | null>({
+        kind: "pending-alarm",
+      });
+      return (
+        observation.value.alarmCalls > coldOpenObservation.value.alarmCalls &&
+        pendingAlarm.value === null
+      );
+    });
+    expect(
+      (
+        await managedWorkTest<{ modelCalls: number; alarmCalls: number }>({
+          kind: "observe",
+        })
+      ).value,
+    ).toMatchObject({ modelCalls: 0 });
+    await expect(
+      sourceDaemon!.executeJob({
+        contractVersion: 1,
+        jobId: "job:blocked-after-workerd-restart",
+        nodeId: sourceNodeId,
+        target: { nodeId: sourceNodeId, workspaceId: sourceWorkspaceId },
+        ownershipGeneration: 0,
+        operation: "write-file",
+        path: "held-source-write-after-restart.txt",
+        contentBase64: Buffer.from("must not be written").toString("base64"),
+      }),
+    ).rejects.toThrow("workspace_capture_active");
+    await expect(
+      lstat(join(sourceWorkspace, "held-source-write-after-restart.txt")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    const nativeDaemonEvidence = new Database(sourceDaemonDatabasePath, {
+      readonly: true,
+    });
+    try {
+      expect(
+        nativeDaemonEvidence
+          .query<
+            {
+              control_id: string;
+              capture_id: string;
+              request_id: string;
+              workspace_id: string;
+              status: string;
+            },
+            [string]
+          >(
+            `SELECT control_id, capture_id, request_id, workspace_id, status
+             FROM execution_capture_controls WHERE control_id = ?`,
+          )
+          .get(captureStatus.value.controlId as string),
+      ).toMatchObject({
+        control_id: captureStatus.value.controlId,
+        capture_id: captureAdmission.value.captureId,
+        request_id: captureRequestId,
+        workspace_id: sourceWorkspaceId,
+        status: "source-capture-fenced",
+      });
+      expect(
+        nativeDaemonEvidence
+          .query<{ capture_id: string; control_id: string }, [string]>(
+            `SELECT capture_id, control_id FROM execution_workspace_captures
+             WHERE workspace_id = ?`,
+          )
+          .get(sourceWorkspaceId),
+      ).toEqual({
+        capture_id: captureAdmission.value.captureId,
+        control_id: captureStatus.value.controlId as string,
+      });
+    } finally {
+      nativeDaemonEvidence.close();
+    }
 
     const downloads = new Map<string, Uint8Array>();
     const downloadSourceBlob = async (reference: string, size?: number) => {

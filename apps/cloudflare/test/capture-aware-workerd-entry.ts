@@ -9,10 +9,12 @@ import {
 import type { ManagedWorkCheckpoint } from "@uzina/pi-runtime/checkpoint";
 import type { FactoryProvenanceEvidence } from "@uzina/contracts/factory";
 import type { ExecutionOperation } from "@uzina/contracts/execution";
+import { FactoryService } from "@uzina/core";
 import {
   verifyManagedWorkCheckpointClosure,
   type ManagedWorkCheckpointClosureVerification,
 } from "@uzina/core/managed-work-checkpoint-verification";
+import type { CaptureStateAdmissionScope } from "./capture-state-barrier";
 import { R2ManagedWorkCheckpointStorage } from "../src/managed-work-checkpoint-storage";
 import {
   MANAGED_WORK_RUNTIME_REQUIREMENTS,
@@ -79,6 +81,79 @@ let checkpointExportForbiddenThreadId: string | undefined;
 let publicationBindingApplied = false;
 let privateReadBindingApplied = false;
 let exportGuardBindingApplied = false;
+let captureStateBarrierUrl: string | undefined;
+let captureStateBarrierBindingApplied = false;
+let synchronousCaptureStateAdmissionScope:
+  CaptureStateAdmissionScope | undefined;
+
+function withCaptureStateAdmissionScope<T>(
+  scope: CaptureStateAdmissionScope | undefined,
+  operation: () => T,
+): T {
+  const previous = synchronousCaptureStateAdmissionScope;
+  synchronousCaptureStateAdmissionScope = scope;
+  try {
+    // Do not await: getManagedWorkCaptureState captures this call's label before
+    // its first await, and another request must never inherit an async label.
+    return operation();
+  } finally {
+    synchronousCaptureStateAdmissionScope = previous;
+  }
+}
+
+const actualRequestManagedWorkTransferHold =
+  FactoryService.prototype.requestManagedWorkTransferHold;
+FactoryService.prototype.requestManagedWorkTransferHold = function (
+  session,
+  threadId,
+  request,
+) {
+  return withCaptureStateAdmissionScope(
+    captureStateAdmissionScope("managed-work-transfer-hold", threadId, request),
+    () =>
+      actualRequestManagedWorkTransferHold.call(
+        this,
+        session,
+        threadId,
+        request,
+      ),
+  );
+};
+const actualRequestWorkspaceRelocation =
+  FactoryService.prototype.requestWorkspaceRelocation;
+FactoryService.prototype.requestWorkspaceRelocation = function (
+  session,
+  threadId,
+  request,
+) {
+  return withCaptureStateAdmissionScope(
+    captureStateAdmissionScope("workspace-relocation", threadId, request),
+    () =>
+      actualRequestWorkspaceRelocation.call(this, session, threadId, request),
+  );
+};
+
+const actualGetManagedWorkCaptureState =
+  FactoryService.prototype.getManagedWorkCaptureState;
+FactoryService.prototype.getManagedWorkCaptureState = async function (
+  threadId,
+) {
+  const scope = synchronousCaptureStateAdmissionScope;
+  const state = await actualGetManagedWorkCaptureState.call(this, threadId);
+  if (captureStateBarrierUrl && scope?.threadId === threadId) {
+    const response = await fetch(captureStateBarrierUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(scope),
+    });
+    const status = response.status;
+    await response.body?.cancel();
+    if (status !== 204) {
+      throw new Error(`Capture-state test barrier returned ${status}`);
+    }
+  }
+  return state;
+};
 
 const model = {
   id: "capture-test-model",
@@ -196,6 +271,7 @@ type TestFactoryEnvironment = ConstructorParameters<typeof FactoryObject>[1] & {
   UZINA_TEST_HOLD_PRIVATE_READ_MODE?: "first-read" | "second-read";
   UZINA_TEST_FORBID_CHECKPOINT_EXPORT_THREAD_ID?: string;
   UZINA_TEST_OWNER_BLOB_BARRIER_URL?: string;
+  UZINA_TEST_CAPTURE_STATE_BARRIER_URL?: string;
 };
 
 function checkpointBucketWithPrivateReadGate(
@@ -386,6 +462,10 @@ export class CaptureTestFactory extends FactoryObject {
       checkpointExportForbiddenThreadId =
         environment.UZINA_TEST_FORBID_CHECKPOINT_EXPORT_THREAD_ID || undefined;
       exportGuardBindingApplied = true;
+    }
+    if (!captureStateBarrierBindingApplied) {
+      captureStateBarrierUrl = environment.UZINA_TEST_CAPTURE_STATE_BARRIER_URL;
+      captureStateBarrierBindingApplied = true;
     }
     this.#storage = state.storage;
   }
@@ -851,6 +931,22 @@ async function errorMessage(operation: () => unknown | Promise<unknown>) {
   } catch (error) {
     return error instanceof Error ? error.message : String(error);
   }
+}
+
+function captureStateAdmissionScope(
+  kind: CaptureStateAdmissionScope["kind"],
+  threadId: string,
+  request: unknown,
+): CaptureStateAdmissionScope | undefined {
+  if (
+    !request ||
+    typeof request !== "object" ||
+    !("requestId" in request) ||
+    typeof request.requestId !== "string"
+  ) {
+    return undefined;
+  }
+  return { kind, requestId: request.requestId, threadId };
 }
 
 // Keep test-only DO RPC calls inside workerd; Miniflare's Node proxy leaks a stub warning.

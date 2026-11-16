@@ -24,6 +24,9 @@ import {
   workspaceSnapshotStatusSchema,
   managedWorkCheckpointRequestSchema,
   managedWorkCheckpointStatusSchema,
+  managedWorkTransferHoldRequestSchema,
+  managedWorkTransferHoldBindingSchema,
+  managedWorkTransferHoldStatusSchema,
   managedWorkImportRequestSchema,
   managedWorkImportHostBindingSchema,
   managedWorkImportPreparationReceiptSchema,
@@ -35,6 +38,8 @@ import {
   type FactoryProvenanceEvidence,
   type FactoryProvenanceExecutionEffect,
   type ManagedWorkCheckpointStage,
+  type ManagedWorkTransferHoldRequest,
+  type ManagedWorkTransferHoldStatus,
   type ManagedWorkImportRequest,
   type ManagedWorkImportHostBinding,
   type ManagedWorkImportStatus,
@@ -273,6 +278,35 @@ type ManagedWorkCheckpointBindingRow = Pick<
   | "node_id"
   | "workspace_id"
   | "ownership_generation"
+>;
+type ManagedWorkTransferHoldRow = {
+  request_id: string;
+  owner_id: string;
+  actor_json: string;
+  capture_request_id: string;
+  checkpoint_request_id: string;
+  workspace_snapshot_request_id: string;
+  capture_id: string;
+  snapshot_id: string;
+  project_id: string;
+  thread_id: string;
+  source_node_id: string;
+  source_workspace_id: string;
+  ownership_generation: number;
+  control_id: string;
+  control_payload_sha256: string;
+  source_capture_report_sha256: string;
+  source_fence_json: string;
+  workspace_snapshot_report_sha256: string;
+  workspace_manifest_reference: string;
+  coherent_checkpoint_manifest_reference: string;
+  status: "held-awaiting-local-preparation";
+  accepted_at: string;
+  binding_sha256: string;
+};
+type ManagedWorkTransferHoldBinding = Omit<
+  ManagedWorkTransferHoldStatus,
+  "bindingSha256"
 >;
 type ManagedWorkCheckpointExecutionPlacement = {
   nodeId: string;
@@ -2260,6 +2294,199 @@ export class FactoryService {
     return this.#managedWorkCheckpointStatus(current);
   }
 
+  /** Reserve one exact available coherent Checkpoint and its already-held source capture. */
+  async requestManagedWorkTransferHold(
+    session: FactorySession,
+    threadId: string,
+    request: unknown,
+  ): Promise<ManagedWorkTransferHoldStatus> {
+    this.#requireOwner(session);
+    const input = managedWorkTransferHoldRequestSchema.parse(request);
+    const existing = this.#managedWorkTransferHoldByRequest(input.requestId);
+    if (existing) {
+      this.#assertManagedWorkTransferHoldRetry(
+        existing,
+        session,
+        threadId,
+        input,
+      );
+      return this.#verifiedManagedWorkTransferHoldStatus(
+        session,
+        input.requestId,
+        true,
+      );
+    }
+
+    const state = await this.getManagedWorkCaptureState(threadId);
+    const acceptedAt = now();
+    const prepared = this.database.transaction(() => {
+      this.#requireOwner(session);
+      const concurrent = this.#managedWorkTransferHoldByRequest(
+        input.requestId,
+      );
+      if (concurrent) {
+        this.#assertManagedWorkTransferHoldRetry(
+          concurrent,
+          session,
+          threadId,
+          input,
+        );
+        return { concurrent } as const;
+      }
+      return {
+        ...this.#buildManagedWorkTransferHoldBinding(
+          session,
+          threadId,
+          input,
+          state,
+          acceptedAt,
+        ),
+        concurrent: undefined,
+      } as const;
+    });
+    if (prepared.concurrent) {
+      return this.#verifiedManagedWorkTransferHoldStatus(
+        session,
+        input.requestId,
+        true,
+      );
+    }
+
+    const [captureReportSha256, snapshotReportSha256] = await Promise.all([
+      sha256(stableJson(JSON.parse(prepared.captureReportJson))),
+      sha256(stableJson(JSON.parse(prepared.snapshotReportJson))),
+    ]);
+    const afterReportHashes = this.database.transaction(() => {
+      this.#requireOwner(session);
+      const concurrent = this.#managedWorkTransferHoldByRequest(
+        input.requestId,
+      );
+      if (concurrent) {
+        this.#assertManagedWorkTransferHoldRetry(
+          concurrent,
+          session,
+          threadId,
+          input,
+        );
+        return concurrent;
+      }
+      const current = this.#buildManagedWorkTransferHoldBinding(
+        session,
+        threadId,
+        input,
+        state,
+        acceptedAt,
+      );
+      if (
+        stableJson(current.binding) !== stableJson(prepared.binding) ||
+        current.captureReportJson !== prepared.captureReportJson ||
+        current.snapshotReportJson !== prepared.snapshotReportJson ||
+        captureReportSha256 !== current.binding.sourceCaptureReportSha256 ||
+        snapshotReportSha256 !== current.binding.workspaceSnapshotReportSha256
+      ) {
+        throw conflict("managed_work_transfer_hold_binding_changed");
+      }
+      return undefined;
+    });
+    if (afterReportHashes) {
+      return this.#verifiedManagedWorkTransferHoldStatus(
+        session,
+        input.requestId,
+        true,
+      );
+    }
+
+    const bindingSha256 = await sha256(stableJson(prepared.binding));
+    const row = this.database.transaction(() => {
+      this.#requireOwner(session);
+      const concurrent = this.#managedWorkTransferHoldByRequest(
+        input.requestId,
+      );
+      if (concurrent) {
+        this.#assertManagedWorkTransferHoldRetry(
+          concurrent,
+          session,
+          threadId,
+          input,
+        );
+        return concurrent;
+      }
+      const current = this.#buildManagedWorkTransferHoldBinding(
+        session,
+        threadId,
+        input,
+        state,
+        acceptedAt,
+      );
+      if (
+        stableJson(current.binding) !== stableJson(prepared.binding) ||
+        current.captureReportJson !== prepared.captureReportJson ||
+        current.snapshotReportJson !== prepared.snapshotReportJson
+      ) {
+        throw conflict("managed_work_transfer_hold_binding_changed");
+      }
+      this.database.exec(
+        `INSERT INTO managed_work_transfer_holds(
+          request_id, owner_id, actor_json, capture_request_id,
+          checkpoint_request_id, workspace_snapshot_request_id, capture_id,
+          snapshot_id, project_id, thread_id, source_node_id,
+          source_workspace_id, ownership_generation, control_id,
+          control_payload_sha256, source_capture_report_sha256,
+          source_fence_json, workspace_snapshot_report_sha256,
+          workspace_manifest_reference, coherent_checkpoint_manifest_reference,
+          status, accepted_at, binding_sha256
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          input.requestId,
+          prepared.binding.ownerId,
+          encode(prepared.binding.actor),
+          prepared.binding.captureRequestId,
+          prepared.binding.checkpointRequestId,
+          prepared.binding.workspaceSnapshotRequestId,
+          prepared.binding.captureId,
+          prepared.binding.snapshotId,
+          prepared.binding.projectId,
+          prepared.binding.threadId,
+          prepared.binding.source.nodeId,
+          prepared.binding.source.workspaceId,
+          prepared.binding.ownershipGeneration,
+          prepared.binding.controlId,
+          prepared.binding.controlPayloadSha256,
+          prepared.binding.sourceCaptureReportSha256,
+          encode(prepared.binding.sourceFence),
+          prepared.binding.workspaceSnapshotReportSha256,
+          prepared.binding.workspaceManifestReference,
+          prepared.binding.coherentCheckpointManifestReference,
+          prepared.binding.status,
+          prepared.binding.acceptedAt,
+          bindingSha256,
+        ],
+      );
+      const inserted = this.#managedWorkTransferHoldByRequest(input.requestId);
+      if (!inserted) {
+        throw new Error("Managed-work transfer hold insert was lost");
+      }
+      return inserted;
+    });
+    return this.#verifiedManagedWorkTransferHoldStatus(
+      session,
+      row.request_id,
+      true,
+    );
+  }
+
+  /** Current source Owner observes the last committed hold evidence without host access. */
+  async getManagedWorkTransferHoldStatus(
+    session: FactorySession,
+    requestId: string,
+  ): Promise<ManagedWorkTransferHoldStatus> {
+    return this.#verifiedManagedWorkTransferHoldStatus(
+      session,
+      requestId,
+      false,
+    );
+  }
+
   /** Reject non-owner callers before the standalone host inspects configured paths. */
   authorizeManagedWorkImport(session: FactorySession): void {
     this.#requireManagedWorkImportOwner(session);
@@ -2607,6 +2834,7 @@ export class FactoryService {
         );
       }
       this.#assertManagedWorkCheckpointAuthority(session, checkpoint, state);
+      this.#assertNoManagedWorkTransferHoldForCheckpoint(checkpoint);
       const alreadyBound = this.database.all<{ request_id: string }>(
         `SELECT request_id FROM workspace_relocations
          WHERE checkpoint_request_id = ? OR capture_request_id = ?
@@ -4071,6 +4299,7 @@ export class FactoryService {
       if (!row || !activation)
         throw notFound("Workspace relocation activation");
       if (row.destination_node_id !== nodeId) throw forbidden();
+      this.#assertNoManagedWorkTransferHoldForRelocation(row);
       this.#assertWorkspaceRelocationActivationCommand(
         row,
         activation,
@@ -4450,6 +4679,17 @@ export class FactoryService {
       )[0];
       if (!row) return;
       if (row.owner_id !== ownerId) throw forbidden();
+      if (
+        this.database.all(
+          "SELECT request_id FROM managed_work_transfer_holds WHERE capture_id = ?",
+          [captureId],
+        ).length
+      ) {
+        throw conflict(
+          "managed_work_transfer_hold_held",
+          "A source capture reserved for managed-work transfer cannot be released",
+        );
+      }
       if (
         this.database.all(
           "SELECT control_id FROM capture_control_requests WHERE capture_id = ?",
@@ -6047,6 +6287,7 @@ export class FactoryService {
     state: ManagedWorkCaptureState,
   ): void {
     this.#requireOwner(session);
+    this.#assertNoManagedWorkTransferHoldForRelocation(row);
     const checkpoint = this.#managedWorkCheckpointByRequest(
       row.checkpoint_request_id,
     );
@@ -6606,6 +6847,362 @@ export class FactoryService {
     };
   }
 
+  #buildManagedWorkTransferHoldBinding(
+    session: FactorySession,
+    threadId: string,
+    input: ManagedWorkTransferHoldRequest,
+    state: ManagedWorkCaptureState,
+    acceptedAt: string,
+  ): {
+    binding: ManagedWorkTransferHoldBinding;
+    captureReportJson: string;
+    snapshotReportJson: string;
+  } {
+    const ownerId = this.#requireOwner(session);
+    const checkpoint = this.#managedWorkCheckpointByRequest(
+      input.checkpointRequestId,
+    );
+    if (!checkpoint || checkpoint.actor_json !== encode(session.actor)) {
+      throw notFound("Owner's available coherent Checkpoint");
+    }
+    if (
+      session.actor.kind !== "human" ||
+      session.actor.userId !== ownerId ||
+      checkpoint.thread_id !== threadId ||
+      checkpoint.capture_request_id !== input.captureRequestId
+    ) {
+      throw conflict("managed_work_transfer_hold_binding_mismatch");
+    }
+    if (
+      checkpoint.status !== "available" ||
+      checkpoint.stage !== "available" ||
+      !checkpoint.manifest_reference ||
+      !CHECKPOINT_SHA256.test(checkpoint.manifest_reference)
+    ) {
+      throw conflict("managed_work_transfer_hold_checkpoint_unavailable");
+    }
+
+    const capture = this.#captureControlByRequest(input.captureRequestId);
+    const snapshot = this.#workspaceSnapshotByRequest(
+      checkpoint.workspace_snapshot_request_id,
+    );
+    const checkpointBinding: ManagedWorkCheckpointBindingRow = checkpoint;
+    this.#assertManagedWorkCheckpointAuthority(
+      session,
+      checkpointBinding,
+      state,
+    );
+    if (
+      !capture?.report_json ||
+      !capture.report_sha256 ||
+      !snapshot?.report_json ||
+      !snapshot.report_sha256 ||
+      !snapshot.manifest_reference
+    ) {
+      throw conflict("managed_work_transfer_hold_prerequisite_unavailable");
+    }
+
+    const control = executionCaptureControlSchema.parse(
+      JSON.parse(capture.payload_json),
+    );
+    const captureReport = executionCaptureControlReportSchema.parse(
+      JSON.parse(capture.report_json),
+    );
+    const snapshotReport = workspaceSnapshotReportSchema.parse(
+      JSON.parse(snapshot.report_json),
+    );
+    if (
+      state.state !== "source-capture-fenced" ||
+      state.binding.captureId !== capture.capture_id ||
+      state.binding.captureRequestId !== capture.request_id ||
+      state.binding.controlId !== capture.control_id ||
+      state.binding.threadId !== checkpoint.thread_id ||
+      state.binding.projectId !== checkpoint.project_id ||
+      state.binding.target.nodeId !== checkpoint.node_id ||
+      state.binding.target.workspaceId !== checkpoint.workspace_id ||
+      state.binding.ownershipGeneration !== checkpoint.ownership_generation ||
+      state.binding.reportSha256 !== capture.report_sha256 ||
+      control.controlId !== capture.control_id ||
+      control.captureId !== capture.capture_id ||
+      control.requestId !== capture.request_id ||
+      control.nodeId !== checkpoint.node_id ||
+      control.target.nodeId !== checkpoint.node_id ||
+      control.target.workspaceId !== checkpoint.workspace_id ||
+      control.ownershipGeneration !== checkpoint.ownership_generation ||
+      captureReport.status !== "source-capture-fenced" ||
+      !captureReport.sourceFence ||
+      stableJson(captureReport.sourceFence) !==
+        stableJson(state.binding.sourceFence) ||
+      snapshotReport.status !== "workspace-checkpoint-available" ||
+      snapshotReport.snapshotId !== snapshot.snapshot_id ||
+      snapshotReport.requestId !== snapshot.request_id ||
+      snapshotReport.captureRequestId !== capture.request_id ||
+      snapshotReport.captureId !== capture.capture_id ||
+      snapshotReport.nodeId !== checkpoint.node_id ||
+      snapshotReport.target.nodeId !== checkpoint.node_id ||
+      snapshotReport.target.workspaceId !== checkpoint.workspace_id ||
+      snapshotReport.ownershipGeneration !== checkpoint.ownership_generation ||
+      snapshotReport.manifestReference !== snapshot.manifest_reference
+    ) {
+      throw conflict("managed_work_transfer_hold_binding_changed");
+    }
+
+    const binding = managedWorkTransferHoldBindingSchema.parse({
+      contractVersion: CONTRACT_VERSION,
+      requestId: input.requestId,
+      ownerId,
+      actor: session.actor,
+      captureRequestId: capture.request_id,
+      checkpointRequestId: checkpoint.request_id,
+      workspaceSnapshotRequestId: snapshot.request_id,
+      captureId: capture.capture_id,
+      snapshotId: snapshot.snapshot_id,
+      projectId: checkpoint.project_id,
+      threadId: checkpoint.thread_id,
+      source: {
+        nodeId: checkpoint.node_id,
+        workspaceId: checkpoint.workspace_id,
+      },
+      ownershipGeneration: checkpoint.ownership_generation,
+      controlId: capture.control_id,
+      controlPayloadSha256: control.payloadSha256,
+      sourceCaptureReportSha256: capture.report_sha256,
+      sourceFence: captureReport.sourceFence,
+      workspaceSnapshotReportSha256: snapshot.report_sha256,
+      workspaceManifestReference: snapshot.manifest_reference,
+      coherentCheckpointManifestReference: checkpoint.manifest_reference,
+      status: "held-awaiting-local-preparation",
+      acceptedAt,
+    });
+    this.#assertManagedWorkTransferHoldReservationAvailable(binding);
+    return {
+      binding,
+      captureReportJson: capture.report_json,
+      snapshotReportJson: snapshot.report_json,
+    };
+  }
+
+  #assertManagedWorkTransferHoldReservationAvailable(
+    binding: ManagedWorkTransferHoldBinding,
+  ): void {
+    const hold = this.database.all<{ request_id: string }>(
+      `SELECT request_id FROM managed_work_transfer_holds
+       WHERE request_id = ? OR capture_request_id = ? OR checkpoint_request_id = ?
+         OR workspace_snapshot_request_id = ? OR capture_id = ?
+         OR (thread_id = ? AND source_node_id = ? AND source_workspace_id = ?
+             AND ownership_generation = ?)
+       LIMIT 1`,
+      [
+        binding.requestId,
+        binding.captureRequestId,
+        binding.checkpointRequestId,
+        binding.workspaceSnapshotRequestId,
+        binding.captureId,
+        binding.threadId,
+        binding.source.nodeId,
+        binding.source.workspaceId,
+        binding.ownershipGeneration,
+      ],
+    )[0];
+    if (hold) {
+      throw conflict(
+        "managed_work_transfer_hold_source_already_reserved",
+        "The held source capture and coherent Checkpoint are already reserved",
+      );
+    }
+    const relocation = this.database.all<{ request_id: string }>(
+      `SELECT request_id FROM workspace_relocations
+       WHERE checkpoint_request_id = ? OR capture_request_id = ?
+         OR capture_id = ? OR workspace_snapshot_request_id = ?
+         OR (thread_id = ? AND source_node_id = ? AND source_workspace_id = ?
+             AND ownership_generation = ?)
+       LIMIT 1`,
+      [
+        binding.checkpointRequestId,
+        binding.captureRequestId,
+        binding.captureId,
+        binding.workspaceSnapshotRequestId,
+        binding.threadId,
+        binding.source.nodeId,
+        binding.source.workspaceId,
+        binding.ownershipGeneration,
+      ],
+    )[0];
+    if (relocation) {
+      throw conflict(
+        "managed_work_transfer_hold_relocation_exists",
+        "A workspace relocation already reserves this source capture or Checkpoint",
+      );
+    }
+  }
+
+  #assertNoManagedWorkTransferHoldForCheckpoint(
+    checkpoint: ManagedWorkCheckpointRow,
+  ): void {
+    const hold = this.database.all<{ request_id: string }>(
+      `SELECT request_id FROM managed_work_transfer_holds
+       WHERE checkpoint_request_id = ? OR capture_request_id = ?
+         OR capture_id = ? OR workspace_snapshot_request_id = ?
+         OR (thread_id = ? AND source_node_id = ? AND source_workspace_id = ?
+             AND ownership_generation = ?)
+       LIMIT 1`,
+      [
+        checkpoint.request_id,
+        checkpoint.capture_request_id,
+        checkpoint.capture_id,
+        checkpoint.workspace_snapshot_request_id,
+        checkpoint.thread_id,
+        checkpoint.node_id,
+        checkpoint.workspace_id,
+        checkpoint.ownership_generation,
+      ],
+    )[0];
+    if (hold) {
+      throw conflict(
+        "workspace_relocation_transfer_hold_conflict",
+        "A held managed-work transfer reserves this source and blocks workspace relocation",
+      );
+    }
+  }
+
+  #assertNoManagedWorkTransferHoldForRelocation(
+    row: WorkspaceRelocationRow,
+  ): void {
+    const hold = this.database.all<{ request_id: string }>(
+      `SELECT request_id FROM managed_work_transfer_holds
+       WHERE checkpoint_request_id = ? OR capture_request_id = ?
+         OR capture_id = ? OR workspace_snapshot_request_id = ?
+         OR (thread_id = ? AND source_node_id = ? AND source_workspace_id = ?
+             AND ownership_generation = ?)
+       LIMIT 1`,
+      [
+        row.checkpoint_request_id,
+        row.capture_request_id,
+        row.capture_id,
+        row.workspace_snapshot_request_id,
+        row.thread_id,
+        row.source_node_id,
+        row.source_workspace_id,
+        row.ownership_generation,
+      ],
+    )[0];
+    if (hold) {
+      throw conflict(
+        "workspace_relocation_transfer_hold_conflict",
+        "A held managed-work transfer reserves this source and blocks workspace relocation",
+      );
+    }
+  }
+
+  #managedWorkTransferHoldByRequest(
+    requestId: string,
+  ): ManagedWorkTransferHoldRow | undefined {
+    return this.database.all<ManagedWorkTransferHoldRow>(
+      "SELECT * FROM managed_work_transfer_holds WHERE request_id = ?",
+      [requestId],
+    )[0];
+  }
+
+  #managedWorkTransferHoldStatus(
+    row: ManagedWorkTransferHoldRow,
+  ): ManagedWorkTransferHoldStatus {
+    try {
+      return managedWorkTransferHoldStatusSchema.parse({
+        contractVersion: CONTRACT_VERSION,
+        requestId: row.request_id,
+        ownerId: row.owner_id,
+        actor: parseActor(row.actor_json),
+        captureRequestId: row.capture_request_id,
+        checkpointRequestId: row.checkpoint_request_id,
+        workspaceSnapshotRequestId: row.workspace_snapshot_request_id,
+        captureId: row.capture_id,
+        snapshotId: row.snapshot_id,
+        projectId: row.project_id,
+        threadId: row.thread_id,
+        source: {
+          nodeId: row.source_node_id,
+          workspaceId: row.source_workspace_id,
+        },
+        ownershipGeneration: row.ownership_generation,
+        controlId: row.control_id,
+        controlPayloadSha256: row.control_payload_sha256,
+        sourceCaptureReportSha256: row.source_capture_report_sha256,
+        sourceFence: JSON.parse(row.source_fence_json),
+        workspaceSnapshotReportSha256: row.workspace_snapshot_report_sha256,
+        workspaceManifestReference: row.workspace_manifest_reference,
+        coherentCheckpointManifestReference:
+          row.coherent_checkpoint_manifest_reference,
+        status: row.status,
+        acceptedAt: row.accepted_at,
+        bindingSha256: row.binding_sha256,
+      });
+    } catch {
+      throw conflict("managed_work_transfer_hold_integrity_failed");
+    }
+  }
+
+  #assertManagedWorkTransferHoldRetry(
+    row: ManagedWorkTransferHoldRow,
+    session: FactorySession,
+    threadId: string,
+    request: ManagedWorkTransferHoldRequest,
+  ): void {
+    const ownerId =
+      session.actor.kind === "human" ? session.actor.userId : undefined;
+    if (
+      row.actor_json !== encode(session.actor) ||
+      row.owner_id !== ownerId ||
+      row.thread_id !== threadId ||
+      row.capture_request_id !== request.captureRequestId ||
+      row.checkpoint_request_id !== request.checkpointRequestId
+    ) {
+      throw conflict(
+        "managed_work_transfer_hold_request_conflict",
+        "The stable hold request ID is already bound to another Owner, thread, capture, or Checkpoint",
+      );
+    }
+  }
+
+  async #verifiedManagedWorkTransferHoldStatus(
+    session: FactorySession,
+    requestId: string,
+    actorMismatchIsConflict: boolean,
+  ): Promise<ManagedWorkTransferHoldStatus> {
+    this.#requireOwner(session);
+    const initial = this.#managedWorkTransferHoldByRequest(requestId);
+    if (!initial) throw notFound("Managed-work transfer hold");
+    if (initial.actor_json !== encode(session.actor)) {
+      if (actorMismatchIsConflict) {
+        throw conflict("managed_work_transfer_hold_request_conflict");
+      }
+      throw forbidden();
+    }
+    const status = this.#managedWorkTransferHoldStatus(initial);
+    const { bindingSha256, ...binding } = status;
+    if ((await sha256(stableJson(binding))) !== bindingSha256) {
+      throw conflict("managed_work_transfer_hold_integrity_failed");
+    }
+    return this.database.transaction(() => {
+      this.#requireOwner(session);
+      const current = this.#managedWorkTransferHoldByRequest(requestId);
+      if (!current) throw notFound("Managed-work transfer hold");
+      if (current.actor_json !== encode(session.actor)) {
+        if (actorMismatchIsConflict) {
+          throw conflict("managed_work_transfer_hold_request_conflict");
+        }
+        throw forbidden();
+      }
+      const currentStatus = this.#managedWorkTransferHoldStatus(current);
+      if (
+        current.binding_sha256 !== initial.binding_sha256 ||
+        stableJson(currentStatus) !== stableJson(status)
+      ) {
+        throw conflict("managed_work_transfer_hold_binding_changed");
+      }
+      return currentStatus;
+    });
+  }
+
   #managedWorkImportByRequest(
     requestId: string,
   ): ManagedWorkImportRow | undefined {
@@ -6799,6 +7396,7 @@ export class FactoryService {
   #assertWorkspaceRelocationFinalizationQuiescent(
     row: WorkspaceRelocationRow,
   ): void {
+    this.#assertNoManagedWorkTransferHoldForRelocation(row);
     this.#assertWorkspaceRelocationActivationQuiescent(row);
     const destinationInput = this.database.all<{ status: string }>(
       "SELECT status FROM dispatch_intents WHERE thread_id = ? AND status IN ('queued', 'unavailable', 'running', 'dispatched', 'uncertain') LIMIT 1",
@@ -6839,6 +7437,7 @@ export class FactoryService {
     row: WorkspaceRelocationRow,
   ): void {
     this.#requireOwner(session);
+    this.#assertNoManagedWorkTransferHoldForRelocation(row);
     if (row.actor_json !== encode(session.actor)) throw forbidden();
     const activation = this.#workspaceRelocationActivationById(
       row.relocation_id,

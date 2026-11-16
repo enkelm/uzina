@@ -480,6 +480,75 @@ export const managedWorkCheckpointStatusSchema = z
     }
   });
 
+export const managedWorkTransferHoldRequestSchema = z
+  .object({
+    ...versioned,
+    requestId: identifier,
+    captureRequestId: identifier,
+    checkpointRequestId: identifier,
+  })
+  .strict();
+const managedWorkTransferHoldBindingShape = {
+  ...versioned,
+  requestId: identifier,
+  ownerId: identifier,
+  actor: factoryActorSchema.refine((actor) => actor.kind === "human"),
+  captureRequestId: identifier,
+  checkpointRequestId: identifier,
+  workspaceSnapshotRequestId: identifier,
+  captureId: executionCaptureIdSchema,
+  snapshotId: identifier,
+  projectId: identifier,
+  threadId: identifier,
+  source: factoryTargetSchema.strict(),
+  ownershipGeneration: z.number().int().nonnegative().safe(),
+  controlId: executionCaptureControlIdSchema,
+  controlPayloadSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  sourceCaptureReportSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  sourceFence: executionCaptureFenceReceiptSchema,
+  workspaceSnapshotReportSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  workspaceManifestReference: z.string().regex(/^[a-f0-9]{64}$/),
+  coherentCheckpointManifestReference: z.string().regex(/^[a-f0-9]{64}$/),
+  status: z.literal("held-awaiting-local-preparation"),
+  acceptedAt: z.string().datetime(),
+};
+export const managedWorkTransferHoldBindingSchema = z
+  .object(managedWorkTransferHoldBindingShape)
+  .strict();
+export const managedWorkTransferHoldStatusSchema =
+  managedWorkTransferHoldBindingSchema
+    .extend({ bindingSha256: z.string().regex(/^[a-f0-9]{64}$/) })
+    .strict()
+    .superRefine((status, context) => {
+      const fence = status.sourceFence;
+      if (
+        status.actor.kind !== "human" ||
+        status.actor.userId !== status.ownerId
+      ) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["actor"],
+          message: "A transfer hold is bound to its human Owner",
+        });
+      }
+      if (
+        fence.controlId !== status.controlId ||
+        fence.captureId !== status.captureId ||
+        fence.requestId !== status.captureRequestId ||
+        fence.nodeId !== status.source.nodeId ||
+        fence.target.nodeId !== status.source.nodeId ||
+        fence.target.workspaceId !== status.source.workspaceId ||
+        fence.ownershipGeneration !== status.ownershipGeneration
+      ) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["sourceFence"],
+          message:
+            "The source fence receipt must match the held source binding",
+        });
+      }
+    });
+
 const workspaceRelocationTargetSchema = factoryTargetSchema.strict();
 const workspaceRelocationErrorCodeSchema = z
   .string()
@@ -1133,6 +1202,12 @@ export type ManagedWorkCheckpointStage = z.infer<
 >;
 export type ManagedWorkCheckpointStatus = z.infer<
   typeof managedWorkCheckpointStatusSchema
+>;
+export type ManagedWorkTransferHoldRequest = z.infer<
+  typeof managedWorkTransferHoldRequestSchema
+>;
+export type ManagedWorkTransferHoldStatus = z.infer<
+  typeof managedWorkTransferHoldStatusSchema
 >;
 export type ManagedWorkImportRequest = z.infer<
   typeof managedWorkImportRequestSchema

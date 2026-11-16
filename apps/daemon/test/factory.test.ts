@@ -1009,6 +1009,131 @@ describe("persistent Factory behavior over Bun SQLite", () => {
     expect(revokedNode.status).toBe(401);
   });
 
+  test("transfer hold rejects non-owners and cannot bind without real source evidence", async () => {
+    const fixture = await provisionFixture(true);
+    const request = {
+      contractVersion: 1,
+      requestId: "transfer:missing-source",
+      captureRequestId: "capture:not-present",
+      checkpointRequestId: "checkpoint:not-present",
+    };
+    const invite = await fixture.factory.createInvitation(fixture.owner, {
+      role: "guest",
+      grants: [{ type: "thread", resourceId: fixture.thread.threadId }],
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    const guest = await fixture.factory.authenticate(
+      (await fixture.factory.redeemInvitation(invite.code, "Guest")).credential,
+    );
+    await expect(
+      fixture.factory.requestManagedWorkTransferHold(
+        guest,
+        fixture.thread.threadId,
+        request,
+      ),
+    ).rejects.toMatchObject({ status: 403, code: "forbidden" });
+    await expect(
+      fixture.factory.requestManagedWorkTransferHold(
+        fixture.owner,
+        fixture.thread.threadId,
+        request,
+      ),
+    ).rejects.toMatchObject({ status: 404, code: "not_found" });
+    await expect(
+      fixture.factory.getManagedWorkTransferHoldStatus(
+        fixture.owner,
+        request.requestId,
+      ),
+    ).rejects.toMatchObject({ status: 404, code: "not_found" });
+    expect(
+      fixture.database.all<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM managed_work_transfer_holds",
+      )[0]?.count,
+    ).toBe(0);
+  });
+
+  test("transfer-hold schema reopens additively without seeding source evidence", async () => {
+    const fixture = await provisionFixture(false);
+    fixture.database.exec("DROP TABLE managed_work_transfer_holds");
+    const database = reopenFixtureDatabase(fixture.directory, fixture.database);
+    const reopened = new FactoryService(database, bootstrapSecret);
+    const columns = database
+      .all<{ name: string }>("PRAGMA table_info(managed_work_transfer_holds)")
+      .map((column) => column.name);
+    expect(columns).toContain("binding_sha256");
+    expect(columns).toContain("source_fence_json");
+    expect(columns).toContain("coherent_checkpoint_manifest_reference");
+    expect(
+      database.all<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM managed_work_transfer_holds",
+      )[0]?.count,
+    ).toBe(0);
+    expect(reopened.listProjects(fixture.owner)).toHaveLength(1);
+  });
+
+  test("transfer hold HTTP route is source-capability gated and strict before admission", async () => {
+    const fixture = await provisionFixture(true);
+    const request = {
+      contractVersion: 1,
+      requestId: "transfer:unavailable-source",
+      captureRequestId: "capture:source",
+      checkpointRequestId: "checkpoint:source",
+    };
+    const headers = {
+      authorization: `Bearer ${fixture.ownerCredential.credential}`,
+      "content-type": "application/json",
+    };
+    const unavailable = await createFactoryHttpHandler(fixture.factory)(
+      new Request(
+        `https://factory.test/v1/threads/${fixture.thread.threadId}/managed-work-transfer-holds`,
+        { method: "POST", headers, body: JSON.stringify(request) },
+      ),
+    );
+    expect(unavailable.status).toBe(503);
+    expect(await unavailable.json()).toMatchObject({
+      error: "managed_work_transfer_hold_unavailable",
+    });
+    const missingStatus = await createFactoryHttpHandler(fixture.factory)(
+      new Request(
+        "https://factory.test/v1/managed-work-transfer-holds/transfer:missing",
+        { headers },
+      ),
+    );
+    expect(missingStatus.status).toBe(404);
+
+    let exportCalled = false;
+    const strictHandler = createFactoryHttpHandler(
+      fixture.factory,
+      {
+        context: async () => null,
+        status: async () => null,
+        async exportCheckpoint() {
+          exportCalled = true;
+          throw new Error(
+            "A missing request body must not export a Checkpoint",
+          );
+        },
+      },
+      undefined,
+      undefined,
+      () => ({ getBlobStream: async () => null }),
+    );
+    const missingBody = await strictHandler(
+      new Request(
+        `https://factory.test/v1/threads/${fixture.thread.threadId}/managed-work-transfer-holds`,
+        { method: "POST", headers: { authorization: headers.authorization } },
+      ),
+    );
+    expect(missingBody.status).toBe(400);
+    expect(await missingBody.json()).toMatchObject({ error: "invalid_json" });
+    expect(exportCalled).toBe(false);
+    expect(
+      fixture.database.all<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM managed_work_transfer_holds",
+      )[0]?.count,
+    ).toBe(0);
+  });
+
   test("a Bun host without a private assembly adapter refuses admission before recording it", async () => {
     const fixture = await provisionFixture(true);
     const handler = createFactoryHttpHandler(fixture.factory);
