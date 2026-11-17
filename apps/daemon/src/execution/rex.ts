@@ -54,7 +54,8 @@ export class RexProcessManager {
   readonly #resolveWorkspace: RexManagerOptions["resolveWorkspace"];
   readonly #assertWorkspaceActive: RexManagerOptions["assertWorkspaceActive"];
   readonly #assertWorkspaceAdmission:
-    RexManagerOptions["assertWorkspaceAdmission"] | undefined;
+    | RexManagerOptions["assertWorkspaceAdmission"]
+    | undefined;
 
   constructor(options: RexManagerOptions) {
     this.#db = options.database;

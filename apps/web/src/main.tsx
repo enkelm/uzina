@@ -6,7 +6,35 @@ import React, {
   useRef,
   useState,
 } from "react";
-import { createRoot } from "react-dom/client";
+import { useNavigate, useSearch } from "@tanstack/react-router";
+import { Avatar, AvatarFallback } from "@ui-sdk/react/avatar";
+import { Button } from "@ui-sdk/react/button";
+import {
+  Collapsible,
+  CollapsiblePanel,
+  CollapsibleTrigger,
+} from "@ui-sdk/react/collapsible";
+import {
+  Dialog,
+  DialogBackdrop,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogTitle,
+  DialogTrigger,
+  createDialogController,
+} from "@ui-sdk/react/dialog";
+import { Field, FieldLabel } from "@ui-sdk/react/field";
+import { Input } from "@ui-sdk/react/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectItemIndicator,
+  SelectTrigger,
+  SelectValue,
+} from "@ui-sdk/react/select";
+import { Textarea } from "@ui-sdk/react/textarea";
 import { FactoryClient, FactoryClientError } from "@uzina/client";
 import { factoryThreadSchema } from "@uzina/contracts/factory";
 type Identity = Awaited<ReturnType<FactoryClient["me"]>>;
@@ -21,7 +49,6 @@ type Workspace = Awaited<
   ReturnType<FactoryClient["listWorkspaces"]>
 >["workspaces"][number];
 type Receipt = Awaited<ReturnType<FactoryClient["submitInput"]>>;
-import "./style.css";
 
 function Icon({ name }: { name: "plus" | "close" | "back" | "chat" }) {
   const paths = {
@@ -99,44 +126,36 @@ function message(error: unknown): string {
 function statusUnavailable(error: unknown): boolean {
   return error instanceof FactoryClientError && error.status >= 500;
 }
-function Modal({
-  open,
-  onClose,
-  labelledBy,
-  children,
-}: {
-  open: boolean;
-  onClose: () => void;
-  labelledBy: string;
-  children: React.ReactNode;
-}) {
-  const ref = useRef<HTMLDialogElement>(null);
-  useEffect(() => {
-    const dialog = ref.current;
-    if (!dialog) return;
-    if (open && !dialog.open) dialog.showModal();
-    else if (!open && dialog.open) dialog.close();
-  }, [open]);
-  return (
-    <dialog
-      ref={ref}
-      className="modal-backdrop"
-      aria-labelledby={labelledBy}
-      onCancel={(event) => {
-        event.preventDefault();
-        onClose();
-      }}
-      onClose={onClose}
-      onClick={(event) => {
-        if (event.target === event.currentTarget) onClose();
-      }}
-    >
-      {children}
-    </dialog>
+export function App() {
+  const { project: selectedProject = "", work: selectedId = "" } = useSearch({
+    from: "/",
+  });
+  const navigate = useNavigate({ from: "/" });
+  const setSelectedProject = useCallback(
+    (project: string, replace = false) => {
+      void navigate({
+        search: (current) => ({
+          project: project || undefined,
+          work: current.project === project ? current.work : undefined,
+        }),
+        replace,
+      });
+    },
+    [navigate],
   );
-}
-
-function App() {
+  const setSelectedId = useCallback(
+    (value: string | ((current: string) => string)) => {
+      void navigate({
+        search: (current) => ({
+          ...current,
+          work:
+            (typeof value === "function" ? value(current.work ?? "") : value) ||
+            undefined,
+        }),
+      });
+    },
+    [navigate],
+  );
   const [sessionActive, setSessionActive] = useState(true);
   const [sessionEpoch, setSessionEpoch] = useState(0);
   const [identity, setIdentity] = useState<Identity | null>(null);
@@ -147,13 +166,10 @@ function App() {
   const identityRef = useRef(identity);
   identityRef.current = identity;
   const [threadBatchFull, setThreadBatchFull] = useState(false);
-  const listedProject = useRef("");
   const [workId, setWorkId] = useState("");
   const [metadataUnavailableId, setMetadataUnavailableId] = useState("");
   const [nodes, setNodes] = useState<Node[]>([]);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
-  const [selectedProject, setSelectedProject] = useState("");
-  const [selectedId, setSelectedId] = useState("");
   const [conversations, setConversations] = useState<Record<string, Message[]>>(
     {},
   );
@@ -188,6 +204,8 @@ function App() {
   };
   const [showCreateProject, setShowCreateProject] = useState(false);
   const [showCreateThread, setShowCreateThread] = useState(false);
+  const [projectDialog] = useState(createDialogController);
+  const [threadDialog] = useState(createDialogController);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [projectName, setProjectName] = useState("");
   const [threadTitle, setThreadTitle] = useState("");
@@ -227,7 +245,7 @@ function App() {
   }, [selectedId, conversation]);
   const client = useMemo(
     () =>
-      sessionActive
+      sessionActive && typeof window !== "undefined"
         ? new FactoryClient({ baseUrl: window.location.origin })
         : null,
     // A cookie account switch must also discard the client's pinned session ID.
@@ -292,9 +310,7 @@ function App() {
     setThreads([]);
     setNodes([]);
     setWorkspaces([]);
-    setSelectedProject("");
-    setSelectedId("");
-    listedProject.current = "";
+    void navigate({ search: {}, replace: true });
     setThreadBatchFull(false);
     setWorkId("");
     setMetadataUnavailableId("");
@@ -316,7 +332,7 @@ function App() {
     setSessionEpoch((epoch) => epoch + 1);
     setConnected(false);
     setError("");
-  }, []);
+  }, [navigate]);
   useEffect(() => {
     if (typeof BroadcastChannel === "undefined") return;
     const channel = new BroadcastChannel("uzina-auth");
@@ -388,6 +404,25 @@ function App() {
     setWorkId("");
     setError(reason);
   }, []);
+  const forgetThread = useCallback(
+    (threadId: string) => {
+      const remove = <T,>(current: Record<string, T>) => {
+        const next = { ...current };
+        delete next[threadId];
+        return next;
+      };
+      setSelectedId((current) => (current === threadId ? "" : current));
+      setMetadataUnavailableId((current) =>
+        current === threadId ? "" : current,
+      );
+      setConversations(remove);
+      setThreadRuns(remove);
+      setDraftsByThread(remove);
+      setPendingInputs(remove);
+      setReceiptsByThread(remove);
+    },
+    [setSelectedId],
+  );
   const refresh = useCallback(
     async (api: FactoryClient, wantedProject = selectedProjectRef.current) => {
       const generation = authGeneration.current;
@@ -439,38 +474,37 @@ function App() {
         );
         let deniedId: string | undefined;
         let unavailableId = "";
+        const requestedId = selectedIdRef.current;
         if (
-          known &&
-          !batch.some((thread) => thread.threadId === known.threadId)
+          requestedId &&
+          !batch.some((thread) => thread.threadId === requestedId)
         ) {
           try {
             let current = known;
             try {
               const status = await request((signal) =>
-                api.getStatus(known.threadId, { signal }),
+                api.getStatus(requestedId, { signal }),
               );
               current = factoryThreadSchema.parse(status.thread);
               if (
-                current.threadId !== known.threadId ||
+                current.threadId !== requestedId ||
                 current.projectId !== projectId
               )
                 throw new Error("Work item binding changed.");
             } catch (error) {
               if (!statusUnavailable(error)) throw error;
-              // A runtime failure is not an authorization result. Check current
-              // thread access through the independent Core history resource.
-              await request((signal) =>
-                api.listRuns(known.threadId, { signal }),
-              );
-              unavailableId = known.threadId;
+              // A runtime failure is not an authorization result. Known metadata
+              // remains usable only after a fresh authorized history read.
+              await request((signal) => api.listRuns(requestedId, { signal }));
+              unavailableId = requestedId;
             }
-            batch.push(current);
+            if (current) batch.push(current);
           } catch (error) {
             if (
               error instanceof FactoryClientError &&
               [403, 404].includes(error.status)
             )
-              deniedId = known.threadId;
+              deniedId = requestedId;
             else throw error;
           }
         }
@@ -483,7 +517,6 @@ function App() {
         // A bounded list is not evidence of revocation. Forget recovery data only
         // after a specific authoritative denial, never because a page omitted it.
         if (deniedId) forgetThread(deniedId);
-        listedProject.current = projectId;
         setThreadBatchFull(threadResult.threads.length === 100);
         setMetadataUnavailableId(unavailableId);
         setIdentity(me);
@@ -493,7 +526,7 @@ function App() {
         setWorkspaces(workspaceResult.workspaces);
         setConnected(true);
         selectedProjectRef.current = projectId;
-        setSelectedProject(projectId);
+        if (projectId !== wantedProject) setSelectedProject(projectId, true);
       } catch (error) {
         if (
           generation !== authGeneration.current ||
@@ -504,7 +537,7 @@ function App() {
         throw error;
       }
     },
-    [],
+    [forgetThread, setSelectedProject],
   );
   useEffect(() => {
     if (!client) return;
@@ -521,7 +554,7 @@ function App() {
         return;
       inFlight = true;
       try {
-        await refresh(client);
+        await refresh(client, selectedProject);
         if (active && initial) setError("");
       } catch (e: unknown) {
         if (active) {
@@ -549,28 +582,7 @@ function App() {
       document.removeEventListener("visibilitychange", onVisibility);
       stopRequests();
     };
-  }, [client, refresh, clearPrivate, disconnect]);
-  useEffect(() => {
-    if (
-      !client ||
-      !identity ||
-      !connected ||
-      listedProject.current === selectedProject
-    )
-      return;
-    const generation = authGeneration.current;
-    void refresh(client, selectedProject).catch((error) => {
-      if (generation !== authGeneration.current) return;
-      if (!handleAccessFailure(error)) disconnect(message(error));
-    });
-  }, [
-    client,
-    selectedProject,
-    Boolean(identity),
-    connected,
-    refresh,
-    disconnect,
-  ]);
+  }, [client, selectedProject, refresh, clearPrivate, disconnect]);
   const selected =
     threads.find((thread) => thread.threadId === selectedId) ?? null;
   useEffect(() => {
@@ -610,10 +622,12 @@ function App() {
             selected.threadId,
             visibleMessages(contextResult.value),
           );
-        } else if (!(
-          contextResult.reason instanceof Error &&
-          contextResult.reason.name === "AbortError"
-        )) {
+        } else if (
+          !(
+            contextResult.reason instanceof Error &&
+            contextResult.reason.name === "AbortError"
+          )
+        ) {
           updateConversation(selected.threadId, []);
           if (
             contextResult.reason instanceof FactoryClientError &&
@@ -638,10 +652,12 @@ function App() {
                 [selected.threadId]: updated,
               }));
           }
-        } else if (!(
-          runResult.reason instanceof Error &&
-          runResult.reason.name === "AbortError"
-        )) {
+        } else if (
+          !(
+            runResult.reason instanceof Error &&
+            runResult.reason.name === "AbortError"
+          )
+        ) {
           if (
             runResult.reason instanceof FactoryClientError &&
             runResult.reason.status === 0
@@ -697,25 +713,6 @@ function App() {
     receiptsByThread,
     disconnect,
   ]);
-  useEffect(() => {
-    if (!selected) setSelectedId("");
-  }, [selected]);
-  function forgetThread(threadId: string) {
-    const remove = <T,>(current: Record<string, T>) => {
-      const next = { ...current };
-      delete next[threadId];
-      return next;
-    };
-    setSelectedId((current) => (current === threadId ? "" : current));
-    setMetadataUnavailableId((current) =>
-      current === threadId ? "" : current,
-    );
-    setConversations(remove);
-    setThreadRuns(remove);
-    setDraftsByThread(remove);
-    setPendingInputs(remove);
-    setReceiptsByThread(remove);
-  }
   function handleAccessFailure(error: unknown, threadId?: string): boolean {
     if (
       !(error instanceof FactoryClientError) ||
@@ -786,14 +783,13 @@ function App() {
       )
         return;
       selectedProjectRef.current = current.projectId;
-      setSelectedProject(current.projectId);
+      void navigate({ search: { project: current.projectId, work: id } });
       setThreads((rows) => [
         ...rows.filter(
           (row) => row.projectId === current.projectId && row.threadId !== id,
         ),
         current,
       ]);
-      setSelectedId(id);
       setWorkId("");
       setError("");
     } catch (error) {
@@ -1156,9 +1152,9 @@ function App() {
             No Factory secret or model key to paste. Your sign-in stays in a
             private HttpOnly cookie, not browser storage.
           </p>
-          <button className="primary" onClick={connect} disabled={busy}>
+          <Button className="primary" onClick={connect} disabled={busy}>
             {busy ? "Connecting…" : "Check sign-in"}
-          </button>
+          </Button>
           {error && (
             <p className="alert" role="alert">
               {error}
@@ -1187,9 +1183,9 @@ function App() {
         {identity.participant?.role === "owner" && (
           <a href="/sharing">Sharing</a>
         )}
-        <button className="quiet" onClick={signOut} disabled={busy}>
+        <Button className="quiet" onClick={signOut} disabled={busy}>
           Sign out
-        </button>
+        </Button>
       </div>
     </header>
   );
@@ -1207,9 +1203,9 @@ function App() {
             Uncertain input stays in this tab with its original Work item,
             request ID, and text. Retry to check current access before recovery.
           </p>
-          <button className="primary" onClick={retryConnection} disabled={busy}>
+          <Button className="primary" onClick={retryConnection} disabled={busy}>
             {busy ? "Connecting…" : "Retry connection"}
-          </button>
+          </Button>
         </main>
       </div>
     );
@@ -1223,96 +1219,113 @@ function App() {
       )}
       <div className="layout">
         <aside className="sidebar" aria-label="Work navigation">
-          <div className="section-head">
-            <label htmlFor="project-select">PROJECT</label>
-            {canCreate && (
-              <button
-                className="icon-button"
-                aria-label="Create project"
-                onClick={openProjectDialog}
+          <Field>
+            <div className="section-head">
+              <FieldLabel>PROJECT</FieldLabel>
+              {canCreate && (
+                <DialogTrigger
+                  controller={projectDialog}
+                  className="icon-button"
+                  aria-label="Create project"
+                >
+                  <Icon name="plus" />
+                </DialogTrigger>
+              )}
+            </div>
+            {projects.length ? (
+              <Select<string>
+                value={selectedProject || null}
+                onValueChange={(value) => setSelectedProject(value ?? "")}
+                placeholder="Choose a project"
+                items={[
+                  ...(selectedProject &&
+                  !projects.some((p) => p.projectId === selectedProject)
+                    ? [{ value: selectedProject, label: selectedProject }]
+                    : []),
+                  ...projects.map((p) => ({
+                    value: p.projectId,
+                    label: p.name,
+                  })),
+                ]}
               >
-                <Icon name="plus" />
-              </button>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {selectedProject &&
+                    !projects.some((p) => p.projectId === selectedProject) && (
+                      <SelectItem value={selectedProject}>
+                        {selectedProject}
+                        <SelectItemIndicator />
+                      </SelectItem>
+                    )}
+                  {projects.map((p) => (
+                    <SelectItem key={p.projectId} value={p.projectId}>
+                      {p.name}
+                      <SelectItemIndicator />
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            ) : (
+              <p className="empty small">No accessible projects.</p>
             )}
-          </div>
-          {projects.length ? (
-            <select
-              id="project-select"
-              value={selectedProject}
-              onChange={(e) => {
-                setSelectedProject(e.target.value);
-                setSelectedId("");
-              }}
-            >
-              <option value="" disabled>
-                Choose a project
-              </option>
-              {selectedProject &&
-                !projects.some((p) => p.projectId === selectedProject) && (
-                  <option value={selectedProject}>{selectedProject}</option>
-                )}
-              {projects.map((p) => (
-                <option key={p.projectId} value={p.projectId}>
-                  {p.name}
-                </option>
-              ))}
-            </select>
-          ) : (
-            <p className="empty small">No accessible projects.</p>
-          )}
+          </Field>
           <div className="section-head work-head">
             <h2>Work items</h2>
             {canCreate && selectedProject && (
-              <button
+              <DialogTrigger
+                controller={threadDialog}
                 className="icon-button"
                 aria-label="Create Work item"
-                onClick={openThreadDialog}
               >
                 <Icon name="plus" />
-              </button>
+              </DialogTrigger>
             )}
           </div>
-          <label className="sr-only" htmlFor="work-search">
-            Search Work items
-          </label>
           {projects.length === 100 && (
             <p className="list-limit">
               First 100 projects shown. Open a Work item by ID if its project is
               not listed.
             </p>
           )}
-          <details className="open-work">
-            <summary>Open Work item by ID</summary>
-            <form onSubmit={openWork}>
-              <label htmlFor="work-id">Work item ID</label>
-              <input
-                id="work-id"
-                value={workId}
-                onChange={(event) => setWorkId(event.target.value)}
-                required
-                maxLength={128}
-              />
-              <button className="primary" disabled={busy}>
-                Open Work item
-              </button>
-            </form>
-          </details>
+          <Collapsible className="open-work">
+            <CollapsibleTrigger>Open Work item by ID</CollapsibleTrigger>
+            <CollapsiblePanel>
+              <form onSubmit={openWork}>
+                <Field>
+                  <FieldLabel>Work item ID</FieldLabel>
+                  <Input
+                    value={workId}
+                    onValueChange={setWorkId}
+                    required
+                    maxLength={128}
+                  />
+                </Field>
+                <Button type="submit" className="primary" disabled={busy}>
+                  Open Work item
+                </Button>
+              </form>
+            </CollapsiblePanel>
+          </Collapsible>
           {threadBatchFull && (
             <p className="list-limit">
               First 100 Work items in this project shown, oldest first. More may
               exist. Open a Work item by ID; search covers only the shown list.
             </p>
           )}
-          <input
-            id="work-search"
-            className="search"
-            placeholder="Search Work items"
-            value={filter}
-            onChange={(e) => setFilter(e.target.value)}
-          />
+          <Field>
+            <FieldLabel className="sr-only">Search Work items</FieldLabel>
+            <Input
+              className="search"
+              placeholder="Search Work items"
+              value={filter}
+              onValueChange={setFilter}
+            />
+          </Field>
           <nav className="thread-list" aria-label="Work items">
             {shownThreads.map((thread) => (
-              <button
+              <Button
                 className={`thread-item ${selectedId === thread.threadId ? "active" : ""}`}
                 key={thread.threadId}
                 aria-current={
@@ -1323,9 +1336,9 @@ function App() {
                   setSelectedId(thread.threadId);
                 }}
               >
-                <span className="thread-title">{thread.title}</span>
+                <span className="thread-title">{thread.title}</span>{" "}
                 <span className="thread-meta">{thread.threadId}</span>
-              </button>
+              </Button>
             ))}
             {!shownThreads.length && (
               <p className="empty">
@@ -1336,26 +1349,35 @@ function App() {
             )}
           </nav>
           <div className="sidebar-foot">
-            <span className="avatar">
-              {(identity.participant?.displayName ?? identity.actor.kind)
-                .slice(0, 1)
-                .toUpperCase()}
-            </span>
+            <Avatar className="avatar" aria-hidden="true">
+              <AvatarFallback>
+                {(identity.participant?.displayName ?? identity.actor.kind)
+                  .slice(0, 1)
+                  .toUpperCase()}
+              </AvatarFallback>
+            </Avatar>
             <span className="user-name">
               {identity.participant?.displayName ?? identity.actor.kind}
             </span>
           </div>
         </aside>
-        <main className="work-area">
+        <Collapsible
+          render={<main />}
+          className="work-area"
+          aria-label="Work details"
+          disabled={!selected}
+          open={detailsOpen}
+          onOpenChange={setDetailsOpen}
+        >
           {selected ? (
             <>
               <div className="work-heading">
-                <button
+                <Button
                   className="mobile-back"
                   onClick={() => setSelectedId("")}
                 >
                   <Icon name="back" /> Work items
-                </button>
+                </Button>
                 <div>
                   <p className="breadcrumb">
                     {projects.find((p) => p.projectId === selected.projectId)
@@ -1363,13 +1385,9 @@ function App() {
                   </p>
                   <h1>{selected.title}</h1>
                 </div>
-                <button
-                  className="details-toggle"
-                  onClick={() => setDetailsOpen(!detailsOpen)}
-                  aria-expanded={detailsOpen}
-                >
+                <CollapsibleTrigger className="details-toggle">
                   Work details
-                </button>
+                </CollapsibleTrigger>
               </div>
               {metadataUnavailableId === selected.threadId && (
                 <p className="list-limit" role="status">
@@ -1446,40 +1464,46 @@ function App() {
                         ? `Command status: ${receipt.dispatchStatus}. This receipt records admission; assistant text appears separately in the conversation.`
                         : "Check the existing request receipt. If no receipt exists, the same request ID and text will be retried."}
                     </span>
-                    <button
+                    <Button
                       className="quiet"
                       onClick={reconcile}
                       disabled={busy}
+                      data-agent-confirm={
+                        pendingInput
+                          ? "May retry the original input on this Work item if no receipt exists"
+                          : undefined
+                      }
                     >
                       {receipt ? "Check receipt" : "Reconcile request"}
-                    </button>
+                    </Button>
                   </article>
                 )}
               </section>
               {canSteer ? (
                 <form className="composer" onSubmit={send}>
-                  <label htmlFor="composer-input">Message</label>
-                  <textarea
-                    id="composer-input"
-                    value={draft}
-                    onChange={(e) => setDraft(e.target.value)}
-                    readOnly={Boolean(pendingInput)}
-                    aria-describedby={
-                      pendingInput ? "pending-input-note" : undefined
-                    }
-                    placeholder="Add direction to this Work item…"
-                    rows={3}
-                    onKeyDown={(e) => {
-                      if (
-                        e.key === "Enter" &&
-                        !e.shiftKey &&
-                        !e.nativeEvent.isComposing
-                      ) {
-                        e.preventDefault();
-                        e.currentTarget.form?.requestSubmit();
+                  <Field>
+                    <FieldLabel className="sr-only">Message</FieldLabel>
+                    <Textarea
+                      value={draft}
+                      onValueChange={setDraft}
+                      readOnly={Boolean(pendingInput)}
+                      aria-describedby={
+                        pendingInput ? "pending-input-note" : undefined
                       }
-                    }}
-                  />
+                      placeholder="Add direction to this Work item…"
+                      rows={3}
+                      onKeyDown={(e) => {
+                        if (
+                          e.key === "Enter" &&
+                          !e.shiftKey &&
+                          !e.nativeEvent.isComposing
+                        ) {
+                          e.preventDefault();
+                          e.currentTarget.form?.requestSubmit();
+                        }
+                      }}
+                    />
+                  </Field>
                   <div className="composer-footer">
                     <span>
                       {pendingInput ? (
@@ -1490,8 +1514,10 @@ function App() {
                         "Enter to send · Shift + Enter for a new line"
                       )}
                     </span>
-                    <button
+                    <Button
+                      type="submit"
                       className="primary"
+                      data-agent-confirm="Sends this input to the selected Work item for execution"
                       disabled={
                         busy ||
                         !connected ||
@@ -1500,7 +1526,7 @@ function App() {
                       }
                     >
                       {busy ? "Sending…" : "Send input"}
-                    </button>
+                    </Button>
                   </div>
                 </form>
               ) : (
@@ -1509,19 +1535,20 @@ function App() {
                   access to send input.
                 </p>
               )}
-              <aside
-                className={`details ${detailsOpen ? "expanded" : ""}`}
+              <CollapsiblePanel
+                render={<aside />}
+                className="details"
                 aria-label="Work item details"
               >
                 <div className="details-title">
                   <h2>Execution &amp; history</h2>
-                  <button
+                  <Button
                     className="icon-button close-details"
                     aria-label="Close work details"
                     onClick={() => setDetailsOpen(false)}
                   >
                     <Icon name="close" />
-                  </button>
+                  </Button>
                 </div>
                 <dl>
                   <dt>Work item</dt>
@@ -1559,7 +1586,7 @@ function App() {
                   History shows command acceptance and status only. It does not
                   infer completion from an acknowledgement.
                 </p>
-              </aside>
+              </CollapsiblePanel>
             </>
           ) : (
             <section className="welcome">
@@ -1582,157 +1609,175 @@ function App() {
                     an explicit existing node and Workspace.
                   </p>
                   {canCreate && (
-                    <button
-                      className="primary"
-                      onClick={() =>
-                        projects.length
-                          ? openThreadDialog()
-                          : openProjectDialog()
+                    <DialogTrigger
+                      controller={
+                        projects.length ? threadDialog : projectDialog
                       }
+                      className="primary"
                     >
                       {projects.length ? "Create Work item" : "Create project"}
-                    </button>
+                    </DialogTrigger>
                   )}
                 </div>
               )}
             </section>
           )}
-        </main>
-        <Modal
-          open={showCreateProject}
-          onClose={closeProjectDialog}
-          labelledBy="project-title"
-        >
-          <section className="dialog">
-            <button
-              className="dialog-close"
-              aria-label="Close"
-              onClick={closeProjectDialog}
+        </Collapsible>
+        {canCreate && (
+          <>
+            <Dialog
+              controller={projectDialog}
+              open={showCreateProject}
+              onOpenChange={(open) =>
+                open ? openProjectDialog() : closeProjectDialog()
+              }
             >
-              <Icon name="close" />
-            </button>
-            <h2 id="project-title">Create project</h2>
-            <form onSubmit={createProject}>
-              <label htmlFor="project-name">Project name</label>
-              <input
-                id="project-name"
-                value={projectName}
-                onChange={(e) => setProjectName(e.target.value)}
-                required
-                maxLength={160}
-                autoFocus
-              />
-              <div className="dialog-actions">
-                <button
-                  type="button"
-                  className="quiet"
-                  onClick={closeProjectDialog}
-                >
-                  Cancel
-                </button>
-                <button className="primary" disabled={busy}>
-                  Create project
-                </button>
-              </div>
-            </form>
-          </section>
-        </Modal>
-        <Modal
-          open={showCreateThread}
-          onClose={closeThreadDialog}
-          labelledBy="thread-title"
-        >
-          <section className="dialog">
-            <button
-              className="dialog-close"
-              aria-label="Close"
-              onClick={closeThreadDialog}
+              <DialogBackdrop className="modal-backdrop" />
+              <DialogContent
+                className="dialog"
+                initialFocus="#project-name"
+                keepMounted
+              >
+                <DialogClose className="dialog-close" aria-label="Close">
+                  <Icon name="close" />
+                </DialogClose>
+                <DialogTitle id="project-title">Create project</DialogTitle>
+                <form onSubmit={createProject}>
+                  <Field>
+                    <FieldLabel>Project name</FieldLabel>
+                    <Input
+                      id="project-name"
+                      value={projectName}
+                      onValueChange={setProjectName}
+                      required
+                      maxLength={160}
+                    />
+                  </Field>
+                  <div className="dialog-actions">
+                    <DialogClose className="quiet">Cancel</DialogClose>
+                    <Button type="submit" className="primary" disabled={busy}>
+                      Create project
+                    </Button>
+                  </div>
+                </form>
+              </DialogContent>
+            </Dialog>
+            <Dialog
+              controller={threadDialog}
+              open={showCreateThread}
+              onOpenChange={(open) =>
+                open ? openThreadDialog() : closeThreadDialog()
+              }
             >
-              <Icon name="close" />
-            </button>
-            <h2 id="thread-title">Create Work item</h2>
-            <p className="muted">
-              Choose a registered node and its existing Workspace. No target is
-              selected automatically.
-            </p>
-            <form onSubmit={createThread}>
-              <label htmlFor="work-title">Work item name</label>
-              <input
-                id="work-title"
-                value={threadTitle}
-                onChange={(e) => setThreadTitle(e.target.value)}
-                required
-                maxLength={160}
-              />
-              <label htmlFor="node-select">Execution node</label>
-              <select
-                id="node-select"
-                value={targetNode}
-                onChange={(e) => {
-                  setTargetNode(e.target.value);
-                  setTargetWorkspace("");
-                }}
-                required
+              <DialogBackdrop className="modal-backdrop" />
+              <DialogContent
+                className="dialog"
+                initialFocus="#work-title"
+                keepMounted
               >
-                <option value="">Choose a node</option>
-                {nodes.map((node) => (
-                  <option key={node.nodeId} value={node.nodeId}>
-                    {node.name} · {node.availability}
-                  </option>
-                ))}
-              </select>
-              <label htmlFor="workspace-select">Workspace</label>
-              <select
-                id="workspace-select"
-                value={targetWorkspace}
-                onChange={(e) => setTargetWorkspace(e.target.value)}
-                required
-                disabled={!targetNode}
-              >
-                <option value="">Choose a Workspace</option>
-                {workspaces
-                  .filter((w) => w.nodeId === targetNode)
-                  .map((w) => (
-                    <option key={w.workspaceId} value={w.workspaceId}>
-                      {w.name}
-                    </option>
-                  ))}
-              </select>
-              {!nodes.length && (
-                <p className="empty">
-                  No execution nodes are registered. An Owner must configure a
-                  node and Workspace first.
-                </p>
-              )}
-              <div className="dialog-actions">
-                <button
-                  type="button"
-                  className="quiet"
-                  onClick={closeThreadDialog}
-                >
-                  Cancel
-                </button>
-                <button
-                  className="primary"
-                  disabled={
-                    busy ||
-                    !nodes.length ||
-                    !workspaces.some((w) => w.nodeId === targetNode)
-                  }
-                >
-                  Create Work item
-                </button>
-              </div>
-            </form>
-          </section>
-        </Modal>
+                <DialogClose className="dialog-close" aria-label="Close">
+                  <Icon name="close" />
+                </DialogClose>
+                <DialogTitle id="thread-title">Create Work item</DialogTitle>
+                <DialogDescription className="muted">
+                  Choose a registered node and its existing Workspace. No target
+                  is selected automatically.
+                </DialogDescription>
+                <form onSubmit={createThread}>
+                  <Field>
+                    <FieldLabel>Work item name</FieldLabel>
+                    <Input
+                      id="work-title"
+                      value={threadTitle}
+                      onValueChange={setThreadTitle}
+                      required
+                      maxLength={160}
+                    />
+                  </Field>
+                  <Field>
+                    <FieldLabel>Execution node</FieldLabel>
+                    <Select<string>
+                      value={targetNode || null}
+                      onValueChange={(value) => {
+                        setTargetNode(value ?? "");
+                        setTargetWorkspace("");
+                      }}
+                      items={nodes.map((node) => ({
+                        value: node.nodeId,
+                        label: `${node.name} · ${node.availability}`,
+                      }))}
+                      placeholder="Choose a node"
+                      required
+                    >
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {nodes.map((node) => (
+                          <SelectItem key={node.nodeId} value={node.nodeId}>
+                            {node.name} · {node.availability}
+                            <SelectItemIndicator />
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                  <Field>
+                    <FieldLabel>Workspace</FieldLabel>
+                    <Select<string>
+                      value={targetWorkspace || null}
+                      onValueChange={(value) => setTargetWorkspace(value ?? "")}
+                      items={workspaces
+                        .filter((w) => w.nodeId === targetNode)
+                        .map((w) => ({ value: w.workspaceId, label: w.name }))}
+                      placeholder="Choose a Workspace"
+                      required
+                      disabled={!targetNode}
+                    >
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {workspaces
+                          .filter((w) => w.nodeId === targetNode)
+                          .map((w) => (
+                            <SelectItem
+                              key={w.workspaceId}
+                              value={w.workspaceId}
+                            >
+                              {w.name}
+                              <SelectItemIndicator />
+                            </SelectItem>
+                          ))}
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                  {!nodes.length && (
+                    <p className="empty">
+                      No execution nodes are registered. An Owner must configure
+                      a node and Workspace first.
+                    </p>
+                  )}
+                  <div className="dialog-actions">
+                    <DialogClose className="quiet">Cancel</DialogClose>
+                    <Button
+                      type="submit"
+                      className="primary"
+                      disabled={
+                        busy ||
+                        !nodes.length ||
+                        !workspaces.some((w) => w.nodeId === targetNode)
+                      }
+                    >
+                      Create Work item
+                    </Button>
+                  </div>
+                </form>
+              </DialogContent>
+            </Dialog>
+          </>
+        )}
       </div>
     </div>
   );
 }
-
-createRoot(document.getElementById("root")!).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>,
-);

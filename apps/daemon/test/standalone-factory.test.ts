@@ -284,7 +284,7 @@ class OwnedProcessStream {
   }
 
   #notify(): void {
-    for (const wake of [...this.#waiters]) wake();
+    for (const wake of this.#waiters) wake();
   }
 }
 
@@ -954,7 +954,7 @@ async function scenario(options: {
 
 afterEach(async () => {
   const cleanupFailures: unknown[] = [];
-  for (const child of [...ownedImportProcesses]) {
+  for (const child of ownedImportProcesses) {
     try {
       await stopManagedWorkImportChild(child, "SIGKILL");
     } catch (error) {
@@ -6896,10 +6896,13 @@ describe("authenticated cloud producer to standalone inactive consumer", () => {
         ...targetSubmission,
         requestId: `${targetSubmission.requestId}:offline-corruption`,
       };
-      await runtimeStorage.commit(
-        [{ type: "submission", value: changedSubmission }],
-        BACKGROUND_CONTEXT,
-      );
+      expect(
+        await runtimeStorage.commit(
+          [[{ type: "submission", value: changedSubmission }]],
+          () => {},
+          BACKGROUND_CONTEXT,
+        ),
+      ).toMatchObject({ stored: 1 });
     } finally {
       await runtimeStorage.close(BACKGROUND_CONTEXT);
     }
@@ -7183,7 +7186,8 @@ describe("guarded managed-work restore resource ownership", () => {
     );
     const destination = join(local.directory, "guarded-restore-destination");
     let openedStorage:
-      Awaited<ReturnType<typeof openBunSqliteStorage>> | undefined;
+      | Awaited<ReturnType<typeof openBunSqliteStorage>>
+      | undefined;
     let revoked = false;
     try {
       await expect(
@@ -7278,7 +7282,8 @@ describe("guarded managed-work restore resource ownership", () => {
     );
     expect(retryOwner.actor).toEqual(ownerSession.actor);
     let retryRawStorage:
-      Awaited<ReturnType<typeof openBunSqliteStorage>> | undefined;
+      | Awaited<ReturnType<typeof openBunSqliteStorage>>
+      | undefined;
     let retryOwnerRevoked = false;
     const publicConversationsReadAfterRevocation: unknown[] = [];
     try {
@@ -7370,11 +7375,13 @@ describe("guarded managed-work restore resource ownership", () => {
     expect(scanTemporaryOwner.status).toBe(201);
     expect(scanTemporaryOwner.value.actor).toEqual(ownerSession.actor);
     let scanRawStorage:
-      Awaited<ReturnType<typeof openBunSqliteStorage>> | undefined;
+      | Awaited<ReturnType<typeof openBunSqliteStorage>>
+      | undefined;
     let scanOwnerRevoked = false;
     let firstConversationPageRecords = 0;
     let scanRevocationResponse:
-      { status: number; value: { status: string } } | undefined;
+      | { status: number; value: { status: string } }
+      | undefined;
     const storageOperationsStartedAfterRevocation: string[] = [];
     try {
       await expect(
@@ -7493,11 +7500,13 @@ describe("guarded managed-work restore resource ownership", () => {
       "post-mint-revocation-destination",
     );
     let mintImportStorage:
-      Awaited<ReturnType<typeof openBunSqliteStorage>> | undefined;
+      | Awaited<ReturnType<typeof openBunSqliteStorage>>
+      | undefined;
     let mintImportStoragePath: string | undefined;
     let mintedId: unknown;
     let mintRevocationResponse:
-      { status: number; value: { status: string } } | undefined;
+      | { status: number; value: { status: string } }
+      | undefined;
     let mintOwnerRevoked = false;
     const storageOperationsAfterMintRevocation: string[] = [];
     try {
@@ -7616,7 +7625,8 @@ describe("guarded managed-work restore resource ownership", () => {
     const reservedReadSettlements = new Map<string, Promise<void>>();
     const operationsStartedAfterJoinRevocation: string[] = [];
     let joinRawStorage:
-      Awaited<ReturnType<typeof openBunSqliteStorage>> | undefined;
+      | Awaited<ReturnType<typeof openBunSqliteStorage>>
+      | undefined;
     let joinRawStoragePath: string | undefined;
     let readsAtStorageClose: string[] | undefined;
     let joinOwnerRevoked = false;
@@ -7780,7 +7790,7 @@ describe("guarded managed-work restore resource ownership", () => {
         ),
       );
       if (joinRestoreOutcome) await joinRestoreOutcome;
-      await Promise.all([...reservedReadSettlements.values()]);
+      await Promise.all(reservedReadSettlements.values());
       await joinRawStorage?.close(BACKGROUND_CONTEXT);
     }
   });

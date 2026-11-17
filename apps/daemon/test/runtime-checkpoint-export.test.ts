@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { JsonValue } from "@earendil-works/chord";
+import type { JsonValue } from "@earendil-works/chord/json";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
   ROOT_CONVERSATION_ID,
@@ -58,30 +58,35 @@ describe("public managed-work storage export bounds", () => {
       join(await directory(), "source.sqlite"),
     );
     try {
-      await storage.commit(
-        [
-          {
-            type: "conversation",
-            value: { id: ROOT_CONVERSATION_ID },
-          },
-          ...entries(260),
-          {
-            type: "document.create",
-            record: {
-              id: 262 as DocumentId,
-              kind: "capture-export-counter",
-              history: "latest",
-              fork: "current",
-              scope: {
-                kind: "conversation",
-                conversationId: ROOT_CONVERSATION_ID,
+      expect(
+        await storage.commit(
+          [
+            [
+              {
+                type: "conversation",
+                value: { id: ROOT_CONVERSATION_ID },
               },
-            },
-            content: { kind: "base", version: 1, value: { count: 260 } },
-          },
-        ],
-        BACKGROUND_CONTEXT,
-      );
+              ...entries(260),
+              {
+                type: "document.create",
+                record: {
+                  id: 262 as DocumentId,
+                  kind: "capture-export-counter",
+                  history: "latest",
+                  fork: "current",
+                  scope: {
+                    kind: "conversation",
+                    conversationId: ROOT_CONVERSATION_ID,
+                  },
+                },
+                content: { kind: "base", version: 1, value: { count: 260 } },
+              },
+            ],
+          ],
+          () => {},
+          BACKGROUND_CONTEXT,
+        ),
+      ).toMatchObject({ stored: 1 });
 
       const checkpoint = await exportManagedWorkCheckpoint(
         storage,
@@ -143,28 +148,33 @@ describe("public managed-work storage export bounds", () => {
       join(await directory(), "active.sqlite"),
     );
     try {
-      await active.commit(
-        [
-          {
-            type: "conversation",
-            value: { id: ROOT_CONVERSATION_ID },
-          },
-          {
-            type: "task",
-            value: {
-              id: 2 as TaskId<JsonValue>,
-              conversationId: ROOT_CONVERSATION_ID,
-              kind: "capture-export-test",
-              version: 1,
-              input: {},
-              background: false,
-              abortRequested: false,
-              state: { status: "pending", checkpoint: {} },
-            },
-          },
-        ],
-        BACKGROUND_CONTEXT,
-      );
+      expect(
+        await active.commit(
+          [
+            [
+              {
+                type: "conversation",
+                value: { id: ROOT_CONVERSATION_ID },
+              },
+              {
+                type: "task",
+                value: {
+                  id: 2 as TaskId<JsonValue>,
+                  conversationId: ROOT_CONVERSATION_ID,
+                  kind: "capture-export-test",
+                  version: 1,
+                  input: {},
+                  background: false,
+                  abortRequested: false,
+                  state: { status: "pending", checkpoint: {} },
+                },
+              },
+            ],
+          ],
+          () => {},
+          BACKGROUND_CONTEXT,
+        ),
+      ).toMatchObject({ stored: 1 });
       await expect(
         exportManagedWorkCheckpoint(active, ROOT_CONVERSATION_ID),
       ).rejects.toThrow("Task 2 is pending");
@@ -211,13 +221,18 @@ describe("public managed-work storage export bounds", () => {
         join(await directory(), "outside-root.sqlite"),
       );
       try {
-        await storage.commit(
-          [
-            { type: "conversation", value: { id: ROOT_CONVERSATION_ID } },
-            ...writes,
-          ],
-          BACKGROUND_CONTEXT,
-        );
+        expect(
+          await storage.commit(
+            [
+              [
+                { type: "conversation", value: { id: ROOT_CONVERSATION_ID } },
+                ...writes,
+              ],
+            ],
+            () => {},
+            BACKGROUND_CONTEXT,
+          ),
+        ).toMatchObject({ stored: 1 });
         await expect(
           exportManagedWorkCheckpoint(storage, ROOT_CONVERSATION_ID),
         ).rejects.toThrow("outside the supported root and owned closure");
@@ -232,45 +247,50 @@ describe("public managed-work storage export bounds", () => {
       join(await directory(), "forked.sqlite"),
     );
     try {
-      await forked.commit(
-        [
-          {
-            type: "conversation",
-            value: { id: ROOT_CONVERSATION_ID },
-          },
-          {
-            type: "task",
-            value: {
-              id: 2 as TaskId<JsonValue>,
-              conversationId: ROOT_CONVERSATION_ID,
-              kind: "capture-export-test",
-              version: 1,
-              input: {},
-              background: false,
-              abortRequested: false,
-              state: {
-                status: "terminal",
-                outcome: { status: "completed", result: null },
+      expect(
+        await forked.commit(
+          [
+            [
+              {
+                type: "conversation",
+                value: { id: ROOT_CONVERSATION_ID },
               },
-            },
-          },
-          {
-            type: "conversation",
-            value: {
-              id: 3 as ConversationId,
-              parent: {
-                conversationId: ROOT_CONVERSATION_ID,
-                at: 4 as EntryId,
+              {
+                type: "task",
+                value: {
+                  id: 2 as TaskId<JsonValue>,
+                  conversationId: ROOT_CONVERSATION_ID,
+                  kind: "capture-export-test",
+                  version: 1,
+                  input: {},
+                  background: false,
+                  abortRequested: false,
+                  state: {
+                    status: "terminal",
+                    outcome: { status: "completed", result: null },
+                  },
+                },
               },
-              owner: {
-                conversationId: ROOT_CONVERSATION_ID,
-                taskId: 2 as TaskId<JsonValue>,
+              {
+                type: "conversation",
+                value: {
+                  id: 3 as ConversationId,
+                  parent: {
+                    conversationId: ROOT_CONVERSATION_ID,
+                    at: 4 as EntryId,
+                  },
+                  owner: {
+                    conversationId: ROOT_CONVERSATION_ID,
+                    taskId: 2 as TaskId<JsonValue>,
+                  },
+                },
               },
-            },
-          },
-        ],
-        BACKGROUND_CONTEXT,
-      );
+            ],
+          ],
+          () => {},
+          BACKGROUND_CONTEXT,
+        ),
+      ).toMatchObject({ stored: 1 });
       await expect(
         exportManagedWorkCheckpoint(forked, ROOT_CONVERSATION_ID),
       ).rejects.toThrow("Owned fork conversations are not supported");
@@ -282,28 +302,33 @@ describe("public managed-work storage export bounds", () => {
       join(await directory(), "session-document.sqlite"),
     );
     try {
-      await sessionScoped.commit(
-        [
-          {
-            type: "conversation",
-            value: { id: ROOT_CONVERSATION_ID },
-          },
-          {
-            type: "document.create",
-            record: {
-              id: 2 as DocumentId,
-              kind: "capture-export-test",
-              scope: { kind: "session" },
-            },
-            content: {
-              kind: "base",
-              version: 1,
-              value: { private: false },
-            },
-          },
-        ],
-        BACKGROUND_CONTEXT,
-      );
+      expect(
+        await sessionScoped.commit(
+          [
+            [
+              {
+                type: "conversation",
+                value: { id: ROOT_CONVERSATION_ID },
+              },
+              {
+                type: "document.create",
+                record: {
+                  id: 2 as DocumentId,
+                  kind: "capture-export-test",
+                  scope: { kind: "session" },
+                },
+                content: {
+                  kind: "base",
+                  version: 1,
+                  value: { private: false },
+                },
+              },
+            ],
+          ],
+          () => {},
+          BACKGROUND_CONTEXT,
+        ),
+      ).toMatchObject({ stored: 1 });
       await expect(
         exportManagedWorkCheckpoint(sessionScoped, ROOT_CONVERSATION_ID),
       ).rejects.toThrow("Session-scoped documents cannot be assigned");

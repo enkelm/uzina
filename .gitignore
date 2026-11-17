@@ -4,6 +4,8 @@ build/
 dist/
 coverage/
 *.tsbuildinfo
+.tanstack/
+.impeccable/review/
 
 # Local tooling state
 .pi/subagents/

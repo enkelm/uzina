@@ -60,10 +60,13 @@ describe("managed-work composition in Miniflare workerd", () => {
     );
     let managedWork;
     try {
-      await sourceStorage.commit(
-        [{ type: "conversation", value: { id: ROOT_CONVERSATION_ID } }],
-        BACKGROUND_CONTEXT,
-      );
+      expect(
+        await sourceStorage.commit(
+          [[{ type: "conversation", value: { id: ROOT_CONVERSATION_ID } }]],
+          () => {},
+          BACKGROUND_CONTEXT,
+        ),
+      ).toMatchObject({ stored: 1 });
       managedWork = await exportManagedWorkCheckpoint(
         sourceStorage,
         ROOT_CONVERSATION_ID,

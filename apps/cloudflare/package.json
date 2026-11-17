@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@earendil-works/chord": "1.4.0",
-    "@earendil-works/pi-durable": "1.4.0",
+    "@earendil-works/chord": "1.5.2",
+    "@earendil-works/pi-durable": "1.5.2",
     "@uzina/checkpoints": "workspace:*",
     "@uzina/contracts": "workspace:*",
     "@uzina/client": "workspace:*",
@@ -13,7 +13,7 @@
     "@uzina/pi-runtime": "workspace:*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-ai": "1.5.2",
     "miniflare": "4.20260730.0",
     "@modelcontextprotocol/sdk": "1.32.2"
   }

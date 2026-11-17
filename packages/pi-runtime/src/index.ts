@@ -1,4 +1,4 @@
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import type { Storage } from "@earendil-works/pi-durable";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
@@ -95,9 +95,10 @@ export class ManagedPiWork {
 
   /** Idempotently create the one root conversation. */
   async create(context: Context = BACKGROUND_CONTEXT): Promise<ConversationId> {
-    const conversation = await this.harness.root(context, {
-      ...(this.options.agent ? { agent: this.options.agent } : {}),
-    });
+    const conversation = await this.harness.root(
+      context,
+      this.options.agent ? { agent: this.options.agent } : {},
+    );
     return conversation.id;
   }
 

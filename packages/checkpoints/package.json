@@ -13,7 +13,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
-    "@earendil-works/pi-durable": "1.4.0",
+    "@earendil-works/pi-durable": "1.5.2",
     "@uzina/pi-runtime": "workspace:*"
   }
 }

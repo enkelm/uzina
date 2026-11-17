@@ -1,12 +1,9 @@
+@layer ui-sdk;
+
 :root {
   font-family:
-    Inter,
-    ui-sans-serif,
-    system-ui,
-    -apple-system,
-    BlinkMacSystemFont,
-    "Segoe UI",
-    sans-serif;
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", sans-serif;
   color: #172e32;
   background: #f4f7f7;
   font-synthesis: none;
@@ -20,6 +17,20 @@
   --muted: #526a6c;
   --surface: #fff;
   --focus: #187b75;
+  --ui-background: #fff;
+  --ui-foreground: #172e32;
+  --ui-muted: #e2ebea;
+  --ui-muted-foreground: #526a6c;
+  --ui-border: #dce5e5;
+  --ui-input: #7f9391;
+  --ui-primary: #123f3c;
+  --ui-primary-foreground: #fff;
+  --ui-ring: #187b75;
+  --ui-ring-border: #187b75;
+  --ui-overlay: #172c2c70;
+  --ui-radius: 5px;
+  --ui-font-sans: inherit;
+  --ui-font-size: 14px;
   color-scheme: light;
   caret-color: var(--teal2);
   scrollbar-color: #668a85 #edf2f2;
@@ -46,8 +57,43 @@ textarea,
 select {
   font: inherit;
 }
+input {
+  height: auto;
+}
 button {
+  height: auto;
+  white-space: normal;
   cursor: pointer;
+}
+[data-slot="field"] {
+  min-width: 0;
+  flex-shrink: 0;
+}
+[data-slot="select-trigger"] {
+  height: auto;
+  min-height: 40px;
+  border-color: var(--ui-input);
+}
+[data-slot="select-value"] {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+[data-slot="select-content"] {
+  max-width: min(var(--available-width), calc(100vw - 24px));
+}
+[data-slot="select-item"] {
+  min-height: 40px;
+  padding-block: 8px;
+  overflow-wrap: anywhere;
+}
+[data-slot="select-item"][data-highlighted] {
+  background: var(--teal);
+  color: #fff;
+}
+[data-slot="select-item"][data-selected] {
+  font-weight: 700;
 }
 button:focus-visible,
 input:focus-visible,
@@ -57,8 +103,17 @@ select:focus-visible,
   outline: 3px solid var(--focus);
   outline-offset: 2px;
 }
-.topbar button:focus-visible {
-  outline-color: #b3ece3;
+.topbar button:focus-visible,
+.topbar a:focus-visible {
+  outline: 3px solid #b3ece3;
+  outline-offset: 2px;
+}
+.topbar a {
+  color: inherit;
+  text-underline-offset: 0.2em;
+}
+.topbar a:hover {
+  text-decoration-thickness: 2px;
 }
 .app-shell {
   height: 100dvh;
@@ -81,12 +136,10 @@ select:focus-visible,
   margin: 0 0 12px;
   font-size: 12px;
 }
-.open-work summary {
-  cursor: pointer;
+.open-work [data-slot="collapsible-trigger"] {
   padding: 8px 0;
-}
-.open-work summary:focus-visible {
-  outline: 3px solid var(--focus);
+  font-size: 12px;
+  color: var(--muted);
 }
 .open-work form {
   display: grid;
@@ -220,12 +273,12 @@ select:focus-visible,
   background: #dfe9e8;
   border-color: #d0dddc;
 }
-.sidebar select,
+.sidebar [data-slot="select-trigger"],
 .open-work input,
-.dialog select,
+.dialog [data-slot="select-trigger"],
 .dialog input {
   width: 100%;
-  border: 1px solid #ccd9d9;
+  border: 1px solid var(--ui-input);
   border-radius: 5px;
   background: #fff;
   padding: 10px;
@@ -242,7 +295,7 @@ select:focus-visible,
 .search {
   width: 100%;
   margin: 0 0 10px;
-  border: 1px solid #d2dede;
+  border: 1px solid var(--ui-input);
   background: #fff;
   padding: 9px 11px;
   border-radius: 5px;
@@ -343,7 +396,7 @@ select:focus-visible,
   min-width: 0;
 }
 .details-toggle {
-  border: 1px solid #d4dfdf;
+  border: 1px solid var(--ui-input);
   background: #fff;
   border-radius: 5px;
   padding: 8px 11px;
@@ -457,18 +510,11 @@ select:focus-visible,
   flex-shrink: 0;
   max-width: 850px;
   margin: 0 auto;
-  border: 1px solid #cedcda;
+  border: 1px solid var(--ui-input);
   border-radius: 7px;
   background: #fff;
   box-shadow: none;
   padding: 12px;
-}
-.composer > label {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip: rect(0, 0, 0, 0);
 }
 .composer textarea {
   width: 100%;
@@ -541,13 +587,10 @@ select:focus-visible,
   box-shadow: none;
   border-radius: 6px;
   padding: 15px;
-  display: none;
-}
-.details.expanded {
-  display: block;
+  color: #172e32;
 }
 @media (min-width: 1121px) {
-  .work-area:has(.details.expanded) {
+  .work-area:has(.details[data-open]) {
     padding-right: 336px;
   }
 }
@@ -728,30 +771,13 @@ select:focus-visible,
   border: 0;
 }
 .modal-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 5;
-  width: 100%;
-  height: 100%;
-  max-width: none;
-  max-height: none;
-  border: 0;
-  margin: 0;
-  padding: 18px;
-  background: transparent;
-  color: inherit;
-  display: grid;
-  place-items: center;
-}
-.modal-backdrop:not([open]) {
-  display: none;
-}
-.modal-backdrop::backdrop {
-  background: #172c2c70;
+  background: var(--ui-overlay);
 }
 .dialog {
-  position: relative;
-  width: min(100%, 460px);
+  width: min(460px, calc(100% - 36px));
+  display: block;
+  border: 0;
+  color: #172e32;
   background: #fff;
   border-radius: 8px;
   padding: 24px;
@@ -768,11 +794,14 @@ select:focus-visible,
   gap: 9px;
   margin-top: 18px;
 }
-.dialog input,
-.dialog select {
+.dialog [data-slot="field"] {
+  gap: 9px;
   margin-bottom: 5px;
 }
 .dialog-close {
+  width: 40px;
+  height: 40px;
+  padding: 0;
   position: absolute;
   right: 14px;
   top: 12px;

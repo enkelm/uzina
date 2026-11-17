@@ -523,13 +523,14 @@ async function runSavedReadinessReopenScenario(
       }
       try {
         await miniflare.dispose();
-      } finally {
-        if (failures.length > 0) {
-          throw new AggregateError(
-            failures,
-            "Saved-readiness fixture failed to stop owned node loops cleanly",
-          );
-        }
+      } catch (error) {
+        failures.push(error);
+      }
+      if (failures.length > 0) {
+        throw new AggregateError(
+          failures,
+          "Saved-readiness fixture failed to stop owned node loops cleanly",
+        );
       }
     },
   };
@@ -2975,7 +2976,8 @@ describe("execution cutover in production-shaped workerd + R2", () => {
       );
       expect(heldRead.response.status).toBe(200);
       let pendingRead:
-        Promise<{ response: Response } | { error: unknown }> | undefined;
+        | Promise<{ response: Response } | { error: unknown }>
+        | undefined;
       let readResponse: Response | undefined;
       try {
         pendingRead = fetch(new URL(blobCase.path, baseUrl), {

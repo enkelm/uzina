@@ -10,6 +10,8 @@ import { HttpExecutionControllerConnector } from "../../../apps/daemon/src/execu
 import { ExecutionLoop } from "../../../apps/daemon/src/execution/loop";
 import { deterministicModels } from "../../../packages/pi-runtime/test-support/deterministic-model";
 import { verifyCatalogWithoutRuntime } from "./verify-catalog-browser";
+import { chooseSelect } from "./browser-controls";
+import { verifyUiSdk, sendWithUiSdk } from "./verify-ui-sdk";
 
 const output = resolve(".impeccable/review");
 const browserPath =
@@ -49,6 +51,7 @@ let nodeLoopTask: Promise<void> | undefined;
 let vite: Awaited<ReturnType<typeof createServer>> | undefined;
 let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
 let primary: unknown;
+const failures: unknown[] = [];
 try {
   await mkdir(output, { recursive: true });
   const workspaceDirectory = join(directory, "workspace");
@@ -203,6 +206,10 @@ try {
   vite = await createServer({
     root: process.cwd(),
     configFile: resolve("vite.config.ts"),
+    optimizeDeps: {
+      entries: ["src/main.tsx"],
+      include: ["@ui-sdk/react/agent"],
+    },
     server: { host: "127.0.0.1", port: 0, strictPort: false },
   });
   await vite.listen();
@@ -265,7 +272,14 @@ try {
   await page
     .getByRole("navigation", { name: "Work items", exact: true })
     .waitFor({ timeout: 10_000 });
-  assert.equal(new URL(page.url()).search, "");
+  const signedInUrl = new URL(page.url());
+  assert.equal(signedInUrl.pathname, "/");
+  assert.ok(
+    [...signedInUrl.searchParams.keys()].every((key) =>
+      ["project", "work"].includes(key),
+    ),
+  );
+  assert.ok(!page.url().includes(ownerCredential));
   await page.setViewportSize({ width: 1440, height: 900 });
   assert.equal(await page.getByText("owner", { exact: true }).count(), 1);
   assert.equal(
@@ -365,6 +379,8 @@ try {
     await otherTab.close();
   }
 
+  const uiSdk = await verifyUiSdk(page, output);
+
   // Owner creates a real project and then a real Work item against the explicit existing target.
   await page
     .getByRole("button", { name: "Create project", exact: true })
@@ -385,12 +401,8 @@ try {
   await page
     .getByLabel("Work item name", { exact: true })
     .fill("Browser-created work");
-  await page
-    .getByLabel("Execution node", { exact: true })
-    .selectOption(node.nodeId);
-  await page
-    .getByLabel("Workspace", { exact: true })
-    .selectOption(workspace.workspaceId);
+  await chooseSelect(page, "Execution node", /^Disposable test node · /);
+  await chooseSelect(page, "Workspace", workspace.name);
   await page
     .getByRole("dialog")
     .getByRole("button", { name: "Create Work item", exact: true })
@@ -399,10 +411,11 @@ try {
     .getByRole("heading", { name: "Browser-created work", exact: true })
     .waitFor({ timeout: 10_000 });
   await page.getByText("online", { exact: true }).waitFor();
-  await page
-    .getByRole("textbox", { name: "Message", exact: true })
-    .fill("Please answer with the deterministic test response.");
-  await page.getByRole("button", { name: "Send input", exact: true }).click();
+  await sendWithUiSdk(
+    page,
+    uiSdk,
+    "Please answer with the deterministic test response.",
+  );
   await page
     .getByText("Input accepted", { exact: true })
     .waitFor({ timeout: 10_000 });
@@ -443,18 +456,20 @@ try {
     await page
       .getByRole("button", { name: "Check receipt", exact: true })
       .scrollIntoViewIfNeeded();
-    const receipt = await page
-      .getByRole("article")
-      .filter({
-        has: page.getByRole("button", { name: "Check receipt", exact: true }),
-      })
-      .boundingBox();
-    const details = await page
-      .getByRole("complementary", { name: "Work item details", exact: true })
-      .boundingBox();
-    const conversation = await page
-      .getByRole("region", { name: "Conversation", exact: true })
-      .boundingBox();
+    const [receipt, details, conversation] = await Promise.all([
+      page
+        .getByRole("article")
+        .filter({
+          has: page.getByRole("button", { name: "Check receipt", exact: true }),
+        })
+        .boundingBox(),
+      page
+        .getByRole("complementary", { name: "Work item details", exact: true })
+        .boundingBox(),
+      page
+        .getByRole("region", { name: "Conversation", exact: true })
+        .boundingBox(),
+    ]);
     assert.ok(receipt && details && conversation);
     // Scroll containers clip fractional overflow. Compare the visible receipt,
     // not a subpixel of its box outside the conversation's painted area.
@@ -518,13 +533,40 @@ try {
   await page.setViewportSize({ width: 1440, height: 900 });
 
   // Cross-thread lost request: abort before admission, switch Work items, ensure A's action is absent on B.
-  await page
-    .getByLabel("PROJECT", { exact: true })
-    .selectOption(project.projectId);
+  await chooseSelect(page, "PROJECT", project.name);
   await page.getByRole("button", { name: /^Original work / }).click();
   await page
     .getByRole("heading", { name: "Original work", exact: true })
     .waitFor();
+  const originalUrl = page.url();
+  assert.equal(
+    new URL(originalUrl).searchParams.get("project"),
+    project.projectId,
+  );
+  assert.equal(new URL(originalUrl).searchParams.get("work"), threadA.threadId);
+  await page.getByRole("button", { name: /^Other work / }).click();
+  await page
+    .getByRole("heading", { name: "Other work", exact: true })
+    .waitFor();
+  assert.equal(new URL(page.url()).searchParams.get("work"), threadB.threadId);
+  await page.goBack();
+  await page
+    .getByRole("heading", { name: "Original work", exact: true })
+    .waitFor();
+  assert.equal(page.url(), originalUrl);
+  await page.goForward();
+  await page
+    .getByRole("heading", { name: "Other work", exact: true })
+    .waitFor();
+  await page.goBack();
+  await page
+    .getByRole("heading", { name: "Original work", exact: true })
+    .waitFor();
+  await page.reload();
+  await page
+    .getByRole("heading", { name: "Original work", exact: true })
+    .waitFor();
+  assert.equal(page.url(), originalUrl);
   const originalInput = "  Only Original work\n";
   let lost: { requestId: string; text: string } | undefined;
   await page.route(
@@ -794,13 +836,9 @@ try {
 
   // Project-scoped listing finds work beyond the global first 100. The exact
   // status resource opens a known ID outside a project's first page.
-  await page
-    .getByLabel("PROJECT", { exact: true })
-    .selectOption(later.projectId);
+  await chooseSelect(page, "PROJECT", later.name);
   await page.getByRole("button", { name: /^Later project work / }).waitFor();
-  await page
-    .getByLabel("PROJECT", { exact: true })
-    .selectOption(crowded.projectId);
+  await chooseSelect(page, "PROJECT", crowded.name);
   await page
     .getByText(
       "First 100 Work items in this project shown, oldest first. More may exist. Open a Work item by ID; search covers only the shown list.",
@@ -815,6 +853,12 @@ try {
   await page
     .getByRole("heading", { name: "Crowded work 100", exact: true })
     .waitFor();
+  const crowdedUrl = page.url();
+  await page.reload();
+  await page
+    .getByRole("heading", { name: "Crowded work 100", exact: true })
+    .waitFor();
+  assert.equal(page.url(), crowdedUrl);
   await page.getByRole("button", { name: "Work details", exact: true }).click();
   await page
     .getByText(
@@ -867,9 +911,7 @@ try {
     .waitFor();
   await connect(viewerCredential);
   assert.equal(await page.getByText("viewer", { exact: true }).count(), 1);
-  await page
-    .getByLabel("PROJECT", { exact: true })
-    .selectOption(project.projectId);
+  await chooseSelect(page, "PROJECT", project.name);
   await page.getByRole("button", { name: /^Original work / }).click();
   await page
     .getByRole("heading", { name: "Original work", exact: true })
@@ -909,9 +951,7 @@ try {
     .getByRole("button", { name: "Check sign-in", exact: true })
     .waitFor();
   await connect(guestCredential);
-  await page
-    .getByLabel("PROJECT", { exact: true })
-    .selectOption(project.projectId);
+  await chooseSelect(page, "PROJECT", project.name);
   await page.getByRole("button", { name: /^Original work / }).click();
   await page
     .getByRole("heading", { name: "Original work", exact: true })
@@ -929,9 +969,7 @@ try {
     .getByRole("button", { name: "Check sign-in", exact: true })
     .waitFor();
   await connect(ownerCredential);
-  await page
-    .getByLabel("PROJECT", { exact: true })
-    .selectOption(project.projectId);
+  await chooseSelect(page, "PROJECT", project.name);
   await page.getByRole("button", { name: /^Original work / }).click();
   await page
     .getByRole("heading", { name: "Original work", exact: true })
@@ -949,9 +987,11 @@ try {
     .fill("private project form value");
   await page.keyboard.press("Shift+Tab");
   assert.equal(
-    await page.evaluate(() => !!document.activeElement?.closest("dialog")),
+    await page.evaluate(
+      () => !!document.activeElement?.closest('[role="dialog"]'),
+    ),
     true,
-    "Keyboard focus must remain inside the native modal",
+    "Keyboard focus must remain inside the creation dialog",
   );
   await page.keyboard.press("Escape");
   await page.locator("#project-title").waitFor({ state: "hidden" });
@@ -1028,9 +1068,7 @@ try {
     0,
     "Former Owner dialog must not survive account switch",
   );
-  await page
-    .getByLabel("PROJECT", { exact: true })
-    .selectOption(project.projectId);
+  await chooseSelect(page, "PROJECT", project.name);
   await page.getByRole("button", { name: /^Original work / }).click();
   await page
     .getByRole("heading", { name: "Original work", exact: true })
@@ -1052,7 +1090,6 @@ try {
 } catch (error) {
   primary = error;
 } finally {
-  const failures: unknown[] = [];
   for (const release of releaseGates) release();
   try {
     await browser?.close();
@@ -1088,9 +1125,9 @@ try {
   } catch (error) {
     failures.push(error);
   }
-  if (primary || failures.length)
-    throw new AggregateError(
-      primary ? [primary, ...failures] : failures,
-      "Owned UI browser scenario failed (all cleanup attempted)",
-    );
 }
+if (primary || failures.length)
+  throw new AggregateError(
+    primary ? [primary, ...failures] : failures,
+    "Owned UI browser scenario failed (all cleanup attempted)",
+  );

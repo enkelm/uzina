@@ -235,7 +235,11 @@ type ExecutionWorkspaceRow = {
   state: "active" | "fenced";
 };
 export type ManagedWorkCheckpointArtifactRole =
-  "runtime" | "evidence" | "attachment" | "inner-manifest" | "outer-manifest";
+  | "runtime"
+  | "evidence"
+  | "attachment"
+  | "inner-manifest"
+  | "outer-manifest";
 export type ManagedWorkCheckpointArtifactReference = {
   role: ManagedWorkCheckpointArtifactRole;
   reference: string;

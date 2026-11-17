@@ -55,7 +55,8 @@ let checkpointPublicationHoldRequested = false;
 let checkpointPublicationEntered = false;
 let releaseCheckpointPublication: (() => void) | undefined;
 let checkpointPublicationSummary:
-  ManagedWorkCheckpointClosureVerification | undefined;
+  | ManagedWorkCheckpointClosureVerification
+  | undefined;
 let checkpointPublicationSummaryFrozen = false;
 let privateArtifactReadHoldRequestId: string | undefined;
 let privateArtifactReadHoldMode: "first-read" | "second-read" | undefined;
@@ -84,7 +85,8 @@ let exportGuardBindingApplied = false;
 let captureStateBarrierUrl: string | undefined;
 let captureStateBarrierBindingApplied = false;
 let synchronousCaptureStateAdmissionScope:
-  CaptureStateAdmissionScope | undefined;
+  | CaptureStateAdmissionScope
+  | undefined;
 
 function withCaptureStateAdmissionScope<T>(
   scope: CaptureStateAdmissionScope | undefined,

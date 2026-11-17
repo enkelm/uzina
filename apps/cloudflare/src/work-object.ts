@@ -1,4 +1,4 @@
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { ROOT_CONVERSATION_ID, type Storage } from "@earendil-works/pi-durable";
 import { openDurableObjectSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/cloudflare";
@@ -124,7 +124,8 @@ export type ManagedWorkFactoryBridge = {
 
 export type ManagedWorkEnvironment = {
   runtimeOptions():
-    ManagedWorkRuntimeOptions | Promise<ManagedWorkRuntimeOptions>;
+    | ManagedWorkRuntimeOptions
+    | Promise<ManagedWorkRuntimeOptions>;
   factory(): ManagedWorkFactoryBridge;
 };
 

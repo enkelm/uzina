@@ -1,6 +1,6 @@
 # Managed Pi Durable runtime
 
-`@uzina/pi-runtime` is the narrow managed-work facade over pinned Pi Durable and chord `1.4.0` APIs. It deliberately exposes one root conversation per managed work item and does not add another scheduler.
+`@uzina/pi-runtime` is the narrow managed-work facade over pinned Pi Durable and chord `1.5.2` APIs. It deliberately exposes one root conversation per managed work item and does not add another scheduler.
 
 ## Public facade
 
@@ -55,7 +55,7 @@ Tool results are correlated from the immutable node receipt into the Pi tool-res
 ## Host composition and recovery
 
 - `openLocalManagedPiWork()` composes `ManagedPiWork` with the serialized Bun SQLite facade. The standalone daemon persists one Pi Durable database per stable thread identity.
-- `ManagedWorkRpcObject` is the workerd Durable Object wrapper. Cold construction arms only a one-shot immediate host bootstrap alarm; it does not open/resume Pi or resolve provider configuration. The first unlocked alarm reconstructs the real Pi wake and resumes; a capture-held alarm is consumed without opening Pi or rearming. Existing active-task heartbeats remain 60 seconds, and future Pi sleep deadlines remain authoritative. An evicted object with no incoming event still waits for its persisted deadline/heartbeat (up to the inherited 60-second active heartbeat); this is not a sub-60-second no-event recovery guarantee. Normal operations and alarms consult authoritative Core capture state before opening/resuming. The production `ManagedWorkObject` configures the selected supported provider/model from Worker secret bindings only when a normal unlocked operation opens the runtime. The Wrangler build uses `apps/cloudflare/scripts/build-worker.ts` to replace Pi AI 1.4.0's host-auth context, OAuth loader, and native environment-helper modules with checked-in Workers-compatible shims; the build rejects unexpected package versions/module shapes. Wrangler and Miniflare consume the same built entry. Pending wake deadlines are armed before execution.
+- `ManagedWorkRpcObject` is the workerd Durable Object wrapper. Cold construction arms only a one-shot immediate host bootstrap alarm; it does not open/resume Pi or resolve provider configuration. The first unlocked alarm reconstructs the real Pi wake and resumes; a capture-held alarm is consumed without opening Pi or rearming. Existing active-task heartbeats remain 60 seconds, and future Pi sleep deadlines remain authoritative. An evicted object with no incoming event still waits for its persisted deadline/heartbeat (up to the inherited 60-second active heartbeat); this is not a sub-60-second no-event recovery guarantee. Normal operations and alarms consult authoritative Core capture state before opening/resuming. The production `ManagedWorkObject` configures the selected supported provider/model from Worker secret bindings only when a normal unlocked operation opens the runtime. The Wrangler build uses `apps/cloudflare/scripts/build-worker.ts` to replace Pi AI 1.5.2's host-auth context, OAuth loader, and native environment-helper modules with checked-in Workers-compatible shims; the build rejects unexpected package versions/module shapes. Wrangler and Miniflare consume the same built entry. Pending wake deadlines are armed before execution.
 - `FactoryObject` is the singleton Factory Durable Object. It routes an accepted persisted input by its stable thread ID to `MANAGED_WORK`; the work Durable Object is per thread. There are no bindings embedded in the portable Core or Pi Runtime packages.
 
 ## Logical checkpoint support
@@ -69,7 +69,17 @@ Tool results are correlated from the immutable node receipt into the Pi tool-res
 - The profile copies canonical conversation entries, settled request receipts, terminal task records, and current values of conversation/task documents through Pi Durable's public storage API. It is not a byte-for-byte database export and does not preserve prior document revisions or provide arbitrary historical `asOf` reconstruction.
 - Import verifies the version/checksum and record graph and rejects checkpoints whose root is not the reserved ID. It requires an exclusively held, genuinely fresh destination; no concurrent writer may use it between validation and import. Composite restore imports into an owned temporary raw Storage and never constructs a Harness, calls models/tools, or activates work. Import does not transfer ownership. Factory provenance is carried separately as an opaque attachment; users, bearer keys, provider credentials/settings, deployment bindings, and execution authority are not imported.
 
-Pi Durable `1.4.0` has no full public storage exporter/importer, so broader checkpoint semantics remain unsupported until upstream exposes the needed logical history/fork records. Keep broader profiles fail-closed rather than copying SQLite internals.
+Broader checkpoint semantics remain unsupported by this adapter. Keep broader profiles fail-closed rather than copying SQLite internals.
+
+## Dependency migration from 1.4.0
+
+Chord context and JSON types now use the `@earendil-works/chord/context` and `@earendil-works/chord/json` subpaths. The Bun SQLite facade implements `runCounted` on both the database and transaction handles, with the same queue, lifetime and rollback rules as other writes.
+
+A committed SQLite fixture written by the actual 1.4.0 Harness verifies that a settled legacy store opens under 1.5.2, retains its context and receipt, deduplicates its old request without a model call, and accepts new work. This is not proof for every old in-flight task or a production database upgrade. Back up runtime data before upgrading a live host.
+
+Pi Durable raw Storage commits now accept batches and a durability-receipt callback. Checkpoint imports use one atomic batch and verify `stored === 1`; a refused batch must not be reported as a successful import. Harness/Session commits retain their callback-based API.
+
+New coherent bundles require `pi-durable:1.5.2`. The default destination profile does not advertise compatibility with older `pi-durable:1.4.0` bundles. Do not rewrite an old manifest's version requirement to bypass compatibility checks; retain the matching runtime or capture a new bundle from a compatible source.
 
 ## Validation and unverified operation
 

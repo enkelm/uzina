@@ -2,6 +2,16 @@
 
 This first UI provides project and Work item creation, an explicit existing Execution node and Workspace choice, conversation text, command receipts, and history. Guest access follows the Core project grants. Viewer access is read-only. It has no transfer, ownership, activation, or terminal controls.
 
+## Framework and UI dependencies
+
+The app uses React 19, TanStack Start and TanStack Router on Vite. Start runs in SPA mode: only the public document shell is prerendered, and the Work route renders on the client. Factory data and cookie authentication stay behind the existing Core API, not Start loaders or server functions.
+
+Project and Work item selection use validated `project` and `work` search parameters. Links can reopen authorized work, including an item outside the first 100 rows. Back, Forward and reload restore selection, not drafts or unresolved inputs. Router scroll restoration is disabled so it does not write navigation state to Web Storage; conversation scrolling remains local to the mounted UI. Authorization is checked again when loading a link.
+
+`@ui-sdk/react` and `@ui-sdk/core` are pinned to `0.1.0-beta.6`. The root route imports `@ui-sdk/core/web.css` once, before the existing app styles; Tailwind is not installed. The Factory app uses ui-sdk Buttons, Fields, Inputs, Textarea, Selects, Dialogs, Collapsibles, and Avatar, styled with the existing teal palette. Controlled values use ui-sdk change callbacks so agents and keyboard/pointer users share the same behavior. Sending input requires agent confirmation. The standalone sign-in, invitation, and sharing pages remain server-rendered Core HTML; they do not depend on React or load a remote UI script. Follow the ui-sdk skill and the installed package docs before building components, as described in the root `AGENTS.md`.
+
+Run `bun run build:web` after changing routes to regenerate `src/routeTree.gen.ts`. Start writes production assets under `dist/client` and its server entry under `dist/server`; neither is a deployment or an API gateway. A static host must serve the SPA shell for application URLs and preserve the separate Factory routes.
+
 ## Development
 
 See [local setup](../../docs/local-setup.md) for copy/start commands, owner sign-in links, and node provisioning. This directory's `.env.example` contains only the optional web proxy address, never credentials. The real Factory environment file has a separate name and is loaded explicitly.
@@ -38,7 +48,7 @@ bun run --cwd apps/web build
 bun run --cwd apps/web test:browser
 ```
 
-The browser check starts an owned disposable Factory, actual native Pi runtime, and registered Execution node. Only the external model transport is deterministic. It checks native sign-in/sharing forms, invitation redemption, cross-tab account switching, project and Work item creation, explicit placement, human and assistant text, Guest/Viewer scope, unknown admission, lost replies after real admission, cross-Work-item recovery, exact input text, stale responses, sign-out, revocation, keyboard dialog behavior, Web Storage, mobile navigation, temporary offline recovery, and real lists/history larger than 100 records. A second owned local Factory has no runtime adapter; it verifies that status 503 does not disconnect its authorized catalog/history and that exact-ID limits are explicit.
+The browser check starts an owned disposable Factory, actual native Pi runtime, and registered Execution node. Only the external model transport is deterministic. It also checks ui-sdk agent discovery and changes, confirmation, dependent selectors, required fields, and nested mobile popups. It checks URL selection, Back/Forward, reload and out-of-batch deep links, native sign-in/sharing forms, invitation redemption, cross-tab account switching, project and Work item creation, explicit placement, human and assistant text, Guest/Viewer scope, unknown admission, lost replies after real admission, cross-Work-item recovery, exact input text, stale responses, sign-out, revocation, keyboard dialog behavior, Web Storage, mobile navigation, temporary offline recovery, and real lists/history larger than 100 records. A second owned local Factory has no runtime adapter; it verifies that status 503 does not disconnect its authorized catalog/history and that exact-ID limits are explicit.
 
 It uses the existing local Chrome executable on macOS. Set `UZINA_WEB_BROWSER_EXECUTABLE` to use another installed Chromium executable. It does not download a browser or use a personal browser profile. Screenshots are written to `.impeccable/review/`.
 

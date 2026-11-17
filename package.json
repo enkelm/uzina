@@ -8,8 +8,10 @@
     "apps/*"
   ],
   "scripts": {
-    "format": "prettier --write \"README.md\" \"GLOSSARY.md\" \"plans/**/*.md\" \"apps/**/{README,PRODUCT,DESIGN}.md\" \"packages/**/README.md\" \"package.json\" \"tsconfig.json\" \"apps/**/*.{ts,tsx,css,html}\" \"apps/**/{package,tsconfig}.json\" \"packages/**/*.ts\" \"packages/**/package.json\" \"packages/**/tsconfig*.json\"",
-    "check": "prettier --check \"README.md\" \"GLOSSARY.md\" \"plans/**/*.md\" \"apps/**/{README,PRODUCT,DESIGN}.md\" \"packages/**/README.md\" \"package.json\" \"tsconfig.json\" \"apps/**/*.{ts,tsx,css,html}\" \"apps/**/{package,tsconfig}.json\" \"packages/**/*.ts\" \"packages/**/package.json\" \"packages/**/tsconfig*.json\"",
+    "format": "oxfmt --write .",
+    "format:check": "oxfmt --check .",
+    "lint": "oxlint --deny-warnings apps packages",
+    "check": "bun run lint && bun run format:check",
     "typecheck": "tsc --noEmit",
     "test": "bun test packages apps",
     "build": "bun run build:daemon && bun run build:cloudflare && bun run build:web",
@@ -22,8 +24,9 @@
   },
   "devDependencies": {
     "@types/bun": "^1.2.21",
-    "prettier": "^3.6.2",
-    "typescript": "^5.9.2",
+    "oxfmt": "0.79.0",
+    "oxlint": "1.94.0",
+    "typescript": "7.0.2",
     "wrangler": "^4.34.0"
   }
 }

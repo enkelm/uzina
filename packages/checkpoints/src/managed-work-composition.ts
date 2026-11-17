@@ -32,7 +32,7 @@ export const MANAGED_WORK_ARTIFACT_MEDIA_TYPE =
 
 export const MANAGED_WORK_RUNTIME_REQUIREMENTS = [
   "managed-work-profile:quiescent-current-documents-no-forks-v1",
-  "pi-durable:1.4.0",
+  "pi-durable:1.5.2",
 ] as const;
 const MANIFEST_MAX_BYTES = PORTABLE_WORKSPACE_MANIFEST_MAX_BYTES;
 const HARD_LIMITS = {
@@ -60,7 +60,11 @@ export interface ManagedWorkBundleManifest {
 type ManagedWorkBundleBody = Omit<ManagedWorkBundleManifest, "sha256">;
 
 export type ManagedWorkCheckpointArtifactRole =
-  "runtime" | "evidence" | "attachment" | "inner-manifest" | "outer-manifest";
+  | "runtime"
+  | "evidence"
+  | "attachment"
+  | "inner-manifest"
+  | "outer-manifest";
 
 export interface ManagedWorkCheckpointArtifactReference {
   role: ManagedWorkCheckpointArtifactRole;

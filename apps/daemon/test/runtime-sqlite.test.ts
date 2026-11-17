@@ -23,7 +23,20 @@ describe("Bun SQLite async facade", () => {
         "CREATE TABLE binding_test (id INTEGER, payload BLOB)",
       );
       const bytes = new Uint8Array([0, 1, 127, 255]);
-      await database.run("INSERT INTO binding_test VALUES (?, ?)", 42n, bytes);
+      expect(
+        await database.runCounted(
+          "INSERT INTO binding_test VALUES (?, ?)",
+          42n,
+          bytes,
+        ),
+      ).toBe(1);
+      expect(
+        await database.runCounted(
+          "UPDATE binding_test SET id = ? WHERE id = ?",
+          43,
+          99,
+        ),
+      ).toBe(0);
       const row = await database.get<{
         id: number | bigint;
         payload: Uint8Array;
@@ -44,7 +57,8 @@ describe("Bun SQLite async facade", () => {
     const entered = deferred();
     const release = deferred();
     let transactionExecutor:
-      Parameters<Parameters<typeof database.transaction>[0]>[0] | undefined;
+      | Parameters<Parameters<typeof database.transaction>[0]>[0]
+      | undefined;
     try {
       await database.exec("CREATE TABLE queue_test (value INTEGER)");
       const transaction = database.transaction(async (executor) => {
@@ -52,7 +66,15 @@ describe("Bun SQLite async facade", () => {
         await executor.run("INSERT INTO queue_test VALUES (1)");
         entered.resolve();
         await release.promise;
-        await executor.run("INSERT INTO queue_test VALUES (2)");
+        expect(
+          await executor.runCounted("INSERT INTO queue_test VALUES (2)"),
+        ).toBe(1);
+        expect(
+          await executor.runCounted(
+            "DELETE FROM queue_test WHERE value = ?",
+            99,
+          ),
+        ).toBe(0);
       });
       await entered.promise;
       let outsideFinished = false;
@@ -69,7 +91,7 @@ describe("Bun SQLite async facade", () => {
         await database.all("SELECT value FROM queue_test ORDER BY value"),
       ).toEqual([{ value: 1 }, { value: 2 }, { value: 3 }]);
       await expect(
-        transactionExecutor?.run("INSERT INTO queue_test VALUES (4)"),
+        transactionExecutor?.runCounted("INSERT INTO queue_test VALUES (4)"),
       ).rejects.toThrow("no longer active");
     } finally {
       release.resolve();
@@ -87,7 +109,11 @@ describe("Bun SQLite async facade", () => {
       await database.exec("CREATE TABLE rollback_test (value INTEGER)");
       await expect(
         database.transaction(async (transaction) => {
-          await transaction.run("INSERT INTO rollback_test VALUES (9)");
+          expect(
+            await transaction.runCounted(
+              "INSERT INTO rollback_test VALUES (9)",
+            ),
+          ).toBe(1);
           throw failure;
         }),
       ).rejects.toBe(failure);

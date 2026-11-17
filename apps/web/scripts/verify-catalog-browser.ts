@@ -4,6 +4,7 @@ import type { Browser, BrowserContext } from "playwright";
 import { createServer, type ViteDevServer } from "vite";
 import { FactoryClient } from "@uzina/client";
 import { factoryThreadSchema } from "@uzina/contracts/factory";
+import { chooseSelect } from "./browser-controls";
 import {
   createLocalFactoryServer,
   type LocalFactoryServer,
@@ -23,6 +24,7 @@ export async function verifyCatalogWithoutRuntime(
   let vite: ViteDevServer | undefined;
   let context: BrowserContext | undefined;
   let primary: unknown;
+  const failures: unknown[] = [];
   try {
     host = createLocalFactoryServer({
       databasePath: join(directory, "catalog-only.sqlite"),
@@ -68,6 +70,10 @@ export async function verifyCatalogWithoutRuntime(
     vite = await createServer({
       root: process.cwd(),
       configFile: resolve("vite.config.ts"),
+      optimizeDeps: {
+        entries: ["src/main.tsx"],
+        include: ["@ui-sdk/react/agent"],
+      },
       server: {
         host: "127.0.0.1",
         port: 0,
@@ -106,12 +112,8 @@ export async function verifyCatalogWithoutRuntime(
     await page
       .getByLabel("Work item name", { exact: true })
       .fill("Last-known catalog work");
-    await page
-      .getByLabel("Execution node", { exact: true })
-      .selectOption(target.nodeId);
-    await page
-      .getByLabel("Workspace", { exact: true })
-      .selectOption(target.workspaceId);
+    await chooseSelect(page, "Execution node", /^Catalog node · /);
+    await chooseSelect(page, "Workspace", workspace.name);
     const creation = page.waitForResponse(
       (response) =>
         response.request().method() === "POST" &&
@@ -196,7 +198,6 @@ export async function verifyCatalogWithoutRuntime(
   } catch (error) {
     primary = error;
   } finally {
-    const failures: unknown[] = [];
     try {
       await context?.close();
     } catch (error) {
@@ -217,10 +218,10 @@ export async function verifyCatalogWithoutRuntime(
     } catch (error) {
       failures.push(error);
     }
-    if (primary || failures.length)
-      throw new AggregateError(
-        primary ? [primary, ...failures] : failures,
-        "Owned catalog-only browser scenario failed (all cleanup attempted)",
-      );
   }
+  if (primary || failures.length)
+    throw new AggregateError(
+      primary ? [primary, ...failures] : failures,
+      "Owned catalog-only browser scenario failed (all cleanup attempted)",
+    );
 }

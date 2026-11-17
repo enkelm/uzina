@@ -964,7 +964,8 @@ describe("workspace snapshot transport in production-shaped workerd + R2", () =>
       { kind: "status" },
     );
     let runtimeFirstAdmission:
-      { response: Response; value: { error?: string } } | undefined;
+      | { response: Response; value: { error?: string } }
+      | undefined;
     let coldOpenStatus: number | undefined;
     try {
       await until(

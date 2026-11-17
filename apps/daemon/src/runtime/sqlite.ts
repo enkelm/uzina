@@ -37,6 +37,10 @@ export class BunSqliteDatabase implements SqliteDatabase {
     });
   }
 
+  runCounted(sql: string, ...params: SqliteValue[]): Promise<number> {
+    return this.enqueue(() => this.database.query(sql).run(...params).changes);
+  }
+
   get<T extends object>(
     sql: string,
     ...params: SqliteValue[]
@@ -69,6 +73,10 @@ export class BunSqliteDatabase implements SqliteDatabase {
         run: async (sql, ...params) => {
           assertActive();
           this.database.query(sql).run(...params);
+        },
+        runCounted: async (sql, ...params) => {
+          assertActive();
+          return this.database.query(sql).run(...params).changes;
         },
         get: async <Row extends object>(
           sql: string,

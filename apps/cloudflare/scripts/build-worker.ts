@@ -10,7 +10,7 @@ const piAiDist = dirname(piAiEntry);
 const piAiPackage = JSON.parse(
   await readFile(join(piAiDist, "../package.json"), "utf8"),
 ) as { version?: string };
-const expectedPiAiVersion = "1.4.0";
+const expectedPiAiVersion = "1.5.2";
 if (piAiPackage.version !== expectedPiAiVersion) {
   throw new Error(
     `Cloudflare provider compatibility is pinned to Pi AI ${expectedPiAiVersion}; found ${piAiPackage.version ?? "unknown"}`,

@@ -1,4 +1,6 @@
 import { defineConfig } from "vite";
+import { tanstackStart } from "@tanstack/react-start/plugin/vite";
+import viteReact from "@vitejs/plugin-react";
 
 const target = process.env.UZINA_WEB_API_ORIGIN ?? "http://127.0.0.1:8788";
 const origin = new URL(target);
@@ -17,6 +19,7 @@ if (
   );
 
 export default defineConfig({
+  plugins: [tanstackStart({ spa: { enabled: true } }), viteReact()],
   server: {
     host: "127.0.0.1",
     proxy: Object.fromEntries(

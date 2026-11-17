@@ -1,6 +1,7 @@
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { gunzipSync } from "node:zlib";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
   createRegistry,
@@ -10,6 +11,7 @@ import {
   type ConversationId,
   type DocumentId,
 } from "@earendil-works/pi-durable";
+import { MemoryStorage } from "@earendil-works/pi-durable/storage/memory";
 import { ManagedPiWork } from "@uzina/pi-runtime";
 import {
   exportManagedWorkCheckpoint,
@@ -96,6 +98,55 @@ describe("local managed Pi runtime", () => {
       expect(provider.requests()).toBe(1);
     } finally {
       await work.close().catch(() => {});
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("opens a genuine Pi Durable 1.4.0 store without replaying settled work", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "uzina-pi-upgrade-"));
+    const databasePath = join(directory, "managed.sqlite");
+    const provider = deterministicModels(
+      "answer after upgrading to Pi Durable 1.5.2",
+    );
+    let work: ManagedPiWork | undefined;
+    try {
+      const fixture = await readFile(
+        new URL("./fixtures/pi-durable-1.4.0.sqlite.gz", import.meta.url),
+      );
+      await writeFile(databasePath, gunzipSync(fixture));
+      work = await openLocalManagedPiWork(databasePath, {
+        models: provider.models,
+      });
+      expect(await work.openRoot()).toBe(ROOT_CONVERSATION_ID);
+      expect((await work.context()).messages).toMatchObject([
+        { role: "user", content: "keep this pre-upgrade request" },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "persisted by Pi Durable 1.4.0" }],
+        },
+      ]);
+      expect(await work.submission("legacy-request")).toMatchObject({
+        id: 8,
+        status: "done",
+      });
+      await work.resume();
+      expect(
+        await work.submit("legacy-request", "keep this pre-upgrade request"),
+      ).toMatchObject({ submissionId: 8 });
+      expect(provider.requests()).toBe(0);
+      await work.submit("post-upgrade-request", "continue after the upgrade");
+      expect(
+        (await work.waitForSubmission("post-upgrade-request")).status,
+      ).toBe("done");
+      expect((await work.context()).messages.at(-1)).toMatchObject({
+        role: "assistant",
+        content: [
+          { type: "text", text: "answer after upgrading to Pi Durable 1.5.2" },
+        ],
+      });
+      expect(provider.requests()).toBe(1);
+    } finally {
+      await work?.close();
       await rm(directory, { recursive: true, force: true });
     }
   });
@@ -195,10 +246,13 @@ describe("local managed Pi runtime", () => {
       join(directory, "non-root.sqlite"),
     );
     try {
-      await storage.commit(
-        [{ type: "conversation", value: { id: 2 as ConversationId } }],
-        BACKGROUND_CONTEXT,
-      );
+      expect(
+        await storage.commit(
+          [[{ type: "conversation", value: { id: 2 as ConversationId } }]],
+          () => {},
+          BACKGROUND_CONTEXT,
+        ),
+      ).toMatchObject({ stored: 1 });
       await expect(
         exportManagedWorkCheckpoint(storage, 2 as ConversationId),
       ).rejects.toBeInstanceOf(UnsupportedCheckpointState);
@@ -219,10 +273,13 @@ describe("local managed Pi runtime", () => {
       join(directory, "destination.sqlite"),
     );
     try {
-      await sourceStorage.commit(
-        [{ type: "conversation", value: { id: ROOT_CONVERSATION_ID } }],
-        BACKGROUND_CONTEXT,
-      );
+      expect(
+        await sourceStorage.commit(
+          [[{ type: "conversation", value: { id: ROOT_CONVERSATION_ID } }]],
+          () => {},
+          BACKGROUND_CONTEXT,
+        ),
+      ).toMatchObject({ stored: 1 });
       const checkpoint = await exportManagedWorkCheckpoint(
         sourceStorage,
         ROOT_CONVERSATION_ID,
@@ -264,35 +321,47 @@ describe("local managed Pi runtime", () => {
       join(directory, "destination.sqlite"),
     );
     try {
-      await sourceStorage.commit(
-        [{ type: "conversation", value: { id: ROOT_CONVERSATION_ID } }],
-        BACKGROUND_CONTEXT,
-      );
+      expect(
+        await sourceStorage.commit(
+          [[{ type: "conversation", value: { id: ROOT_CONVERSATION_ID } }]],
+          () => {},
+          BACKGROUND_CONTEXT,
+        ),
+      ).toMatchObject({ stored: 1 });
       const checkpoint = await exportManagedWorkCheckpoint(
         sourceStorage,
         ROOT_CONVERSATION_ID,
       );
 
       const documentId = await destinationStorage.mintId<DocumentId>();
-      await destinationStorage.commit(
-        [
-          {
-            type: "document.create",
-            record: {
-              id: documentId,
-              kind: "orphan.checkpoint-test",
-              scope: {
-                kind: "conversation",
-                conversationId: 88 as ConversationId,
+      expect(
+        await destinationStorage.commit(
+          [
+            [
+              {
+                type: "document.create",
+                record: {
+                  id: documentId,
+                  kind: "orphan.checkpoint-test",
+                  scope: {
+                    kind: "conversation",
+                    conversationId: 88 as ConversationId,
+                  },
+                  history: "latest",
+                  fork: "current",
+                },
+                content: {
+                  kind: "base",
+                  version: 1,
+                  value: { retained: true },
+                },
               },
-              history: "latest",
-              fork: "current",
-            },
-            content: { kind: "base", version: 1, value: { retained: true } },
-          },
-        ],
-        BACKGROUND_CONTEXT,
-      );
+            ],
+          ],
+          () => {},
+          BACKGROUND_CONTEXT,
+        ),
+      ).toMatchObject({ stored: 1 });
 
       await expect(
         importManagedWorkCheckpoint(destinationStorage, checkpoint),
@@ -369,6 +438,27 @@ describe("local managed Pi runtime", () => {
         expect(provider.requests()).toBe(1);
       } finally {
         await destination.close();
+      }
+
+      const refusal = new Error("The destination refused the checkpoint batch");
+      class RefusingStorage extends MemoryStorage {
+        override async commit() {
+          return { stored: 0, refused: refusal };
+        }
+      }
+      const refusedStorage = new RefusingStorage();
+      try {
+        await expect(
+          importManagedWorkCheckpoint(refusedStorage, checkpoint),
+        ).rejects.toBe(refusal);
+        expect(
+          await refusedStorage.conversation(
+            ROOT_CONVERSATION_ID,
+            BACKGROUND_CONTEXT,
+          ),
+        ).toBeUndefined();
+      } finally {
+        await refusedStorage.close(BACKGROUND_CONTEXT);
       }
 
       const corruptStorage = await openBunSqliteStorage(

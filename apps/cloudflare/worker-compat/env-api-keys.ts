@@ -1,4 +1,4 @@
-/** Pi AI 1.4.0 constants without native dynamic imports. Worker auth comes only from secret bindings. */
+/** Pi AI 1.5.2 constants without native dynamic imports. Worker auth comes only from secret bindings. */
 export const ANTHROPIC_AUTH_TOKEN_ENV = "ANTHROPIC_AUTH_TOKEN";
 export const ANTHROPIC_OAUTH_TOKEN_ENV = "ANTHROPIC_OAUTH_TOKEN";
 export const ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY";

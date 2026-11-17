@@ -681,7 +681,7 @@ export function portableWorkspaceBlobReferences(
       }
     }
     if (entry.kind === "symlink") {
-      const targetParts = [...parts.slice(0, -1)];
+      const targetParts = parts.slice(0, -1);
       for (const segment of entry.linkTarget.split("/")) {
         if (segment === "" || segment === ".") continue;
         if (segment === "..") targetParts.pop();
@@ -743,6 +743,7 @@ function portablePath(value: unknown): string {
         part === "." ||
         part === ".." ||
         part.toLowerCase() === ".git" ||
+        // oxlint-disable-next-line no-control-regex -- Portable paths must reject control characters.
         /[\u0000-\u001f\u007f]/.test(part) ||
         /[<>:"|?*]/.test(part) ||
         /[. ]$/.test(part) ||
@@ -763,7 +764,7 @@ function containedSymlinkTarget(path: string, target: string): boolean {
     /^[A-Za-z]:/.test(target)
   )
     return false;
-  const parts = [...path.split("/").slice(0, -1)];
+  const parts = path.split("/").slice(0, -1);
   for (const segment of target.split("/")) {
     if (segment === "" || segment === ".") continue;
     if (segment === "..") {

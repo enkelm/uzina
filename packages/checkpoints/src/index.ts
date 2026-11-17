@@ -1830,7 +1830,8 @@ function validateRelativePath(path: string): string | null {
         !part ||
         part === "." ||
         part === ".." ||
-        /[\x00-\x1f<>:\"|?*]/.test(part) ||
+        // oxlint-disable-next-line no-control-regex -- Portable paths must reject control characters.
+        /[\x00-\x1f<>:"|?*]/.test(part) ||
         /[. ]$/.test(part) ||
         /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i.test(part),
     )

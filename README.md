@@ -46,7 +46,7 @@ wrangler versions secret put UZINA_OWNER_TOKEN
 wrangler versions secret put UZINA_PROVIDER_CREDENTIALS
 ```
 
-`bun run build:cloudflare` creates the pinned Pi AI 1.4.0 compatibility bundle that replaces unsupported Worker host-auth/OAuth/native-environment helper modules; Miniflare and Wrangler consume the same generated entry. Wrangler's dry-run validates the artifact and prints the bound Durable Object classes. This is not a deployment. Do not enable a public `workers.dev` human interface as a substitute for protected ingress. Slice 6 adds persistent Owner, Guest, and Viewer access through scoped project/thread grants, invitations, participant administration, and separate thread discussion. Those scoped-access APIs remain inside one Factory and do not add workforce roles/assignments, email/password login, or federation. The separate web UI above uses those same access checks.
+`bun run build:cloudflare` creates the pinned Pi AI 1.5.2 compatibility bundle that replaces unsupported Worker host-auth/OAuth/native-environment helper modules; Miniflare and Wrangler consume the same generated entry. Wrangler's dry-run validates the artifact and prints the bound Durable Object classes. This is not a deployment. Do not enable a public `workers.dev` human interface as a substitute for protected ingress. Slice 6 adds persistent Owner, Guest, and Viewer access through scoped project/thread grants, invitations, participant administration, and separate thread discussion. Those scoped-access APIs remain inside one Factory and do not add workforce roles/assignments, email/password login, or federation. The separate web UI above uses those same access checks.
 
 ## Scoped collaboration and access (slice 6)
 
@@ -91,6 +91,8 @@ The source Owner must separately gather the authorized bundle files and supply t
 Same-ID retries verify existing prepared output and retain the original receipt; changed output becomes uncertain without repair or renewed proof. Status GET reports last committed evidence, not a continuous filesystem audit. Durable destination reservations survive disabled/changed import configuration, and shutdown joins finite in-flight imports. These are managed-host safeguards, not an OS sandbox. Source-trust/retirement and local activation remain separate, unimplemented checkpoints.
 
 ## Verification
+
+The workspace uses TypeScript 7.0.2, Pi/Durable/Chord 1.5.2, Oxlint for correctness checks, and Oxfmt instead of Prettier. `bun run check` runs lint and format checks; `bun run format` applies formatting. The web app uses React 19 with TanStack Start and Router, with ui-sdk installed for new UI work. Dependency versions and the Bun lockfile are committed together.
 
 ```sh
 bun install --frozen-lockfile

@@ -1,4 +1,4 @@
-/** Pi AI 1.4.0 host discovery is unavailable in Workers; credentials are injected explicitly. */
+/** Pi AI 1.5.2 host discovery is unavailable in Workers; credentials are injected explicitly. */
 export function defaultProviderAuthContext() {
   return {
     async env(_name: string) {

@@ -1,4 +1,5 @@
-import type { Context, JsonValue } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
+import type { JsonValue } from "@earendil-works/chord/json";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
   ROOT_CONVERSATION_ID,
@@ -1038,9 +1039,15 @@ export async function importManagedWorkCheckpoint(
       },
     })),
   ];
-  await guardedStorageEffect(beforeAndAfterEffect, () =>
-    storage.commit(writes, context),
+  const result = await guardedStorageEffect(beforeAndAfterEffect, () =>
+    storage.commit([writes], () => {}, context),
   );
+  if (result.stored !== 1) {
+    throw (
+      result.refused ??
+      new Error("Managed-work checkpoint import was not stored")
+    );
+  }
   return {
     rootConversationId: checkpoint.rootConversationId,
     imported: writes.length,

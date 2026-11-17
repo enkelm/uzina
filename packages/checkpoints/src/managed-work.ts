@@ -52,7 +52,7 @@ export type {
 
 const RUNTIME_REQUIREMENTS = [
   "managed-work-profile:quiescent-current-documents-no-forks-v1",
-  "pi-durable:1.4.0",
+  "pi-durable:1.5.2",
 ] as const;
 const PREPARED_RECEIPT_FORMAT = "uzina-prepared-managed-work-restore" as const;
 

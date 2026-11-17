@@ -181,6 +181,7 @@ describe("managed provider configuration", () => {
       .find((candidate) => candidate.id === "gpt-4o-mini");
     expect(model).toBeDefined();
     class ThrowingStream extends AssistantMessageEventStream {
+      // oxlint-disable-next-line require-yield -- Exercise a source that fails before its first event.
       override async *[Symbol.asyncIterator](): AsyncGenerator<
         AssistantMessageEvent,
         void,
@@ -217,6 +218,7 @@ describe("managed provider configuration", () => {
       .find((candidate) => candidate.id === "gpt-4o-mini");
     expect(model).toBeDefined();
     class ThrowingStream extends AssistantMessageEventStream {
+      // oxlint-disable-next-line require-yield -- Exercise an aborted source that fails before its first event.
       override async *[Symbol.asyncIterator](): AsyncGenerator<
         AssistantMessageEvent,
         void,
