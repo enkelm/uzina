@@ -89,8 +89,14 @@ export async function verifyCatalogWithoutRuntime(
     await page.goto(`http://127.0.0.1:${address.port}/`, {
       waitUntil: "networkidle",
     });
-    await page.getByLabel("Human credential", { exact: true }).fill(credential);
-    await page.getByRole("button", { name: "Connect", exact: true }).click();
+    const signIn = await page.request.post(
+      new URL("/login", host.server.url).href,
+      { form: { token: credential }, maxRedirects: 0 },
+    );
+    assert.equal(signIn.status(), 303);
+    await page
+      .getByRole("button", { name: "Check sign-in", exact: true })
+      .click();
     await page
       .getByRole("navigation", { name: "Work items", exact: true })
       .waitFor();

@@ -41,7 +41,8 @@ export type FactoryFetch = (
 
 export interface FactoryClientOptions {
   baseUrl: string | URL;
-  credential: string;
+  /** Omit for same-origin browser HttpOnly sessions. */
+  credential?: string;
   fetch?: FactoryFetch;
 }
 
@@ -157,7 +158,8 @@ async function readBoundedResponseBytes(
 export class FactoryClient {
   readonly #baseUrl: URL;
   readonly #origin: string;
-  readonly #credential: string;
+  readonly #credential: string | undefined;
+  #sessionCredentialId: string | undefined;
   readonly #fetch: FactoryFetch;
 
   constructor(options: FactoryClientOptions) {
@@ -174,7 +176,10 @@ export class FactoryClient {
         "Factory baseUrl must be an origin URL without credentials or a path",
       );
     }
-    if (!options.credential.trim() || /\s/.test(options.credential)) {
+    if (
+      options.credential !== undefined &&
+      (!options.credential.trim() || /\s/.test(options.credential))
+    ) {
       throw new TypeError("Factory credential must be a nonempty bearer token");
     }
     this.#baseUrl = baseUrl;
@@ -184,7 +189,21 @@ export class FactoryClient {
   }
 
   async me(options: RequestOptions = {}) {
-    return this.#get("/v1/me", meResponseSchema, options.signal);
+    const identity = await this.#get(
+      "/v1/me",
+      meResponseSchema,
+      options.signal,
+    );
+    if (this.#credential === undefined) {
+      if (
+        this.#sessionCredentialId !== undefined &&
+        this.#sessionCredentialId !== identity.credentialId
+      ) {
+        throw new FactoryClientError(401, "session_changed");
+      }
+      this.#sessionCredentialId = identity.credentialId;
+    }
+    return identity;
   }
 
   async getPrivateAssistantStatus(options: RequestOptions = {}) {
@@ -407,8 +426,13 @@ export class FactoryClient {
       response = await fetchRequest(url, {
         method,
         redirect: "error",
+        credentials: this.#credential === undefined ? "same-origin" : "omit",
         headers: {
-          authorization: `Bearer ${this.#credential}`,
+          ...(this.#credential
+            ? { authorization: `Bearer ${this.#credential}` }
+            : this.#sessionCredentialId
+              ? { "x-uzina-session": this.#sessionCredentialId }
+              : {}),
           ...(body === undefined ? {} : { "content-type": "application/json" }),
         },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),

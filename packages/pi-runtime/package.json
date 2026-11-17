@@ -8,6 +8,7 @@
     "./checkpoint": "./src/checkpoint.ts",
     "./tools": "./src/tools.ts",
     "./provider": "./src/provider.ts",
+    "./provider-errors": "./src/provider-errors.ts",
     "./worker-provider": "./src/worker-provider.ts",
     "./work": "./src/work.ts",
     "./model-config": "./src/model-config.ts",

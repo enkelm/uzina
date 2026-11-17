@@ -119,6 +119,7 @@ export interface FactoryRpc {
     authorized: boolean;
     status: number;
     code: string;
+    credentialId?: string;
   }>;
 }
 
@@ -131,9 +132,12 @@ export interface PrivateAssistantRpc {
 
 export interface FactoryDurableObjectEnvironment {
   UZINA_BOOTSTRAP_SECRET?: string;
+  /** Encrypted Worker secret for pi-coop-style owner sign-in links; no bootstrap request needed. */
+  UZINA_OWNER_TOKEN?: string;
   UZINA_MODEL_PROVIDER?: string;
   UZINA_MODEL_ID?: string;
   UZINA_MODEL_API_KEY?: string;
+  UZINA_PROVIDER_CREDENTIALS?: string;
   FACTORY: {
     idFromName(name: string): unknown;
     get(id: unknown): FactoryRpc;
@@ -273,6 +277,7 @@ class DurableObjectFactoryDatabase implements FactoryDatabase {
 /** Core-facing controller logic; the exported Worker Durable Object wrapper adds RPC support. */
 export class FactoryController {
   readonly #factory: FactoryService;
+  readonly #ready: Promise<unknown>;
   readonly #handle: (request: Request) => Promise<Response>;
   readonly #snapshotStorage: R2WorkspaceSnapshotStorage | undefined;
   readonly #exportCheckpoint: (request: {
@@ -292,6 +297,15 @@ export class FactoryController {
       new DurableObjectFactoryDatabase(state.storage),
       environment.UZINA_BOOTSTRAP_SECRET,
     );
+    this.#ready = environment.UZINA_OWNER_TOKEN
+      ? this.#factory
+          .createOwnerSignIn("Factory owner", environment.UZINA_OWNER_TOKEN)
+          .catch((error: unknown) => {
+            // Core revocation wins over the deployment secret, including after eviction.
+            if (error instanceof FactoryError && error.status === 401) return;
+            throw error;
+          })
+      : Promise.resolve();
     this.#publishManagedWorkCheckpoint =
       publishManagedWorkCheckpoint ??
       ((requestId, manifestReference, verification) =>
@@ -380,6 +394,7 @@ export class FactoryController {
   }
 
   async fetch(request: Request): Promise<Response> {
+    await this.#ready;
     const pathname = new URL(request.url).pathname;
     const inputRoute =
       request.method === "POST" &&
@@ -409,10 +424,16 @@ export class FactoryController {
 
   /** Core-authenticated owner gate used by the Worker before private-runtime RPC. */
   async authorizePrivateAssistant(credential: string) {
+    await this.#ready;
     try {
       const session = await this.#factory.authenticate(credential);
       this.#factory.requirePrivateAssistantOwner(session);
-      return { authorized: true, status: 200, code: "authorized" };
+      return {
+        authorized: true,
+        status: 200,
+        code: "authorized",
+        credentialId: session.credentialId,
+      };
     } catch (error) {
       return error instanceof FactoryError
         ? { authorized: false, status: error.status, code: error.code }
@@ -460,6 +481,7 @@ export class FactoryController {
   }
 
   async alarm(): Promise<void> {
+    await this.#ready;
     await this.#armQueueAlarm();
     await this.#dispatchQueued();
   }

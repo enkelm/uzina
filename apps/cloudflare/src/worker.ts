@@ -1,4 +1,8 @@
 import { CONTRACT_VERSION, healthResponseSchema } from "@uzina/contracts";
+import {
+  assertBrowserOrigin,
+  requestCredential,
+} from "@uzina/core/browser-auth";
 import { privateAssistantInputRequestSchema } from "@uzina/contracts/factory";
 import {
   FACTORY_DURABLE_OBJECT_NAME,
@@ -28,13 +32,6 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
-function privateAssistantBearer(request: Request): string | null {
-  const header = request.headers.get("authorization");
-  if (!header) return null;
-  const match = /^Bearer ([^\s]+)$/.exec(header);
-  return match?.[1] ?? null;
-}
-
 function privateAssistantFailure(error: unknown): Response {
   if (
     error &&
@@ -54,7 +51,12 @@ async function privateAssistantRequest(
   request: Request,
   environment: WorkerEnvironment,
 ): Promise<Response> {
-  const credential = privateAssistantBearer(request);
+  try {
+    assertBrowserOrigin(request);
+  } catch {
+    return json({ error: "cross_site_request" }, 403);
+  }
+  const credential = requestCredential(request);
   if (!credential) return json({ error: "unauthorized" }, 401);
   try {
     const factory = environment.FACTORY.get(
@@ -63,6 +65,14 @@ async function privateAssistantRequest(
     const authorization = await factory.authorizePrivateAssistant(credential);
     if (!authorization.authorized) {
       return json({ error: authorization.code }, authorization.status);
+    }
+    const expectedSession = request.headers.get("x-uzina-session");
+    if (
+      !request.headers.has("authorization") &&
+      expectedSession &&
+      expectedSession !== authorization.credentialId
+    ) {
+      return json({ error: "session_changed" }, 401);
     }
     const assistant = environment.PRIVATE_ASSISTANT.get(
       environment.PRIVATE_ASSISTANT.idFromName(

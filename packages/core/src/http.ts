@@ -1,5 +1,10 @@
 import { CONTRACT_VERSION } from "@uzina/contracts";
 import {
+  assertBrowserOrigin,
+  browserAuth,
+  requestCredential,
+} from "./browser-auth";
+import {
   assistantCredentialGrantsRequestSchema,
   bootstrapFactoryRequestSchema,
   captureControlAdmissionRequestSchema,
@@ -167,10 +172,12 @@ export function createFactoryHttpHandler(
       return json({ contractVersion: CONTRACT_VERSION, status: "ok" });
     }
     if (url.pathname === "/v1/mcp") return mcp(request);
-    if (!url.pathname.startsWith("/v1/"))
-      return json({ error: "not_found" }, 404);
-
     try {
+      const signIn = await browserAuth(factory, request);
+      if (signIn) return signIn;
+      if (!url.pathname.startsWith("/v1/"))
+        return json({ error: "not_found" }, 404);
+      assertBrowserOrigin(request);
       if (request.method === "POST" && url.pathname === "/v1/bootstrap") {
         const input = await body(request, bootstrapFactoryRequestSchema);
         const secret = bearer(request, "Bootstrap");
@@ -197,7 +204,7 @@ export function createFactoryHttpHandler(
         );
       }
 
-      const credential = bearer(request);
+      const credential = requestCredential(request);
       if (!credential)
         throw new FactoryError(
           401,
@@ -205,6 +212,14 @@ export function createFactoryHttpHandler(
           "A valid active Bearer credential is required",
         );
       const session = await factory.authenticate(credential);
+      const expectedSession = request.headers.get("x-uzina-session");
+      if (
+        !request.headers.has("authorization") &&
+        expectedSession &&
+        expectedSession !== session.credentialId
+      ) {
+        throw new FactoryError(401, "session_changed");
+      }
       const path = url.pathname;
 
       if (request.method === "POST" && path === "/v1/managed-work-imports") {

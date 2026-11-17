@@ -7,7 +7,10 @@ import {
   createConfiguredModels,
   readManagedModelConfig,
 } from "../src/provider";
-import { createWorkerConfiguredModels } from "../src/worker-provider";
+import {
+  createWorkerConfiguredModels,
+  createWorkerManagedRuntimeOptions,
+} from "../src/worker-provider";
 
 describe("managed provider configuration", () => {
   test("fails closed when any selected provider, model or API credential is missing", async () => {
@@ -36,11 +39,39 @@ describe("managed provider configuration", () => {
     ).rejects.toThrow("provider is not supported");
     await expect(
       createWorkerConfiguredModels({
-        provider: "anthropic",
-        modelId: "claude-3-5-haiku",
+        provider: "unknown-provider",
+        modelId: "unknown-model",
         apiKey: "test-key",
       }),
-    ).rejects.toThrow("support only the OpenAI API-key provider profile");
+    ).rejects.toThrow("other providers are unsupported");
+  });
+
+  test("resolves multiple Worker credentials without machine environment discovery", async () => {
+    const options = await createWorkerManagedRuntimeOptions({
+      UZINA_PROVIDER_CREDENTIALS: JSON.stringify({
+        openai: { type: "api_key", key: "worker-openai-dummy" },
+        anthropic: { type: "api_key", key: "worker-anthropic-dummy" },
+      }),
+    });
+    expect(options.agent.model).toEqual({
+      provider: "openai",
+      modelId: "gpt-4o-mini",
+    });
+    expect((await options.models.getAuth("anthropic"))?.auth.apiKey).toBe(
+      "worker-anthropic-dummy",
+    );
+    expect(options.models.getProvider("google")).toBeUndefined();
+    await expect(
+      createWorkerManagedRuntimeOptions({
+        UZINA_PROVIDER_CREDENTIALS:
+          '{"openai":{"type":"oauth","access":"not-a-worker-key"}}',
+      }),
+    ).rejects.toThrow("OAuth remains local-only");
+    await expect(
+      createWorkerManagedRuntimeOptions({
+        UZINA_PROVIDER_CREDENTIALS: "not-json",
+      }),
+    ).rejects.toThrow("JSON provider credential map");
   });
 
   test("redacts an echoed configured key from local OpenAI SDK errors", async () => {
@@ -159,11 +190,13 @@ describe("managed provider configuration", () => {
       }
     }
     provider.streamSimple = () => new ThrowingStream();
-    const protectedProvider = redactProviderErrors(provider, apiKey);
+    const protectedProvider = redactProviderErrors(provider);
     const context = { messages: [] } as unknown as Parameters<
       typeof provider.streamSimple
     >[1];
-    const failedStream = protectedProvider.streamSimple(model!, context);
+    const failedStream = protectedProvider.streamSimple(model!, context, {
+      apiKey,
+    });
     const events = [];
     for await (const event of failedStream) events.push(event);
     const result = await failedStream.result();

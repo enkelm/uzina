@@ -4,22 +4,31 @@ This composition binds one SQLite-backed `FactoryObject`, one SQLite-backed `Man
 
 ## Configure a protected deployment
 
-`wrangler.toml` sets `workers_dev = false`, declares the Durable Object classes/migration, and selects Pi AI's real `openai` / `gpt-4o-mini` model. Use a custom operator-owned route and protect human Factory traffic with Cloudflare Access or a private gateway. A Tailscale client does not make a public Worker endpoint private. Keep bootstrap, API key, and execution-node credentials distinct.
+`wrangler.toml` sets `workers_dev = false`, declares the Durable Object classes/migration, and selects Pi AI's real `openai` / `gpt-4o-mini` model. Use a custom operator-owned route and protect human Factory traffic with Cloudflare Access or a private gateway. A Tailscale client does not make a public Worker endpoint private. Keep owner sign-in, model, assistant, and execution-node credentials distinct.
 
-From this directory, configure secrets without printing them:
+From this directory, stage secrets without printing them (deployment is a separate operator action):
 
 ```sh
-wrangler secret put UZINA_BOOTSTRAP_SECRET
-wrangler secret put UZINA_MODEL_API_KEY
-wrangler secret put UZINA_PRIVATE_ASSISTANT_BEARER
-wrangler secret put UZINA_PRIVATE_ASSISTANT_CREDENTIAL_ID
-wrangler secret put UZINA_PRIVATE_ASSISTANT_ASSISTANT_ID
-wrangler secret put UZINA_PRIVATE_ASSISTANT_OWNER_ID
+wrangler versions secret put UZINA_OWNER_TOKEN
+wrangler versions secret put UZINA_PROVIDER_CREDENTIALS
 ```
 
-For local workerd development, provide `UZINA_BOOTSTRAP_SECRET` and `UZINA_MODEL_API_KEY` through Wrangler's local secrets mechanism (`.dev.vars`, excluded from source control). This Worker profile supports only the real Pi AI OpenAI API-key provider using Responses; provider and model ID can be set as Worker variables. `createWorkerConfiguredModels()` validates the supported provider, actual catalog model, and stored API-key credential; missing credentials and unsupported providers fail closed. OAuth login/refresh, process environment discovery, and filesystem credential discovery are explicitly unsupported in this Worker. The configured API key is stored in Pi AI's in-memory credential store, not emitted in events/log output. The standalone local Bun host retains the full Pi AI catalog and its separate configured-provider behavior.
+`UZINA_OWNER_TOKEN` is a private random token of at least 32 non-whitespace characters (generate locally with `openssl rand -hex 32`). The Factory initializes its owner from this secret, storing only a hash in SQLite. Open `https://<protected-origin>/login?token=<token>` and confirm sign-in; there is no bootstrap request or UI token field. Keep this link private. Cookie sessions, single-use scoped invitations, and `/sharing` use the same portable handler as the native host. Revocation is checked on every request; a revoked configured token is not re-enabled after eviction.
 
-`bun run build:cloudflare` creates `build/index.js` with the pinned Worker-only Pi AI compatibility plugin and then invokes Wrangler's dry-run build. The same `build/index.js` artifact is used by Miniflare/workerd integration tests. The build checks Pi AI's exact `1.4.0` package version and expected auth-module exports, and fails if either replacement seam is missing. Use `wrangler deploy --dry-run --config wrangler.toml` to inspect the actual class bindings; a dry run does not deploy, create a production namespace, set secrets, configure Access, or prove cloud operation.
+`UZINA_PROVIDER_CREDENTIALS` is a Pi-style provider map, with only credentials this Worker needs. For example (dummy values):
+
+```json
+{
+  "openai": { "type": "api_key", "key": "replace-me" },
+  "anthropic": { "type": "api_key", "key": "replace-me" }
+}
+```
+
+Use a **secret**, never a public Wrangler `vars` entry: [Worker secrets are encrypted text bindings](https://developers.cloudflare.com/workers/configuration/secrets/). No application encryption key or custom credential-ID indirection is needed. The Worker receives plaintext credentials only at runtime in memory. OpenAI, Anthropic, and Google API-key profiles are supported; choose the provider/model with non-secret `UZINA_MODEL_PROVIDER` / `UZINA_MODEL_ID` variables. Without selection, a stored OpenAI `gpt-4o-mini` is preferred, then an available model. Existing `UZINA_MODEL_API_KEY` + explicit provider/model deployments remain supported for compatibility.
+
+For local workerd development, use `.dev.vars` (Git-ignored); these local files are plaintext and must remain private. OAuth login/refresh and machine filesystem/environment discovery remain unsupported on Workers. Local Bun instead reuses Pi's complete native resolver, including existing API-key/OAuth sign-ins and custom model configuration.
+
+`bun run build:cloudflare` creates `build/index.js` with the pinned Worker-only Pi AI compatibility plugin and then invokes Wrangler's dry-run build. The same `build/index.js` artifact is used by Miniflare/workerd integration tests. The build checks Pi AI's exact `1.4.0` package version and expected auth-module exports, and fails if a required replacement seam is missing. The shims cover host-auth context, OAuth loaders, and Anthropic's native environment-helper imports. Use `wrangler deploy --dry-run --config wrangler.toml` to inspect the actual class bindings; a dry run does not deploy, create a production namespace, set secrets, configure Access, or prove cloud operation.
 
 ## Private routes and node setup
 
@@ -27,7 +36,7 @@ For local workerd development, provide `UZINA_BOOTSTRAP_SECRET` and `UZINA_MODEL
 
 ## Owner-private Factory assistant
 
-The owner provisions a named assistant credential through the existing Core owner operation and selects explicit factory-wide or narrower project/thread grants. The host never provisions a token or broadens grants. Keep the returned bearer only in `UZINA_PRIVATE_ASSISTANT_BEARER`; configure the matching non-secret `credentialId`, immutable `assistantId`, and accountable `ownerId` in the protected Worker configuration as shown above. Use dummy values only in local workerd tests. This is independent of owner/browser, node, and model API credentials.
+The owner provisions a named assistant credential through the existing Core owner operation and selects explicit factory-wide or narrower project/thread grants. The host never provisions a token or broadens grants. Keep the returned bearer only in `UZINA_PRIVATE_ASSISTANT_BEARER`; configure the matching non-secret `credentialId`, immutable `assistantId`, and accountable `ownerId` in the protected Worker configuration. Use `wrangler versions secret put` for `UZINA_PRIVATE_ASSISTANT_BEARER`, `UZINA_PRIVATE_ASSISTANT_CREDENTIAL_ID`, `UZINA_PRIVATE_ASSISTANT_ASSISTANT_ID`, and `UZINA_PRIVATE_ASSISTANT_OWNER_ID`; deploy that version separately. Use dummy values only in local workerd tests. This is independent of owner/browser, node, and model API credentials.
 
 The dedicated Durable Object validates that exact identity through the ordinary authenticated Factory HTTP handler using `FactoryClient.me()`. Its custom `factory_*` tools are installed only in the private root; work-thread registries retain their existing remote execution tools and never receive this bearer. The assistant has no native filesystem/argv tools. Tool requests authenticate through Core each time, so current grant changes and revocation apply to subsequent calls. A missing, revoked, mismatched, or temporarily uncheckable assistant credential parks the assistant without affecting unrelated Factory work. The owner can still inspect the existing private history/status/receipts after assistant revocation. The owner-only routes are `/v1/private-assistant/status`, `/context`, `/receipts/:inputId`, and `POST /inputs` with stable `{ inputId, text }`; changed text for a reused ID conflicts.
 
@@ -35,7 +44,7 @@ The runtime pins its persisted assistant identity. Changing bearer identity does
 
 The Worker applies Factory bearer credentials to owner operations/context/events/status. Connected execution daemons use separately provisioned node bearer credentials and initiate outbound registration, heartbeat, claim, and report requests. If Cloudflare Access is fronting the Worker, its policy must allow those node protocol paths without a human Access cookie (for example via a narrowly scoped bypass) while keeping them protected by the route's node credential and rate limits. The node credential is not an owner or model API key. No HTTP path accepts caller-selected execution jobs.
 
-Owner workflow: bootstrap an owner, provision node identities, provision mapped workspaces, and create threads with an explicit target. Submit input only to the assigned thread. `GET /v1/commands/:requestId`, `/v1/events`, and authorized `/context` and `/status` routes surface receipts and canonical model state.
+Owner workflow: open the protected owner sign-in link, provision node identities, provision mapped workspaces, and create threads with an explicit target. Submit input only to the assigned thread. `GET /v1/commands/:requestId`, `/v1/events`, and authorized `/context` and `/status` routes surface receipts and canonical model state.
 
 `POST /v1/mcp` uses the same `FactoryObject` and Core operations as REST. It is the official SDK 1.32.2 Web Standard stateless Streamable HTTP/JSON profile with `Authorization: Bearer <active Factory credential>` on every POST. The stateless server stores no MCP session/auth snapshot; revocation/grant changes apply on subsequent requests. Query-string tokens and cross-origin `Origin` values are rejected; there are no wildcard CORS headers. Tokens are isolated by the single Factory Durable Object credential store and rejected by another Factory. See `packages/core/README.md` for the complete tool list, resource profile, and unsupported lifecycle operations. No execution-node or model-provider request receives this caller credential.
 

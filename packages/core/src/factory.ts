@@ -717,13 +717,75 @@ export class FactoryService {
     ) {
       throw authError();
     }
+    return this.#initializeOwner(name);
+  }
+
+  /** Trusted host startup only; never expose this operation through HTTP/MCP. */
+  async createOwnerSignIn(
+    name = "Factory owner",
+    suppliedCredential?: string,
+  ): Promise<BootstrapResult> {
+    if (suppliedCredential !== undefined) {
+      if (suppliedCredential.length < 32 || /\s/.test(suppliedCredential))
+        throw new Error(
+          "Owner sign-in token must contain at least 32 non-whitespace characters",
+        );
+      const hash = await sha256(suppliedCredential);
+      const existing = this.database.all<CredentialRow>(
+        "SELECT credential_id, actor_json, revoked_at FROM credentials WHERE token_hash = ?",
+        [hash],
+      )[0];
+      if (existing) {
+        const session = await this.authenticate(suppliedCredential);
+        this.#requireOwner(session);
+        return {
+          credentialId: session.credentialId,
+          name,
+          credential: suppliedCredential,
+          actor: session.actor,
+        };
+      }
+    }
+    const owner = this.database.all<{ owner_id: string }>(
+      "SELECT owner_id FROM factory_meta WHERE singleton = 1",
+    )[0];
+    if (!owner) return this.#initializeOwner(name, suppliedCredential);
+    const actor = actorIdentitySchema.parse({
+      contractVersion: CONTRACT_VERSION,
+      kind: "human",
+      userId: owner.owner_id,
+    });
+    const credential = suppliedCredential
+      ? {
+          credentialId: makeId("credential"),
+          name,
+          credential: suppliedCredential,
+          actor,
+          tokenHash: await sha256(suppliedCredential),
+        }
+      : await this.#newCredential(actor, name);
+    this.database.transaction(() => {
+      this.#insertCredentialRows(credential, now());
+    });
+    return {
+      credentialId: credential.credentialId,
+      name,
+      credential: credential.credential,
+      actor,
+    };
+  }
+
+  async #initializeOwner(
+    name: string,
+    suppliedCredential?: string,
+  ): Promise<BootstrapResult> {
     const ownerId = "user:owner";
     const actor = actorIdentitySchema.parse({
       contractVersion: CONTRACT_VERSION,
       kind: "human",
       userId: ownerId,
     });
-    const credential = token("human");
+    const credential = suppliedCredential ?? token("human");
     const tokenHash = await sha256(credential);
     const credentialId = makeId("credential");
     const createdAt = now();
@@ -1096,6 +1158,26 @@ export class FactoryService {
         timestamp,
       );
     });
+  }
+
+  async invitationGrant(code: string) {
+    const codeHash = await sha256(code);
+    const row = this.database.all<InvitationRow>(
+      "SELECT invitation_id, code_hash, role, grants_json, expires_at, redeemed_at, redeemed_by, revoked_at, created_at FROM invitations WHERE code_hash = ?",
+      [codeHash],
+    )[0];
+    if (
+      !row ||
+      row.revoked_at ||
+      row.redeemed_at ||
+      Date.parse(row.expires_at) <= Date.now()
+    ) {
+      throw notFound("Invitation code");
+    }
+    return {
+      role: row.role,
+      grants: accessGrantSchema.array().parse(JSON.parse(row.grants_json)),
+    };
   }
 
   async redeemInvitation(code: string, displayName: string) {

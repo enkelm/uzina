@@ -1,7 +1,4 @@
-import {
-  createConfiguredModels,
-  readManagedModelConfig,
-} from "@uzina/pi-runtime";
+import { createLocalRuntimeOptions } from "./runtime/models";
 import { createDaemonServer } from "./server";
 import { createStandaloneFactoryServer } from "./factory/standalone";
 import { ExecutionDaemon, type WorkspaceMapping } from "./execution/daemon";
@@ -56,12 +53,7 @@ const port = Number(Bun.env.PORT ?? "8788");
 const hostname = Bun.env.HOST ?? "127.0.0.1";
 
 async function startLocalFactory(): Promise<void> {
-  const modelConfig = readManagedModelConfig({
-    UZINA_MODEL_PROVIDER: Bun.env.UZINA_MODEL_PROVIDER,
-    UZINA_MODEL_ID: Bun.env.UZINA_MODEL_ID,
-    UZINA_MODEL_API_KEY: Bun.env.UZINA_MODEL_API_KEY,
-  });
-  const models = await createConfiguredModels(modelConfig);
+  const { models, agent } = await createLocalRuntimeOptions();
   const server = await createStandaloneFactoryServer({
     databasePath: Bun.env.UZINA_FACTORY_DATABASE_PATH,
     runtimeDirectory: Bun.env.UZINA_MANAGED_WORK_DIRECTORY,
@@ -71,16 +63,18 @@ async function startLocalFactory(): Promise<void> {
     managedWorkImportDestinations: optionalPathMappings(
       "UZINA_MANAGED_WORK_IMPORT_DESTINATIONS",
     ),
-    bootstrapSecret: required("UZINA_BOOTSTRAP_SECRET"),
+    ownerSignIn: true,
     models,
-    modelProvider: modelConfig.provider,
-    modelId: modelConfig.modelId,
-    privateAssistant: {
-      bearer: Bun.env.UZINA_PRIVATE_ASSISTANT_BEARER,
-      credentialId: Bun.env.UZINA_PRIVATE_ASSISTANT_CREDENTIAL_ID,
-      assistantId: Bun.env.UZINA_PRIVATE_ASSISTANT_ASSISTANT_ID,
-      ownerId: Bun.env.UZINA_PRIVATE_ASSISTANT_OWNER_ID,
-    },
+    modelProvider: agent.model.provider,
+    modelId: agent.model.modelId,
+    privateAssistant: Bun.env.UZINA_PRIVATE_ASSISTANT_BEARER
+      ? {
+          bearer: Bun.env.UZINA_PRIVATE_ASSISTANT_BEARER,
+          credentialId: Bun.env.UZINA_PRIVATE_ASSISTANT_CREDENTIAL_ID,
+          assistantId: Bun.env.UZINA_PRIVATE_ASSISTANT_ASSISTANT_ID,
+          ownerId: Bun.env.UZINA_PRIVATE_ASSISTANT_OWNER_ID,
+        }
+      : undefined,
     port,
     hostname,
   });
@@ -90,6 +84,11 @@ async function startLocalFactory(): Promise<void> {
   process.once("SIGINT", close);
   process.once("SIGTERM", close);
   console.log(`Uzina standalone Factory listening at ${server.server.url}`);
+  if (server.ownerSignInPath) {
+    console.log(
+      `Owner sign-in (keep private): http://127.0.0.1:5173${server.ownerSignInPath}`,
+    );
+  }
 }
 
 function startConnectedExecutor(): void {

@@ -222,18 +222,148 @@ try {
     waitUntil: "networkidle",
   });
   const connect = async (credential: string) => {
-    await page.getByLabel("Human credential", { exact: true }).fill(credential);
-    await page.getByRole("button", { name: "Connect", exact: true }).click();
+    const signIn = await page.request.post(
+      new URL("/login", host!.server.url).href,
+      { form: { token: credential }, maxRedirects: 0 },
+    );
+    assert.equal(signIn.status(), 303);
+    await page
+      .getByRole("button", { name: "Check sign-in", exact: true })
+      .click();
     await page
       .getByRole("navigation", { name: "Work items", exact: true })
       .waitFor({ state: "visible", timeout: 10_000 });
   };
-  await connect(ownerCredential);
+  await page.goto(
+    `http://127.0.0.1:${address.port}/login?token=${encodeURIComponent(ownerCredential)}`,
+  );
+  await page
+    .getByRole("heading", { name: "Sign in to your Factory", exact: true })
+    .waitFor();
+  await page.screenshot({
+    path: join(output, "sign-in-desktop.png"),
+    fullPage: true,
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.screenshot({
+    path: join(output, "sign-in-mobile.png"),
+    fullPage: true,
+  });
+  const [loginResponse] = await Promise.all([
+    page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname === "/login" &&
+        response.request().method() === "POST",
+    ),
+    page.getByRole("button", { name: "Sign in", exact: true }).click(),
+  ]);
+  assert.equal(
+    loginResponse.status(),
+    303,
+    await loginResponse.text().catch(() => ""),
+  );
+  await page
+    .getByRole("navigation", { name: "Work items", exact: true })
+    .waitFor({ timeout: 10_000 });
+  assert.equal(new URL(page.url()).search, "");
+  await page.setViewportSize({ width: 1440, height: 900 });
   assert.equal(await page.getByText("owner", { exact: true }).count(), 1);
   assert.equal(
     await page.evaluate(() => localStorage.length + sessionStorage.length),
     0,
   );
+
+  // Native sharing pages and invite forms work through the same production proxy/cookie boundary.
+  const [sharingResponse] = await Promise.all([
+    page.waitForResponse(
+      (response) => new URL(response.url()).pathname === "/sharing",
+    ),
+    page.getByRole("link", { name: "Sharing", exact: true }).click(),
+  ]);
+  assert.equal(sharingResponse.status(), 200, await sharingResponse.text());
+  await page
+    .getByLabel("Share", { exact: true })
+    .selectOption(`project|${project.projectId}`);
+  await page
+    .getByRole("button", { name: "Create invitation", exact: true })
+    .click();
+  await page
+    .getByRole("heading", { name: "Invitation ready", exact: true })
+    .waitFor();
+  await page.screenshot({
+    path: join(output, "sharing-desktop.png"),
+    fullPage: true,
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.screenshot({
+    path: join(output, "sharing-mobile.png"),
+    fullPage: true,
+  });
+  assert.equal(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+    true,
+  );
+  const invitationLink = await page
+    .locator('a[href*="/join/"]')
+    .getAttribute("href");
+  const invitedContext = await browser.newContext();
+  try {
+    const invitedPage = await invitedContext.newPage();
+    await invitedPage.goto(invitationLink!);
+    await invitedPage
+      .getByLabel("Your name", { exact: true })
+      .fill("Invited browser viewer");
+    await invitedPage
+      .getByRole("button", { name: "Join Factory", exact: true })
+      .click();
+    await invitedPage.getByText("viewer", { exact: true }).waitFor();
+    assert.equal(
+      await invitedPage
+        .getByRole("link", { name: "Sharing", exact: true })
+        .count(),
+      0,
+    );
+  } finally {
+    await invitedContext.close();
+  }
+  await page
+    .getByRole("link", { name: "Back to Factory", exact: true })
+    .click();
+  await page
+    .getByRole("navigation", { name: "Work items", exact: true })
+    .waitFor();
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  // Cookies are shared across tabs: changing accounts clears the other tab's private state.
+  const otherTab = await context.newPage();
+  try {
+    await otherTab.goto(
+      `http://127.0.0.1:${address.port}/login?token=${encodeURIComponent(viewerCredential)}`,
+    );
+    await otherTab
+      .getByRole("button", { name: "Sign in", exact: true })
+      .click();
+    await otherTab.getByText("viewer", { exact: true }).waitFor();
+    await page.getByText("viewer", { exact: true }).waitFor();
+    assert.equal(
+      await page
+        .getByRole("button", { name: "Create project", exact: true })
+        .count(),
+      0,
+    );
+    await otherTab.goto(
+      `http://127.0.0.1:${address.port}/login?token=${encodeURIComponent(ownerCredential)}`,
+    );
+    await otherTab
+      .getByRole("button", { name: "Sign in", exact: true })
+      .click();
+    await otherTab.getByText("owner", { exact: true }).waitFor();
+    await page.getByText("owner", { exact: true }).waitFor();
+  } finally {
+    await otherTab.close();
+  }
 
   // Owner creates a real project and then a real Work item against the explicit existing target.
   await page
@@ -732,7 +862,9 @@ try {
 
   // Viewer authentication only calls APIs allowed to participants and remains read-only.
   await page.getByRole("button", { name: "Sign out", exact: true }).click();
-  await page.getByLabel("Human credential", { exact: true }).waitFor();
+  await page
+    .getByRole("button", { name: "Check sign-in", exact: true })
+    .waitFor();
   await connect(viewerCredential);
   assert.equal(await page.getByText("viewer", { exact: true }).count(), 1);
   await page
@@ -766,14 +898,16 @@ try {
     .waitFor();
   host.factory.revokeParticipant(owner, viewerSession.actor.userId);
   await page
-    .getByLabel("Human credential", { exact: true })
+    .getByRole("button", { name: "Check sign-in", exact: true })
     .waitFor({ timeout: 15_000 });
   assert.equal(
     await page.getByText("Only Original work", { exact: true }).count(),
     0,
     "Revoked Viewer context must be cleared",
   );
-  await page.getByLabel("Human credential", { exact: true }).waitFor();
+  await page
+    .getByRole("button", { name: "Check sign-in", exact: true })
+    .waitFor();
   await connect(guestCredential);
   await page
     .getByLabel("PROJECT", { exact: true })
@@ -791,7 +925,9 @@ try {
   );
   await page.getByLabel("Message", { exact: true }).fill("private guest draft");
   await page.getByRole("button", { name: "Sign out", exact: true }).click();
-  await page.getByLabel("Human credential", { exact: true }).waitFor();
+  await page
+    .getByRole("button", { name: "Check sign-in", exact: true })
+    .waitFor();
   await connect(ownerCredential);
   await page
     .getByLabel("PROJECT", { exact: true })
@@ -870,7 +1006,9 @@ try {
     "the real Owner identity read before account switch",
   );
   await page.getByRole("button", { name: "Sign out", exact: true }).click();
-  await page.getByLabel("Human credential", { exact: true }).waitFor();
+  await page
+    .getByRole("button", { name: "Check sign-in", exact: true })
+    .waitFor();
   await connect(guestCredential);
   releaseOldMe();
   await within(

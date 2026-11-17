@@ -19,7 +19,12 @@ if (
 export default defineConfig({
   server: {
     host: "127.0.0.1",
-    proxy: { "/v1": { target: origin.origin, changeOrigin: false } },
+    proxy: Object.fromEntries(
+      ["/v1", "/login", "/join", "/sharing"].map((path) => [
+        path,
+        { target: origin.origin, changeOrigin: false },
+      ]),
+    ),
   },
   preview: { host: "127.0.0.1" },
 });

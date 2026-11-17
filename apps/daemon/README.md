@@ -4,26 +4,27 @@ The daemon defaults to `UZINA_MODE=local`, which composes the standalone persist
 
 ## Standalone local Factory
 
-Use Bun 1.4.4. Configure a real Pi AI provider/model and a private bootstrap secret, then run:
+For separate environment files, the owner sign-in link, and node provisioning, follow [local setup](../../docs/local-setup.md). The repository-root `.env.example` configures the Factory; this directory's `.env.example` configures only an Execution node. They must not share credentials or the same listener port on one machine.
+
+Use Bun 1.4.4 and an existing Pi sign-in or provider environment credential, then run:
 
 ```sh
-UZINA_MODE=local \
-UZINA_BOOTSTRAP_SECRET='<private-local-bootstrap-secret>' \
-UZINA_MODEL_PROVIDER=openai \
-UZINA_MODEL_ID=gpt-4o-mini \
-UZINA_MODEL_API_KEY='<provider-api-key>' \
 bun run dev:daemon
 ```
 
-`UZINA_FACTORY_DATABASE_PATH` defaults to `~/.local/share/uzina/factory.sqlite`; `UZINA_MANAGED_WORK_DIRECTORY` defaults to `~/.local/share/uzina/managed-work`. Both can be set to isolated paths for tests or an operator-selected data location. The service defaults to `http://127.0.0.1:8788`. `POST /v1/bootstrap` uses the configured `Bootstrap` bearer secret once; the returned human bearer is distinct from all execution-node credentials.
+No Factory bootstrap secret or separate model key is required. The local host uses the same native `ModelRuntime` as pi-coop: Pi's `auth.json`, `models.json`, settings, and machine environment. `PI_CODING_AGENT_DIR` selects another Pi profile. Optional `UZINA_MODEL_PROVIDER` / `UZINA_MODEL_ID` override selection. Without overrides, an available Pi default is preferred, then another available authenticated model.
 
-Model provider, model ID, and API key are required. Startup validates them against the actual Pi AI provider/model catalog and credential resolver. Missing or unsupported configuration fails closed; production does not install a dummy response model. Secret values are not printed or placed in Factory events. The deterministic model adapters are test-only.
+`UZINA_FACTORY_DATABASE_PATH` defaults to `~/.local/share/uzina/factory.sqlite`; `UZINA_MANAGED_WORK_DIRECTORY` defaults to `~/.local/share/uzina/managed-work`. Both can be set to isolated paths for tests or an operator-selected data location. The service defaults to `http://127.0.0.1:8788`. Startup prints a private owner sign-in link for the default web UI port. Open it and confirm sign-in; browser sessions use HttpOnly cookies, not a pasted Factory secret. The protected `factory.sqlite.owner-token` file holds the local owner bearer; SQLite holds its hash. Existing owner identity and data are retained on restart. Legacy programmatic hosts can still opt into `bootstrapSecret` and `/v1/bootstrap`; the CLI no longer requires them.
+
+No paid/model request is made at startup. Missing usable credentials fail with a sign-in instruction; production never installs a dummy response model. Model credentials are not printed or placed in Factory events. The console's owner link is itself a credential and must remain private.
 
 ## Owner-private Factory assistant
 
 The standalone host always keeps the private assistant in a dedicated `private-assistant/` directory (mode `0700`) beneath `UZINA_MANAGED_WORK_DIRECTORY`, separate from each per-thread Pi database. Its SQLite files and WAL remain inside this owner-only directory. It is not a Factory work thread, has no project/node/workspace placement, and is not included in managed-work checkpoint bundles.
 
-The owner first provisions a named `assistant` credential and an explicit grant set through the existing owner credential/grant operations. The assistant's grants—not the human owner's authority—control its Factory tools. Install the returned bearer into the protected local process environment and configure all expected non-secret identity fields:
+By default, native startup provisions a separate named `assistant` credential with its own factory-wide grant and stores its bearer/identity in `factory.sqlite.assistant-identity` (mode `0600`). A restart reuses it. Revoking it parks the assistant; startup does not replace a revoked persisted identity. Owners can narrow its grants through the existing grant API. An explicitly supplied private-assistant configuration overrides this automatic setup.
+
+For operator-managed identity, the owner first provisions a named `assistant` credential and an explicit grant set through the existing owner credential/grant operations. The assistant's grants—not the human owner's authority—control its Factory tools. Install the returned bearer into the protected local process environment and configure all expected non-secret identity fields:
 
 ```sh
 UZINA_PRIVATE_ASSISTANT_BEARER='<operator-installed-assistant-bearer>' \
@@ -33,7 +34,7 @@ UZINA_PRIVATE_ASSISTANT_OWNER_ID='user:...' \
 bun run dev:daemon
 ```
 
-Do not put that bearer in a browser, node, model/provider, database, transcript, Pi memo, event, checkpoint, or command line visible to other users. The service reads it only from the protected host environment. The assistant validates the active bearer through authenticated Factory `GET /v1/me`, pins the exact credential/assistant/owner identity in its private metadata store, and calls Factory only through the same-origin authenticated client. Each Core tool request checks current revocation and grants. If configuration is incomplete, revoked, mismatched, or temporarily uncheckable, status reports `parked` and the assistant does not start/resume tool-capable tasks; ordinary Factory work remains available. Owner-private context and receipt reads remain available after assistant revocation. Changing credential identity parks the existing transcript; transcript adoption and credential rotation are unsupported and never inferred. Preserve the store and do not silently point a different assistant bearer at it.
+Do not put that bearer in a browser, node, model/provider, database, transcript, Pi memo, event, checkpoint, or command line visible to other users. The service reads it only from its protected local identity file or explicit host configuration. The assistant validates the active bearer through authenticated Factory `GET /v1/me`, pins the exact credential/assistant/owner identity in its private metadata store, and calls Factory only through the same-origin authenticated client. Each Core tool request checks current revocation and grants. If configuration is incomplete, revoked, mismatched, or temporarily uncheckable, status reports `parked` and the assistant does not start/resume tool-capable tasks; ordinary Factory work remains available. Owner-private context and receipt reads remain available after assistant revocation. Changing credential identity parks the existing transcript; transcript adoption and credential rotation are unsupported and never inferred. Preserve the store and do not silently point a different assistant bearer at it.
 
 Owner-only ingress is `POST /v1/private-assistant/inputs` with stable `{ inputId, text }`, `GET /v1/private-assistant/status`, `GET /v1/private-assistant/context`, and `GET /v1/private-assistant/receipts/:inputId`. Identical IDs/text reuse the durable Pi submission; changed text conflicts. The assistant uses explicit-target `factory_*` coordination tools only in this private registry. Ordinary managed coding threads retain their existing remote file/argv tools and do not receive Factory control-plane tools or the assistant credential. Stop, native resume/CLI, and transfer remain unsupported.
 

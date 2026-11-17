@@ -137,7 +137,8 @@ function Modal({
 }
 
 function App() {
-  const [credential, setCredential] = useState("");
+  const [sessionActive, setSessionActive] = useState(true);
+  const [sessionEpoch, setSessionEpoch] = useState(0);
   const [identity, setIdentity] = useState<Identity | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
@@ -209,6 +210,7 @@ function App() {
   const aborts = useRef(new Set<AbortController>());
   const inputAborts = useRef(new Map<string, Set<AbortController>>());
   const authGeneration = useRef(0);
+  const authChannel = useRef<BroadcastChannel | null>(null);
   const refreshSequence = useRef(0);
   const connectedRef = useRef(connected);
   connectedRef.current = connected;
@@ -225,10 +227,11 @@ function App() {
   }, [selectedId, conversation]);
   const client = useMemo(
     () =>
-      credential
-        ? new FactoryClient({ baseUrl: window.location.origin, credential })
+      sessionActive
+        ? new FactoryClient({ baseUrl: window.location.origin })
         : null,
-    [credential],
+    // A cookie account switch must also discard the client's pinned session ID.
+    [sessionActive, sessionEpoch],
   );
   const stopRequests = () => {
     for (const controller of aborts.current) controller.abort();
@@ -309,10 +312,37 @@ function App() {
     setTargetNode("");
     setTargetWorkspace("");
     setFilter("");
-    setCredential("");
+    setSessionActive(false);
+    setSessionEpoch((epoch) => epoch + 1);
     setConnected(false);
     setError("");
   }, []);
+  useEffect(() => {
+    if (typeof BroadcastChannel === "undefined") return;
+    const channel = new BroadcastChannel("uzina-auth");
+    authChannel.current = channel;
+    channel.onmessage = (event: MessageEvent<unknown>) => {
+      if (
+        !event.data ||
+        typeof event.data !== "object" ||
+        !("credentialId" in event.data)
+      )
+        return;
+      const id = event.data.credentialId;
+      if (id !== null && typeof id !== "string") return;
+      if (id === identityRef.current?.credentialId) return;
+      clearPrivate();
+      if (id !== null) setSessionActive(true);
+    };
+    return () => {
+      authChannel.current = null;
+      channel.close();
+    };
+  }, [clearPrivate]);
+  useEffect(() => {
+    if (identity?.credentialId)
+      authChannel.current?.postMessage({ credentialId: identity.credentialId });
+  }, [identity?.credentialId]);
   function openProjectDialog() {
     projectDialogVersion.current += 1;
     setShowCreateProject(true);
@@ -786,19 +816,29 @@ function App() {
       if (generation === authGeneration.current) setBusy(false);
     }
   }
-  async function connect(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const form = new FormData(event.currentTarget);
-    const token = String(form.get("credential") ?? "").trim();
-    event.currentTarget.reset();
-    if (!token || /\s/.test(token)) {
-      setError("Enter a valid Factory human credential.");
-      return;
-    }
-    clearPrivate();
+  function connect() {
     setBusy(true);
     setError("");
-    setCredential(token);
+    setSessionActive(true);
+  }
+  async function signOut() {
+    setBusy(true);
+    try {
+      const response = await fetch("/v1/auth/logout", {
+        method: "POST",
+        credentials: "same-origin",
+      });
+      if (!response.ok)
+        throw new Error(
+          "Sign-out failed. Retry while the Factory is available.",
+        );
+      authChannel.current?.postMessage({ credentialId: null });
+      clearPrivate();
+    } catch (error) {
+      setError(message(error));
+    } finally {
+      setBusy(false);
+    }
   }
   async function createProject(event: React.FormEvent) {
     event.preventDefault();
@@ -1107,30 +1147,18 @@ function App() {
               UZINA <small>FACTORY</small>
             </span>
           </div>
-          <h1>Connect to your Factory</h1>
+          <h1>Sign in to your Factory</h1>
           <p>
-            Use a current human credential for this Factory. The credential
-            remains in this browser tab’s memory only.
+            Open the owner sign-in link printed by your local Factory, or ask
+            its Owner for an invitation.
           </p>
-          <form onSubmit={connect} className="connect-form">
-            <label htmlFor="credential">Human credential</label>
-            <input
-              id="credential"
-              name="credential"
-              type="password"
-              autoComplete="off"
-              required
-              autoFocus
-            />
-            <button className="primary" disabled={busy}>
-              {busy ? "Connecting…" : "Connect"}
-            </button>
-          </form>
           <p className="help">
-            Start the Factory service first. Ask its Owner for a human
-            credential using the configured access flow. Do not use an
-            execution-node credential or a model-provider key.
+            No Factory secret or model key to paste. Your sign-in stays in a
+            private HttpOnly cookie, not browser storage.
           </p>
+          <button className="primary" onClick={connect} disabled={busy}>
+            {busy ? "Connecting…" : "Check sign-in"}
+          </button>
           {error && (
             <p className="alert" role="alert">
               {error}
@@ -1156,7 +1184,10 @@ function App() {
         <span className="role">
           {identity.participant?.role ?? identity.actor.kind}
         </span>
-        <button className="quiet" onClick={clearPrivate}>
+        {identity.participant?.role === "owner" && (
+          <a href="/sharing">Sharing</a>
+        )}
+        <button className="quiet" onClick={signOut} disabled={busy}>
           Sign out
         </button>
       </div>

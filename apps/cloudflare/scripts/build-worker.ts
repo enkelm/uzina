@@ -19,6 +19,7 @@ if (piAiPackage.version !== expectedPiAiVersion) {
 
 const authContextPath = join(piAiDist, "auth/context.js");
 const oauthLoadPath = join(piAiDist, "auth/oauth/load.js");
+const envApiKeysPath = join(piAiDist, "env-api-keys.js");
 const authContextSource = await readFile(authContextPath, "utf8");
 const oauthLoadSource = await readFile(oauthLoadPath, "utf8");
 if (
@@ -36,7 +37,10 @@ const compatibilityPlugin: Bun.BunPlugin = {
   name: "uzina-cloudflare-pi-ai-auth-compatibility",
   setup(build) {
     build.onResolve(
-      { filter: /^(?:\.\/auth\/context\.js|\.\.\/auth\/oauth\/load\.js)$/ },
+      {
+        filter:
+          /^(?:\.\/auth\/context\.js|\.\.\/auth\/oauth\/load\.js|\.\.\/env-api-keys\.js)$/,
+      },
       (args) => {
         const target = resolve(dirname(args.importer), args.path);
         const replacement =
@@ -44,7 +48,9 @@ const compatibilityPlugin: Bun.BunPlugin = {
             ? join(cloudflareDirectory, "worker-compat/auth-context.ts")
             : target === oauthLoadPath
               ? join(cloudflareDirectory, "worker-compat/oauth-load.ts")
-              : undefined;
+              : target === envApiKeysPath
+                ? join(cloudflareDirectory, "worker-compat/env-api-keys.ts")
+                : undefined;
         if (!replacement) return;
         replaced.add(target);
         return { path: replacement };
@@ -90,7 +96,11 @@ async function buildWorkerArtifact(
       "Could not build the compatibility-bundled Cloudflare Worker",
     );
   }
-  if (!replaced.has(authContextPath) || !replaced.has(oauthLoadPath)) {
+  if (
+    !replaced.has(authContextPath) ||
+    !replaced.has(oauthLoadPath) ||
+    !replaced.has(envApiKeysPath)
+  ) {
     throw new Error(
       "Expected Pi AI Worker auth and OAuth modules were not replaced; refusing an unreviewed bundle",
     );

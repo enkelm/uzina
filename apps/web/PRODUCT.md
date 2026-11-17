@@ -24,7 +24,7 @@ The first UI covers a Work item list, conversation, status and history, project 
 
 Coherent Checkpoints, Workspace movement, inactive import and source holds exist in the backend, but end-to-end ownership transfer and local continuation are unfinished. Do not expose transfer, retirement, release or activation actions. No frontend implementation of authorization, model scheduling, filesystem restore, terminals or execution processes.
 
-Use separate current human credentials for the selected Controller, bound to its origin. Never persist credential values to browser storage, URLs, events, logs or rendered history. Do not forward source/local Owner credentials to another Controller. Development UI and API proxy are loopback-only by default. This work does not deploy public ingress, add tenants, synchronize accounts or migrate the Factory database.
+Use origin-bound human sessions via HttpOnly cookies, with pi-coop-style private sign-in links and single-use scoped invitations. Do not put bearer values in React state, Web Storage, application URLs, events, or rendered history; the native `/login` confirmation consumes the credential link and redirects to `/`. The local Factory prints the owner link to its private console. Sharing and revocation remain Core-authorized. Do not forward source/local Owner credentials to another Controller. Development UI and API proxy are loopback-only by default. This work does not deploy public ingress, add tenants, synchronize accounts or migrate the Factory database.
 
 ## Evidence on Hand
 

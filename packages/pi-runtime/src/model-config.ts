@@ -11,6 +11,8 @@ export type ManagedRuntimeEnvironment = {
   UZINA_MODEL_PROVIDER?: string;
   UZINA_MODEL_ID?: string;
   UZINA_MODEL_API_KEY?: string;
+  /** Cloudflare encrypted Worker secret, keyed by Pi provider ID; never a public var. */
+  UZINA_PROVIDER_CREDENTIALS?: string;
 };
 
 export function readManagedModelConfig(

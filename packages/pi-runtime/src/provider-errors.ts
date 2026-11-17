@@ -14,7 +14,7 @@ type StreamResult =
 /** Keep a configured provider's assistant events and result free of its API key. */
 export function redactProviderErrors<TApi extends Api>(
   provider: Provider<TApi>,
-  apiKey: string,
+  apiKey = "",
 ): Provider<TApi> {
   const stream = provider.stream.bind(provider);
   const streamSimple = provider.streamSimple.bind(provider);
@@ -22,14 +22,14 @@ export function redactProviderErrors<TApi extends Api>(
     redactProviderErrorStream(
       stream(model, context, options),
       model,
-      apiKey,
+      options?.apiKey ?? apiKey,
       options?.signal,
     );
   provider.streamSimple = (model, context, options) =>
     redactProviderErrorStream(
       streamSimple(model, context, options),
       model,
-      apiKey,
+      options?.apiKey ?? apiKey,
       options?.signal,
     );
   return provider;
@@ -169,6 +169,7 @@ function redactMessage(
 }
 
 function redactValue(value: unknown, apiKey: string): unknown {
+  if (!apiKey) return value;
   if (typeof value === "string") {
     return value
       .replaceAll(`Bearer ${apiKey}`, "[redacted provider authorization]")

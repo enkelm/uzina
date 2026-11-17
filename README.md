@@ -6,20 +6,19 @@ This is not evidence of a production deployment. No Cloudflare production creden
 
 ## Run the standalone local Factory
 
-Use Bun 1.4.4. Local mode is the default and listens on loopback (`127.0.0.1:8788`). A real Pi AI provider/model, its API key, and a private bootstrap secret are required:
+Follow [local setup](docs/local-setup.md) for the optional environment examples, owner sign-in link, and Execution node provisioning. The example files are `.env.example` (Factory), `apps/web/.env.example` (web proxy, no secrets), and `apps/daemon/.env.example` (Execution node).
+
+Use Bun 1.4.4. Local mode is the default and runs Pi Durable on Bun SQLite, listening on loopback (`127.0.0.1:8788`). No Factory bootstrap secret or separate model key is required. Existing Pi credentials, provider environment variables, custom `models.json`, and settings are reused:
 
 ```sh
-UZINA_MODE=local \
-UZINA_BOOTSTRAP_SECRET='<private-bootstrap-secret>' \
-UZINA_MODEL_PROVIDER=openai \
-UZINA_MODEL_ID=gpt-4o-mini \
-UZINA_MODEL_API_KEY='<provider-api-key>' \
-bun run dev:daemon
+cp -n .env.example .env.factory.local
+chmod 600 .env.factory.local
+bun --no-env-file --env-file=.env.factory.local --watch apps/daemon/src/index.ts
 ```
 
-The Factory SQLite path defaults to `~/.local/share/uzina/factory.sqlite`, and per-thread Pi Durable stores to `~/.local/share/uzina/managed-work`. Set `UZINA_FACTORY_DATABASE_PATH` and `UZINA_MANAGED_WORK_DIRECTORY` to change them. Model configuration is resolved against Pi AI's real catalog and auth resolver; missing configuration fails closed. No production dummy/deterministic model is available.
+The Factory SQLite path defaults to `~/.local/share/uzina/factory.sqlite`, and per-thread Pi Durable stores to `~/.local/share/uzina/managed-work`. Set `UZINA_FACTORY_DATABASE_PATH` and `UZINA_MANAGED_WORK_DIRECTORY` to change them. The local host uses Pi's native model/credential resolver. Optional `UZINA_MODEL_PROVIDER` and `UZINA_MODEL_ID` override model selection; otherwise it prefers Pi's available default, then another available authenticated model. No production dummy/deterministic model is available.
 
-Bootstrap once through `POST /v1/bootstrap` with `Authorization: Bootstrap <UZINA_BOOTSTRAP_SECRET>`. Provision execution nodes and workspace IDs with owner-authenticated routes, create a thread with the explicit node/workspace target, then submit input. Inputs cannot select execution placement. `GET /v1/commands/:requestId` reconciles accepted inputs and their effect receipts; `GET /v1/threads/:threadId/context` and `/status` are authenticated canonical managed-Pi queries. `GET /v1/events` returns committed receipt transitions.
+Local startup creates a private owner sign-in link and a separate revocable private-assistant identity, persisted in mode-0600 files beside the Factory database. Open the printed link after starting the web UI; no Factory token field is needed. Provision execution nodes and workspace IDs with owner-authenticated routes, create a thread with the explicit node/workspace target, then submit input. Inputs cannot select execution placement. `GET /v1/commands/:requestId` reconciles accepted inputs and their effect receipts; `GET /v1/threads/:threadId/context` and `/status` are authenticated canonical managed-Pi queries. `GET /v1/events` returns committed receipt transitions.
 
 ## Use the web UI
 
@@ -29,7 +28,7 @@ With the Factory running on `127.0.0.1:8788`, start the loopback development UI 
 bun run dev:web
 ```
 
-Open the URL that Vite prints and enter a human credential for this Factory. The credential stays in this tab's memory; it is not stored in Web Storage or a URL. The Owner can create projects and Work items, choosing an existing Execution node and Workspace explicitly. Guests can steer work within their grants; Viewers are read-only. The UI shows conversation text, durable command receipts, and history. A receipt means admission, not assistant output or completion.
+Open the private owner link printed by the Factory and confirm sign-in. Browser authentication uses HttpOnly, SameSite cookies (Secure over HTTPS), adapted from pi-coop. The Owner's **Sharing** page creates expiring, single-use project/Work item invitations and revokes access. Keep sign-in links private; bearer values never enter React state or Web Storage. The Owner can create projects and Work items, choosing an existing Execution node and Workspace explicitly. Guests can steer work within their grants; Viewers are read-only. The UI shows conversation text, durable command receipts, and history. A receipt means admission, not assistant output or completion.
 
 Uncertain input retains its original Work item, request ID, and exact text. Use **Reconcile request** on that item, not a new Send. Temporary connection loss hides private work and exposes a retry; sign-out clears all local private state. Reloading the tab loses its memory-only drafts and unresolved inputs. Bounded lists, runtime-less catalog behavior, installed-browser checks, and proxy configuration are documented in [the web UI README](apps/web/README.md).
 
@@ -37,17 +36,17 @@ This is a development UI, not production serving or private ingress. It adds no 
 
 ## Cloudflare composition
 
-`apps/cloudflare/wrangler.toml` declares the `FactoryObject`, `ManagedWorkObject`, and separate `PrivateAssistantObject` SQLite Durable Object bindings/migrations, plus the `CHECKPOINTS` R2 bucket binding. The operator must provision the bucket; the binding declaration does not create it. The Worker defaults to no `workers.dev` endpoint (`workers_dev = false`); deployment requires an operator-owned custom Worker route. Protect human business traffic with Cloudflare Access/tailnet-oriented ingress. If using an Access policy, permit authenticated node-only protocol paths to reach the Worker because node daemons use distinct owner-provisioned Bearer credentials and do not hold a human Access session. All application routes still enforce their Factory/node credentials; bootstrap and model API keys are independent secrets.
+`apps/cloudflare/wrangler.toml` declares the `FactoryObject`, `ManagedWorkObject`, and separate `PrivateAssistantObject` SQLite Durable Object bindings/migrations, plus the `CHECKPOINTS` R2 bucket binding. The operator must provision the bucket; the binding declaration does not create it. The Worker defaults to no `workers.dev` endpoint (`workers_dev = false`); deployment requires an operator-owned custom Worker route. Protect human business traffic with Cloudflare Access/tailnet-oriented ingress. If using an Access policy, permit authenticated node-only protocol paths to reach the Worker because node daemons use distinct owner-provisioned Bearer credentials and do not hold a human Access session. All application routes still enforce their Factory/node identities; owner sign-in and model credentials remain separate.
 
-The checked-in Cloudflare profile supports only Pi AI's real OpenAI API-key Responses provider and `gpt-4o-mini`; unsupported Worker providers, OAuth, environment discovery, and filesystem credential discovery fail closed. The standalone Bun host retains the broader Pi AI catalog. Set secrets without exposing their values:
+Cloudflare supports OpenAI, Anthropic, and Google API-key profiles; `wrangler.toml` defaults to OpenAI / `gpt-4o-mini`. Store only the credentials needed by the Worker in the encrypted `UZINA_PROVIDER_CREDENTIALS` Worker secret (a Pi-style provider map). Set `UZINA_OWNER_TOKEN` to a random private token of at least 32 characters and open `/login?token=<token>` on the protected origin; no bootstrap request is required. Worker OAuth and machine credential discovery remain unsupported. The standalone host uses the full native Pi resolver. These commands stage secret versions; deploying them is a separate operator action:
 
 ```sh
 cd apps/cloudflare
-wrangler secret put UZINA_BOOTSTRAP_SECRET
-wrangler secret put UZINA_MODEL_API_KEY
+wrangler versions secret put UZINA_OWNER_TOKEN
+wrangler versions secret put UZINA_PROVIDER_CREDENTIALS
 ```
 
-`bun run build:cloudflare` creates the pinned Pi AI 1.4.0 compatibility bundle that replaces only the unsupported Worker host-auth/OAuth helper modules; Miniflare and Wrangler consume the same generated entry. Wrangler's dry-run validates the artifact and prints the bound Durable Object classes. This is not a deployment. Do not enable a public `workers.dev` human interface as a substitute for protected ingress. Slice 6 adds persistent Owner, Guest, and Viewer access through scoped project/thread grants, invitations, participant administration, and separate thread discussion. Those scoped-access APIs remain inside one Factory and do not add workforce roles/assignments, email/password login, or federation. The separate web UI above uses those same access checks.
+`bun run build:cloudflare` creates the pinned Pi AI 1.4.0 compatibility bundle that replaces unsupported Worker host-auth/OAuth/native-environment helper modules; Miniflare and Wrangler consume the same generated entry. Wrangler's dry-run validates the artifact and prints the bound Durable Object classes. This is not a deployment. Do not enable a public `workers.dev` human interface as a substitute for protected ingress. Slice 6 adds persistent Owner, Guest, and Viewer access through scoped project/thread grants, invitations, participant administration, and separate thread discussion. Those scoped-access APIs remain inside one Factory and do not add workforce roles/assignments, email/password login, or federation. The separate web UI above uses those same access checks.
 
 ## Scoped collaboration and access (slice 6)
 
@@ -77,7 +76,7 @@ Access scopes are application-level visibility and admission rules, not OS sandb
 
 ## Private assistant and workspace snapshots
 
-The private assistant is a separate owner-private conversation/store, not a project or work thread with fake execution placement. The operator installs a named assistant bearer and its expected credential/assistant/owner identity; no token is automatically provisioned and no owner authority is inherited. Core applies current grants and revocation on tool requests. Missing or mismatched identity parks execution while owner history remains readable. Bun recovery after a transient identity failure is triggered by an authorized status request; Worker alarms also resume due persisted work. See [daemon setup](apps/daemon/README.md#owner-private-factory-assistant) and [Worker setup](apps/cloudflare/README.md#owner-private-factory-assistant).
+The private assistant is a separate owner-private conversation/store, not a project or work thread with fake execution placement. Local startup provisions a separate named assistant identity automatically; Worker operators still install its bearer and expected identity. No human owner bearer is inherited. Core applies current grants and revocation on tool requests. Missing or mismatched identity parks execution while owner history remains readable. Bun recovery after a transient identity failure is triggered by an authorized status request; Worker alarms also resume due persisted work. See [daemon setup](apps/daemon/README.md#owner-private-factory-assistant) and [Worker setup](apps/cloudflare/README.md#owner-private-factory-assistant).
 
 After a confirmed source CONTROL fence, an owner can request a workspace-only snapshot. The assigned node captures Git/index/selected files into a private immutable cache, then streams verified objects into configured Bun storage or Cloudflare R2. Core reports `workspace-checkpoint-available` only after manifest/reference verification; owner retrieval is allowlisted. Interrupted or corrupt cached production stays uncertain, not silently recaptured. Mandatory path exclusions and declared scope are checked with a bounded non-backtracking matcher, but selected files and Git history may still contain secrets.
 
@@ -114,4 +113,5 @@ The integrated local scenario uses persistent SQLite and real HTTP between Core,
 - The private assistant is isolated from normal work-thread Pi stores and checkpoint exports. Its host-held credential is not given to coding workers, nodes or model context; its coordination tools use ordinary authorized Core operations. Stable admission/mutation IDs survive lost acknowledgements and pending-task recovery without claiming cancellation or exactly-once arbitrary effects.
 - Workspace snapshot CONTROL/production is separate from managed inputs and execution jobs. Upload authority is capture/node-bound; controller-private runtime artifacts are outside that channel. Coherent assembly and authenticated workspace cutover require their own verified bindings; an available artifact or inactive receipt alone is not a move.
 - Offline standalone import reserves private inactive data only. It does not migrate a Factory database, synchronize accounts, authenticate cross-controller source authority, activate a copied Pi root, or retire/unfence a source. Cloud-controlled and standalone remain alternative single-Factory compositions, not federated controllers.
+- Rex provides persisted process launch/inspect/stop/reconciliation, not structured agent orchestration. Native Pi CLI/RPC adapters, turn/event ingestion and TUI-agent coordination are not implemented; terminal text is not authoritative agent state.
 - Scoped invitations, discussion, MCP/client access and the private assistant are implemented; this is still execution infrastructure, not a workforce manager. The first Work item web UI is implemented, but worker definitions, assignments, delivery workflows, PWA/offline behavior, managed-runtime ownership transfer and native CLI adapters are not. The broader workforce direction remains held; the first UI does not depend on it. No push, real Cloudflare deployment, Cloudflare Access configuration, credential-value readout, paid model request, second-laptop proof or existing Rex session mutation is claimed.

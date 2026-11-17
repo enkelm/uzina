@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, realpathSync } from "node:fs";
-import { chmod, mkdir, realpath } from "node:fs/promises";
+import { chmod, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import {
   captureManagedWorkBundle,
   type BlobTransport,
@@ -37,6 +37,7 @@ export interface StandaloneFactoryServer {
   server: ReturnType<typeof Bun.serve>;
   factory: FactoryService;
   database: BunFactoryDatabase;
+  ownerSignInPath?: string;
   captureManagedWorkCheckpoint(input: {
     credential: string;
     threadId: string;
@@ -49,7 +50,9 @@ export type StandaloneFactoryOptions = {
   databasePath?: string;
   runtimeDirectory?: string;
   snapshotStorageDirectory?: string;
-  bootstrapSecret: string;
+  bootstrapSecret?: string;
+  /** Native host provisions a private owner link; legacy API bootstrap remains opt-in. */
+  ownerSignIn?: boolean;
   models: ManagedModels;
   modelProvider: string;
   modelId: string;
@@ -131,9 +134,6 @@ export async function createStandaloneFactoryServer(
 ): Promise<StandaloneFactoryServer> {
   const hostname = options.hostname ?? "127.0.0.1";
   assertLoopbackHostname(hostname);
-  if (!options.bootstrapSecret.trim()) {
-    throw new Error("Standalone Factory requires UZINA_BOOTSTRAP_SECRET");
-  }
   const defaults = localFactoryDefaults();
   const databasePath = resolve(options.databasePath ?? defaults.databasePath);
   const runtimeDirectory = resolve(
@@ -189,6 +189,8 @@ export async function createStandaloneFactoryServer(
   const privateAssistantPath = join(runtimeDirectory, "private-assistant");
   const configuredLocalPaths = [
     ...databasePaths,
+    `${databasePath}.owner-token`,
+    `${databasePath}.assistant-identity`,
     runtimeDirectory,
     privateAssistantPath,
     snapshotStorageDirectory,
@@ -204,9 +206,67 @@ export async function createStandaloneFactoryServer(
 
   const database = new BunFactoryDatabase(databasePath);
   let factory: FactoryService;
+  let ownerCredential: string | undefined;
+  let privateAssistantConfig = options.privateAssistant;
   try {
     factory = new FactoryService(database, options.bootstrapSecret);
     factory.assertManagedWorkImportReservationsDisjoint(reservationGuardRoots);
+    if (options.ownerSignIn ?? !options.bootstrapSecret) {
+      const tokenPath = `${databasePath}.owner-token`;
+      try {
+        const stored = (await readFile(tokenPath, "utf8")).trim();
+        const session = await factory.authenticate(stored);
+        factory.requirePrivateAssistantOwner(session);
+        ownerCredential = stored;
+      } catch (error) {
+        if (
+          !(error instanceof Error) ||
+          (!("code" in error && error.code === "ENOENT") &&
+            !("status" in error && error.status === 401))
+        )
+          throw error;
+      }
+      if (!ownerCredential) {
+        ownerCredential = (await factory.createOwnerSignIn()).credential;
+        await writeFile(tokenPath, `${ownerCredential}\n`, { mode: 0o600 });
+      }
+      await chmod(tokenPath, 0o600);
+      if (privateAssistantConfig === undefined) {
+        const identityPath = `${databasePath}.assistant-identity`;
+        try {
+          privateAssistantConfig = JSON.parse(
+            await readFile(identityPath, "utf8"),
+          );
+        } catch (error) {
+          if (
+            !(error instanceof Error) ||
+            !("code" in error) ||
+            error.code !== "ENOENT"
+          )
+            throw error;
+          const owner = await factory.authenticate(ownerCredential);
+          const credential = await factory.provisionCredential(
+            owner,
+            "assistant",
+            "Private Factory assistant",
+          );
+          if (credential.actor.kind !== "assistant")
+            throw new Error("Expected assistant credential");
+          privateAssistantConfig = {
+            bearer: credential.credential,
+            credentialId: credential.credentialId,
+            assistantId: credential.actor.assistantId,
+            ownerId: credential.actor.ownerId,
+          };
+          await writeFile(
+            identityPath,
+            JSON.stringify(privateAssistantConfig),
+            { mode: 0o600 },
+          );
+        }
+        await chmod(identityPath, 0o600);
+      }
+    }
   } catch (error) {
     database.close();
     throw error;
@@ -338,7 +398,7 @@ export async function createStandaloneFactoryServer(
         join(privateAssistantPath, "metadata.sqlite"),
       );
       privateAssistantStore = store;
-      const config = options.privateAssistant;
+      const config = privateAssistantConfig;
       const expected =
         config?.credentialId && config.assistantId && config.ownerId
           ? {
@@ -564,6 +624,11 @@ export async function createStandaloneFactoryServer(
     server,
     factory,
     database,
+    ...(ownerCredential
+      ? {
+          ownerSignInPath: `/login?token=${encodeURIComponent(ownerCredential)}`,
+        }
+      : {}),
     async captureManagedWorkCheckpoint({ credential, threadId, transport }) {
       if (closing) throw new Error("Standalone Factory is closing");
       activeCaptures += 1;
