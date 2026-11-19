@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { stripVTControlCharacters } from "node:util";
 import {
   EXECUTION_CONTRACT_VERSION,
   executionRexInspectionSchema,
@@ -30,6 +31,8 @@ interface RexManagerOptions {
   database: Database;
   nodeId: string;
   executable: string;
+  /** Explicit local tool hosts pin the endpoint instead of following ambient selection. */
+  server?: string;
   resolveWorkspace(workspaceId: string): string;
   assertWorkspaceActive(workspaceId: string, generation: number): void;
   assertWorkspaceAdmission?(workspaceId: string): void;
@@ -51,6 +54,7 @@ export class RexProcessManager {
   readonly #db: Database;
   readonly #nodeId: string;
   readonly #executable: string;
+  readonly #server: string | undefined;
   readonly #resolveWorkspace: RexManagerOptions["resolveWorkspace"];
   readonly #assertWorkspaceActive: RexManagerOptions["assertWorkspaceActive"];
   readonly #assertWorkspaceAdmission:
@@ -61,9 +65,99 @@ export class RexProcessManager {
     this.#db = options.database;
     this.#nodeId = options.nodeId;
     this.#executable = options.executable;
+    this.#server = options.server;
     this.#resolveWorkspace = options.resolveWorkspace;
     this.#assertWorkspaceActive = options.assertWorkspaceActive;
     this.#assertWorkspaceAdmission = options.assertWorkspaceAdmission;
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS execution_rex_processes (
+        process_id TEXT PRIMARY KEY,
+        payload_sha256 TEXT NOT NULL,
+        node_id TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        ownership_generation INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        launched_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        session_id TEXT,
+        block_id TEXT,
+        exit_code INTEGER,
+        error_code TEXT,
+        reconciliation_evidence TEXT
+      );
+      CREATE INDEX IF NOT EXISTS execution_rex_workspace_status
+        ON execution_rex_processes(workspace_id, status);
+    `);
+    this.#db
+      .query(
+        "UPDATE execution_rex_processes SET status = 'uncertain', updated_at = ?, error_code = 'interrupted_during_lifecycle' WHERE status IN ('starting', 'stopping')",
+      )
+      .run(new Date().toISOString());
+  }
+
+  getReceipt(processId: string): ExecutionRexProcessReceipt {
+    const row = this.#row(processId);
+    if (!row) throw new ExecutionError("rex_process_not_found");
+    return this.#receipt(row);
+  }
+
+  async connection(): Promise<{ endpoint: string; instanceId: string }> {
+    const response = await this.#runJson(["whoami", "--json"]);
+    if (
+      typeof response.endpoint !== "string" ||
+      typeof response.instance_id !== "string" ||
+      !response.instance_id
+    ) {
+      throw new RexCliError("invalid_rex_identity");
+    }
+    return { endpoint: response.endpoint, instanceId: response.instance_id };
+  }
+
+  async capture(
+    processId: string,
+    options: { tailLines: number; maxBytes: number },
+  ): Promise<{ kind: "terminal_snapshot"; text: string; truncated: boolean }> {
+    if (
+      !Number.isInteger(options.tailLines) ||
+      options.tailLines < 1 ||
+      options.tailLines > 500 ||
+      !Number.isInteger(options.maxBytes) ||
+      options.maxBytes < 256 ||
+      options.maxBytes > 65_536
+    ) {
+      throw new ExecutionError("invalid_rex_output_limit");
+    }
+    const row = this.#row(processId);
+    if (!row) throw new ExecutionError("rex_process_not_found");
+    if (!row.session_id || !row.block_id) {
+      throw new ExecutionError("rex_process_identity_uncertain");
+    }
+    this.#assertWorkspaceActive(row.workspace_id, row.ownership_generation);
+    const result = await this.#run(
+      [
+        "capture",
+        "--session",
+        row.session_id,
+        "--block",
+        row.block_id,
+        "--trim",
+        "--unwrap",
+      ],
+      true,
+      options.maxBytes,
+    );
+    if (result.exitCode !== 0) throw new RexCliError("rex_cli_failed");
+    const text = stripVTControlCharacters(result.stdout)
+      // Terminal controls must not be replayed by MCP clients.
+      // oxlint-disable-next-line no-control-regex
+      .replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "")
+      .replace(/\n$/, "");
+    const lines = text.split("\n");
+    return {
+      kind: "terminal_snapshot",
+      text: lines.slice(-options.tailLines).join("\n"),
+      truncated: result.truncated || lines.length > options.tailLines,
+    };
   }
 
   async launch(input: unknown): Promise<ExecutionRexProcessReceipt> {
@@ -86,7 +180,7 @@ export class RexProcessManager {
         if (existing.payload_sha256 !== payloadSha256) {
           throw new ExecutionError("process_id_payload_conflict");
         }
-        return this.#receipt(existing);
+        return { receipt: this.#receipt(existing), launch: false };
       }
       this.#assertWorkspaceActive(
         request.target.workspaceId,
@@ -110,9 +204,14 @@ export class RexProcessManager {
           now,
           now,
         );
-      return this.#receipt(this.#row(request.processId)!);
+      return {
+        receipt: this.#receipt(this.#row(request.processId)!),
+        launch: true,
+      };
     });
-    if (current.status !== "starting") return current;
+    // Only the admission that inserted the intent may send it to Rex. A retry
+    // observing 'starting' must not create a second external process.
+    if (!current.launch) return current.receipt;
 
     try {
       const label = `uzina-${request.processId}`;
@@ -155,6 +254,16 @@ export class RexProcessManager {
   async inspect(processId: string): Promise<ExecutionRexInspection> {
     const row = this.#row(processId);
     if (!row) throw new ExecutionError("rex_process_not_found");
+    // Terminal evidence survives closing its presentation. Raw CLI changes do
+    // not turn a completed job back into an observation of some later child.
+    if (row.status === "exited") {
+      return executionRexInspectionSchema.parse({
+        contractVersion: EXECUTION_CONTRACT_VERSION,
+        processId,
+        status: "exited",
+        exitCode: row.exit_code,
+      });
+    }
     if (!row.session_id || !row.block_id || row.status === "uncertain") {
       return executionRexInspectionSchema.parse({
         contractVersion: EXECUTION_CONTRACT_VERSION,
@@ -174,7 +283,14 @@ export class RexProcessManager {
         row.block_id,
         "process",
       ]);
-      // Rex exposes either a running flag or the current child process object.
+      // Newer Rex omits child after exit and returns a structured last_exit.
+      // Running evidence wins over any retained exit from an earlier child.
+      const lastExit = process.last_exit;
+      const structuredExit =
+        lastExit &&
+        typeof lastExit === "object" &&
+        !Array.isArray(lastExit) &&
+        (typeof lastExit.exit_code === "number" || lastExit.exit_code === null);
       const running =
         typeof process.running === "boolean"
           ? process.running
@@ -184,13 +300,17 @@ export class RexProcessManager {
                 typeof process.child === "object" &&
                 !Array.isArray(process.child)
               ? true
-              : undefined;
+              : process.child === undefined &&
+                  (structuredExit || typeof lastExit === "number")
+                ? false
+                : undefined;
       if (typeof running !== "boolean") {
         throw new RexCliError("invalid_rex_process_state");
       }
-      const exitCode =
-        typeof process.last_exit === "number" || process.last_exit === null
-          ? process.last_exit
+      const exitCode = structuredExit
+        ? lastExit.exit_code
+        : typeof lastExit === "number" || lastExit === null
+          ? lastExit
           : undefined;
       const status = running ? "running" : "exited";
       this.#update(processId, {
@@ -369,11 +489,18 @@ export class RexProcessManager {
   async #run(
     args: string[],
     captureOutput: boolean,
-  ): Promise<{ stdout: string; exitCode: number }> {
+    tailBytes?: number,
+  ): Promise<{ stdout: string; exitCode: number; truncated: boolean }> {
     let process: ReturnType<typeof Bun.spawn>;
     try {
       process = Bun.spawn({
-        cmd: [this.#executable, ...args],
+        cmd: [
+          this.#executable,
+          ...(this.#server
+            ? ["--autostart=false", "--server", this.#server]
+            : []),
+          ...args,
+        ],
         stdin: "ignore",
         stdout: captureOutput ? "pipe" : "ignore",
         stderr: "ignore",
@@ -398,12 +525,16 @@ export class RexProcessManager {
     try {
       const [stdout, exitCode] = await Promise.all([
         captureOutput
-          ? readLimited(stdoutStream as ReadableStream<Uint8Array>, 256 * 1024)
-          : Promise.resolve(""),
+          ? readLimited(
+              stdoutStream as ReadableStream<Uint8Array>,
+              tailBytes ?? 256 * 1024,
+              tailBytes !== undefined,
+            )
+          : Promise.resolve({ text: "", truncated: false }),
         process.exited,
       ]);
       if (timedOut) throw new RexCliError("rex_cli_timeout");
-      return { stdout, exitCode };
+      return { stdout: stdout.text, exitCode, truncated: stdout.truncated };
     } finally {
       clearTimeout(timeout);
     }
@@ -425,7 +556,8 @@ export class RexProcessManager {
 async function readLimited(
   stream: ReadableStream<Uint8Array>,
   limit: number,
-): Promise<string> {
+  tail = false,
+): Promise<{ text: string; truncated: boolean }> {
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
   let size = 0;
@@ -434,7 +566,18 @@ async function readLimited(
     while (true) {
       const part = await reader.read();
       if (part.done) break;
-      if (size + part.value.byteLength > limit) {
+      if (tail) {
+        chunks.push(part.value);
+        size += part.value.byteLength;
+        while (size > limit) {
+          exceeded = true;
+          const first = chunks[0]!;
+          const remove = Math.min(size - limit, first.byteLength);
+          if (remove === first.byteLength) chunks.shift();
+          else chunks[0] = first.subarray(remove);
+          size -= remove;
+        }
+      } else if (size + part.value.byteLength > limit) {
         const allowed = Math.max(0, limit - size);
         if (allowed) chunks.push(part.value.subarray(0, allowed));
         size += allowed;
@@ -447,8 +590,12 @@ async function readLimited(
   } finally {
     reader.releaseLock();
   }
-  if (exceeded) throw new RexCliError("rex_cli_output_limit");
-  return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString(
-    "utf8",
-  );
+  if (exceeded && !tail) throw new RexCliError("rex_cli_output_limit");
+  const bytes = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
+  let start = 0;
+  if (tail && exceeded) {
+    // Discard only a cut UTF-8 prefix, not genuine replacement characters.
+    while (start < bytes.length && (bytes[start]! & 0xc0) === 0x80) start++;
+  }
+  return { text: bytes.subarray(start).toString("utf8"), truncated: exceeded };
 }

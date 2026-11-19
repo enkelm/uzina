@@ -6,19 +6,17 @@ This is not evidence of a production deployment. No Cloudflare production creden
 
 ## Run the standalone local Factory
 
-Follow [local setup](docs/local-setup.md) for the optional environment examples, owner sign-in link, and Execution node provisioning. The example files are `.env.example` (Factory), `apps/web/.env.example` (web proxy, no secrets), and `apps/daemon/.env.example` (Execution node).
+Follow [local setup](docs/local-setup.md) for the default startup, owner sign-in link, optional overrides and additional Execution nodes. The example files are `.env.example` (Factory), `apps/web/.env.example` (web proxy, no secrets), and `apps/daemon/.env.example` (Execution node).
 
 Use Bun 1.4.4. Local mode is the default and runs Pi Durable on Bun SQLite, listening on loopback (`127.0.0.1:8788`). No Factory bootstrap secret or separate model key is required. Existing Pi credentials, provider environment variables, custom `models.json`, and settings are reused:
 
 ```sh
-cp -n .env.example .env.factory.local
-chmod 600 .env.factory.local
-bun --no-env-file --env-file=.env.factory.local --watch apps/daemon/src/index.ts
+bun run dev:daemon
 ```
 
 The Factory SQLite path defaults to `~/.local/share/uzina/factory.sqlite`, and per-thread Pi Durable stores to `~/.local/share/uzina/managed-work`. Set `UZINA_FACTORY_DATABASE_PATH` and `UZINA_MANAGED_WORK_DIRECTORY` to change them. The local host uses Pi's native model/credential resolver. Optional `UZINA_MODEL_PROVIDER` and `UZINA_MODEL_ID` override model selection; otherwise it prefers Pi's available default, then another available authenticated model. No production dummy/deterministic model is available.
 
-Local startup creates a private owner sign-in link and a separate revocable private-assistant identity, persisted in mode-0600 files beside the Factory database. Open the printed link after starting the web UI; no Factory token field is needed. Provision execution nodes and workspace IDs with owner-authenticated routes, create a thread with the explicit node/workspace target, then submit input. Inputs cannot select execution placement. `GET /v1/commands/:requestId` reconciles accepted inputs and their effect receipts; `GET /v1/threads/:threadId/context` and `/status` are authenticated canonical managed-Pi queries. `GET /v1/events` returns committed receipt transitions.
+Local startup creates a private owner sign-in link and a separate revocable private-assistant identity, persisted in mode-0600 files beside the Factory database. Open the printed link after starting the web UI; no Factory token field is needed. The local node and cwd-bound workspace are provisioned automatically. Create a thread with that explicit target, then submit input. Additional nodes/workspaces still use the Owner-authenticated provisioning routes. Inputs cannot select execution placement. `GET /v1/commands/:requestId` reconciles accepted inputs and their effect receipts; `GET /v1/threads/:threadId/context` and `/status` are authenticated canonical managed-Pi queries. `GET /v1/events` returns committed receipt transitions.
 
 ## Use the web UI
 
@@ -74,7 +72,25 @@ Request bounds are explicit: display names are 1–120 characters, grant identif
 
 Access scopes are application-level visibility and admission rules, not OS sandboxing. A Guest allowed to steer a shell-capable agent has substantial execution power. Already claimed/external effects may remain uncertain or complete after access changes; Core prevents later admissions where it can but cannot undo an external effect. Human ingress must remain loopback/tailnet/Access protected; invitations do not add a public unauthenticated Factory or MCP deployment.
 
+## Native Rex worker coordination
+
+Native agent sessions can register a project-scoped worker and use a restricted MCP/HTTP mailbox to ask the Pi Durable Factory bot questions or report progress. The bot answers within its authority or escalates to the Owner's **Factory inbox**. Answers and instructions remain queued until the native worker acknowledges receipt; receipt is not execution. Sessions and conversations stay in Rex, not browser Work item chats. See [native worker coordination](docs/native-worker-coordination.md) for provisioning, tools, recovery and limits.
+
+## Reusable local Rex tools
+
+Any compatible native agent can load the local stdio MCP server's single **rex** tool for command launch, inspection, bounded waiting and terminal output. A JSON CLI uses the same operation host and receipts; uncovered operations fall back to the installed Rex CLI. This is an explicitly configured local OS-user service, not a Factory authorization path or sandbox. It does not install agent extensions, deliver instructions, or mirror native conversations. See [Rex tool setup, CLI fallback and recovery](docs/rex-tools.md).
+
+## Local Pi and Codex bootstrap
+
+Normal local startup creates and reuses a **local Execution node and workspace**, bound to the startup directory, and discovers installed **Pi/Codex/Rex** on the host PATH. No native-worker environment flag, operator JSON, or manual node-credential setup is required. Owner-authorized provisioning through `factory_board` prepares a dedicated worker credential and both private `rex`/`factory` MCP connections, then starts the ordinary interactive CLI in Rex. Core still enforces current grants and placement; startup itself launches no worker. Process evidence and observed MCP readiness remain separate. New connected Pi workers also get [safe-boundary assignment/answer delivery](docs/native-pi-delivery.md), independently verified persisted native admission and original-conversation lifecycle fencing; Codex delivery remains manual. MCP readiness alone implies none of that. No global settings mutation, terminal typing, transcript synchronization or remote launch protocol is added. Programmatic hosts can still supply explicit trusted profiles and policies. See [connected-worker defaults and recovery](docs/native-worker-provisioning.md) and [raw launch authority and live acceptance](docs/native-agent-launch.md).
+
+## Factory bot: durable board and threads
+
+The owner-private assistant now exposes two deep tools: **board** for durable goals, briefs, priorities, execution attempts and evidence-backed review; **threads** for focused planning/review conversations and explicit worker coordination. Goals and the pinned agenda live in Pi Durable conversation documents, not chat memory or a competing scheduler. Recoverable background tasks observe Core receipts and worker reports, and uncertain attempts reconcile without resending assignments. Native sessions remain in Rex. On explicitly configured/delegated local targets, the board can provision connected Pi/Codex workers; it does not stop them or mirror their transcripts. See [Factory bot contracts, recovery and limits](docs/factory-bot.md).
+
 ## Private assistant and workspace snapshots
+
+Open **Factory chat** in the web header for the Owner-private coordinator; Work chats stay separate. The panel reads current context, shows coordinator reply receipts, and reconciles uncertain sends with the same input ID and text. Closing it does not stop work; parked coordinator access is read-only. Uncertain inputs are retained in this tab only—reconcile before reloading. Guests and Viewers cannot access the private chat.
 
 The private assistant is a separate owner-private conversation/store, not a project or work thread with fake execution placement. Local startup provisions a separate named assistant identity automatically; Worker operators still install its bearer and expected identity. No human owner bearer is inherited. Core applies current grants and revocation on tool requests. Missing or mismatched identity parks execution while owner history remains readable. Bun recovery after a transient identity failure is triggered by an authorized status request; Worker alarms also resume due persisted work. See [daemon setup](apps/daemon/README.md#owner-private-factory-assistant) and [Worker setup](apps/cloudflare/README.md#owner-private-factory-assistant).
 
@@ -115,5 +131,5 @@ The integrated local scenario uses persistent SQLite and real HTTP between Core,
 - The private assistant is isolated from normal work-thread Pi stores and checkpoint exports. Its host-held credential is not given to coding workers, nodes or model context; its coordination tools use ordinary authorized Core operations. Stable admission/mutation IDs survive lost acknowledgements and pending-task recovery without claiming cancellation or exactly-once arbitrary effects.
 - Workspace snapshot CONTROL/production is separate from managed inputs and execution jobs. Upload authority is capture/node-bound; controller-private runtime artifacts are outside that channel. Coherent assembly and authenticated workspace cutover require their own verified bindings; an available artifact or inactive receipt alone is not a move.
 - Offline standalone import reserves private inactive data only. It does not migrate a Factory database, synchronize accounts, authenticate cross-controller source authority, activate a copied Pi root, or retire/unfence a source. Cloud-controlled and standalone remain alternative single-Factory compositions, not federated controllers.
-- Rex provides persisted process launch/inspect/stop/reconciliation, not structured agent orchestration. Native Pi CLI/RPC adapters, turn/event ingestion and TUI-agent coordination are not implemented; terminal text is not authoritative agent state.
-- Scoped invitations, discussion, MCP/client access and the private assistant are implemented; this is still execution infrastructure, not a workforce manager. The first Work item web UI is implemented, but worker definitions, assignments, delivery workflows, PWA/offline behavior, managed-runtime ownership transfer and native CLI adapters are not. The broader workforce direction remains held; the first UI does not depend on it. No push, real Cloudflare deployment, Cloudflare Access configuration, credential-value readout, paid model request, second-laptop proof or existing Rex session mutation is claimed.
+- Rex provides persisted process launch/inspect/stop/reconciliation. Native workers coordinate through an explicit durable inbox and mailbox; terminal text is not authoritative agent state. Local Pi/Codex launch profiles, delegated connected-worker provisioning, the restricted worker bridge and a Pi-first native delivery/lifecycle adapter are implemented. Codex automatic delivery, remote workforce provisioning, transcript ingestion and terminal steering are not.
+- Scoped invitations, discussion, MCP/client access and the private assistant are implemented; this is still execution infrastructure, not a workforce manager. The first Work item web UI and owner-private Factory-bot goals/assignment tasks are implemented, but remote workforce definitions/provisioning, Codex automatic delivery, board UI, broader delivery workflows, PWA/offline behavior and managed-runtime ownership transfer are not. The broader workforce direction remains held; the first UI does not depend on it. No push, real Cloudflare deployment, Cloudflare Access configuration, credential-value readout, paid model request, second-laptop proof or existing Rex session mutation is claimed.

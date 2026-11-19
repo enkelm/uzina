@@ -37,6 +37,12 @@ import {
 import { Textarea } from "@ui-sdk/react/textarea";
 import { FactoryClient, FactoryClientError } from "@uzina/client";
 import { factoryThreadSchema } from "@uzina/contracts/factory";
+import { CoordinationInbox } from "./coordination-inbox";
+import { FactoryChat } from "./factory-chat";
+import {
+  visibleMessages,
+  type ContextMessage as Message,
+} from "./context-messages";
 type Identity = Awaited<ReturnType<FactoryClient["me"]>>;
 type Project = Awaited<
   ReturnType<FactoryClient["listProjects"]>
@@ -75,43 +81,10 @@ function Icon({ name }: { name: "plus" | "close" | "back" | "chat" }) {
   );
 }
 
-type Message = { role: "user" | "assistant"; text: string };
 const EMPTY_MESSAGES: Message[] = [];
 const EMPTY_RUNS: Receipt[] = [];
 function ownValue<T>(values: Record<string, T>, key: string): T | undefined {
   return Object.hasOwn(values, key) ? values[key] : undefined;
-}
-function visibleMessages(value: unknown): Message[] {
-  if (!value || typeof value !== "object") return [];
-  const runtime = (value as { runtime?: unknown }).runtime;
-  if (
-    !runtime ||
-    typeof runtime !== "object" ||
-    !Array.isArray((runtime as { messages?: unknown }).messages)
-  )
-    return [];
-  const out: Message[] = [];
-  for (const raw of (runtime as { messages: unknown[] }).messages) {
-    if (!raw || typeof raw !== "object") continue;
-    const item = raw as { role?: unknown; content?: unknown };
-    if (item.role !== "assistant" && item.role !== "user") continue;
-    const parts = Array.isArray(item.content) ? item.content : [];
-    const text =
-      typeof item.content === "string" && item.role === "user"
-        ? item.content
-        : parts
-            .filter(
-              (part): part is { type: string; text: string } =>
-                !!part &&
-                typeof part === "object" &&
-                (part as { type?: unknown }).type === "text" &&
-                typeof (part as { text?: unknown }).text === "string",
-            )
-            .map((part) => part.text)
-            .join("");
-    if (text) out.push({ role: item.role, text });
-  }
-  return out;
 }
 function message(error: unknown): string {
   if (error instanceof FactoryClientError) {
@@ -620,7 +593,7 @@ export function App() {
         if (contextResult.status === "fulfilled") {
           updateConversation(
             selected.threadId,
-            visibleMessages(contextResult.value),
+            visibleMessages(contextResult.value.runtime),
           );
         } else if (
           !(
@@ -1174,12 +1147,41 @@ export function App() {
         </span>
       </div>
       <div className="top-right">
-        <span className={`connection ${connected ? "online" : "offline"}`}>
-          <i /> {connected ? "Connected" : "Unavailable"}
+        <span
+          className={`connection ${connected ? "online" : "offline"}`}
+          aria-label={connected ? "Connected" : "Unavailable"}
+        >
+          <i aria-hidden="true" />{" "}
+          <span className="connection-label">
+            {connected ? "Connected" : "Unavailable"}
+          </span>
         </span>
         <span className="role">
           {identity.participant?.role ?? identity.actor.kind}
         </span>
+        {client && identity.participant?.role === "owner" ? (
+          <FactoryChat
+            key={`${identity.credentialId}:${sessionEpoch}`}
+            client={client}
+            connected={connected}
+            onAccessDenied={clearPrivate}
+          />
+        ) : null}
+        {connected &&
+        client &&
+        selectedProject &&
+        identity.participant?.role === "owner" ? (
+          <CoordinationInbox
+            key={`${identity.credentialId}:${selectedProject}`}
+            client={client}
+            projectId={selectedProject}
+            projectName={
+              projects.find((project) => project.projectId === selectedProject)
+                ?.name ?? selectedProject
+            }
+            onAccessDenied={clearPrivate}
+          />
+        ) : null}
         {identity.participant?.role === "owner" && (
           <a href="/sharing">Sharing</a>
         )}
@@ -1430,10 +1432,10 @@ export function App() {
                 aria-live="polite"
               >
                 {conversation.length ? (
-                  conversation.map((entry, i) => (
+                  conversation.map((entry) => (
                     <article
                       className={`message ${entry.role}`}
-                      key={`${i}-${entry.role}`}
+                      key={entry.key}
                     >
                       <div className="message-label">
                         {entry.role === "user" ? "Human" : "Assistant"}

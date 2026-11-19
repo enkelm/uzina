@@ -5,6 +5,8 @@ import { createAssistantMessageEventStream } from "@earendil-works/pi-ai/utils/e
 export type DeterministicPrivateAssistantModelOptions = {
   factoryThreadId?: string;
   factoryInputText?: string;
+  coordinationItemId?: string;
+  onCoordinationSettled?: () => void;
 };
 
 /** Deterministic provider adapter for owner-private assistant composition tests only. */
@@ -64,10 +66,73 @@ function scriptedResponse(
       );
     }),
   );
+  if (
+    options.coordinationItemId &&
+    history.includes(
+      `Factory coordination inbox item ${options.coordinationItemId}`,
+    )
+  ) {
+    const hasToolResult = (name: string) =>
+      messages.some(
+        (entry) =>
+          entry !== null &&
+          typeof entry === "object" &&
+          "role" in entry &&
+          entry.role === "toolResult" &&
+          "toolName" in entry &&
+          entry.toolName === name,
+      );
+    if (hasToolResult("factory_board")) {
+      options.onCoordinationSettled?.();
+      return message(
+        [
+          {
+            type: "text",
+            text: "Owner decision required. The native worker question is in your Factory inbox.",
+          },
+        ],
+        "stop",
+      );
+    }
+    if (hasToolResult("factory_threads"))
+      return message(
+        [
+          {
+            type: "toolCall",
+            id: "call:escalate-worker-question",
+            name: "factory_board",
+            arguments: {
+              op: "decide",
+              itemId: options.coordinationItemId,
+              action: "escalate",
+              text: "Choose whether to preserve compatibility before the worker proceeds.",
+            },
+          },
+        ],
+        "toolUse",
+      );
+    return message(
+      [
+        {
+          type: "toolCall",
+          id: "call:inspect-worker-question",
+          name: "factory_threads",
+          arguments: {
+            op: "inspect",
+            target: {
+              kind: "coordination",
+              itemId: options.coordinationItemId,
+            },
+          },
+        },
+      ],
+      "toolUse",
+    );
+  }
   const ownerConversation = history.includes("OWNER-PRIVATE-COORDINATION");
   const workConversation = history.includes("BOUNDED-WORK-EFFECT");
   if (ownerConversation) {
-    if (history.includes("factory_get_receipt")) {
+    if (history.includes("call:private-receipt")) {
       return message(
         [{ type: "text", text: "Private coordination finished." }],
         "stop",
@@ -80,29 +145,37 @@ function scriptedResponse(
           {
             type: "toolCall",
             id: "call:private-receipt",
-            name: "factory_get_receipt",
-            arguments: { requestId: uncertainMutation.requestId },
+            name: "factory_threads",
+            arguments: {
+              op: "receipt",
+              kind: "work",
+              requestId: uncertainMutation.requestId,
+            },
           },
         ],
         "toolUse",
       );
     }
-    if (history.includes("factory_submit_input")) {
+    if (history.includes("call:private-submit")) {
       return message(
         [{ type: "text", text: "Private coordination finished." }],
         "stop",
       );
     }
-    if (history.includes("factory_list_projects")) {
+    if (history.includes("call:private-list-projects")) {
       return message(
         [
           {
             type: "toolCall",
             id: "call:private-submit",
-            name: "factory_submit_input",
+            name: "factory_threads",
             arguments: {
-              threadId:
-                options.factoryThreadId ?? "thread:private-assistant-proof",
+              op: "send",
+              target: {
+                kind: "work",
+                threadId:
+                  options.factoryThreadId ?? "thread:private-assistant-proof",
+              },
               text: options.factoryInputText ?? "BOUNDED-WORK-EFFECT",
             },
           },
@@ -115,8 +188,8 @@ function scriptedResponse(
         {
           type: "toolCall",
           id: "call:private-list-projects",
-          name: "factory_list_projects",
-          arguments: { limit: 20 },
+          name: "factory_board",
+          arguments: { op: "view", limit: 20 },
         },
       ],
       "toolUse",

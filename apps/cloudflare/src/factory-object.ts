@@ -143,6 +143,10 @@ export interface FactoryDurableObjectEnvironment {
     get(id: unknown): FactoryRpc;
   };
   MANAGED_WORK: ManagedWorkNamespace;
+  PRIVATE_ASSISTANT?: {
+    idFromName(name: string): unknown;
+    get(id: unknown): PrivateAssistantRpc;
+  };
   /** Operator-configured R2 bucket; absence disables remote snapshot publication. */
   CHECKPOINTS?: R2WorkspaceBucket;
 }
@@ -402,11 +406,15 @@ export class FactoryController {
     const checkpointRoute =
       request.method === "POST" &&
       /^\/v1\/threads\/[^/]+\/managed-work-checkpoints$/.test(pathname);
-    if (inputRoute) await this.#armQueueAlarm();
+    const coordinationRoute =
+      request.method === "POST" && pathname.startsWith("/v1/worker/");
+    if (inputRoute || coordinationRoute) await this.#armQueueAlarm();
     if (checkpointRoute && this.environment.CHECKPOINTS) {
       await this.#armCheckpointRecoveryAlarm();
     }
     const response = await this.#handle(request);
+    if (coordinationRoute && response.ok)
+      this.state.waitUntil(this.#dispatchQueued());
     if (checkpointRoute && response.status === 202) {
       await this.#armCheckpointRecoveryAlarm();
       this.state.waitUntil(this.#dispatchQueued());
@@ -502,6 +510,14 @@ export class FactoryController {
         // The next managed input is admitted only after this durable submission settles.
       }
       await this.#drainManagedWorkCheckpointAssemblies();
+      const assistants = this.environment.PRIVATE_ASSISTANT;
+      if (assistants)
+        await this.#factory.coordination.dispatchNotifications(
+          (inputId, text) =>
+            assistants
+              .get(assistants.idFromName(PRIVATE_ASSISTANT_DURABLE_OBJECT_NAME))
+              .submit(inputId, text),
+        );
     };
     this.#draining = drain()
       .catch(() => {})
@@ -509,6 +525,8 @@ export class FactoryController {
         this.#draining = undefined;
         if (this.#factory.listManagedWorkCheckpointAssemblies(1).length > 0) {
           await this.#armCheckpointRecoveryAlarm();
+        } else if (this.#factory.coordination.hasNotifications()) {
+          await this.#armQueueAlarm();
         } else {
           await this.state.storage.deleteAlarm();
         }

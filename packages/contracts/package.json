@@ -6,7 +6,12 @@
   "exports": {
     ".": "./src/index.ts",
     "./execution": "./src/execution.ts",
-    "./factory": "./src/factory.ts"
+    "./factory": "./src/factory.ts",
+    "./coordination": "./src/coordination.ts",
+    "./assignments": "./src/assignments.ts",
+    "./rex-tools": "./src/rex-tools.ts",
+    "./native-agents": "./src/native-agents.ts",
+    "./native-provisioning": "./src/native-provisioning.ts"
   },
   "dependencies": {
     "zod": "^3.25.76"

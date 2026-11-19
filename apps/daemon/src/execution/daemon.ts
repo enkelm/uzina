@@ -86,6 +86,10 @@ import { ControllerHttpError, ControllerProtocolError } from "./connector";
 import { ExecutionError } from "./errors";
 import { executionPayloadSha256 } from "./payload";
 import { RexProcessManager } from "./rex";
+import {
+  NativeAgentLauncher,
+  type NativeAgentConfiguration,
+} from "./native-agents";
 
 export interface WorkspaceMapping {
   workspaceId: string;
@@ -101,6 +105,9 @@ export interface ExecutionDaemonOptions {
   workspaces: readonly WorkspaceMapping[];
   daemonVersion?: string;
   rexExecutable?: string;
+  /** Required explicit local endpoint when native launch profiles are enabled. */
+  rexServer?: string;
+  nativeAgents?: NativeAgentConfiguration;
   snapshotCacheDirectory?: string;
 }
 
@@ -370,6 +377,7 @@ export class ExecutionDaemon {
   readonly #workspaces = new Map<string, string>();
   readonly #workspaceRelocationsInFlight = new Set<string>();
   readonly rex: RexProcessManager;
+  readonly nativeAgents: NativeAgentLauncher | undefined;
   #closed = false;
 
   constructor(options: ExecutionDaemonOptions) {
@@ -519,23 +527,6 @@ export class ExecutionDaemon {
       );
       CREATE INDEX IF NOT EXISTS execution_workspace_activation_pending
         ON execution_workspace_activation_receipts(status, reported_at, updated_at);
-      CREATE TABLE IF NOT EXISTS execution_rex_processes (
-        process_id TEXT PRIMARY KEY,
-        payload_sha256 TEXT NOT NULL,
-        node_id TEXT NOT NULL,
-        workspace_id TEXT NOT NULL,
-        ownership_generation INTEGER NOT NULL,
-        status TEXT NOT NULL,
-        launched_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        session_id TEXT,
-        block_id TEXT,
-        exit_code INTEGER,
-        error_code TEXT,
-        reconciliation_evidence TEXT
-      );
-      CREATE INDEX IF NOT EXISTS execution_rex_workspace_status
-        ON execution_rex_processes(workspace_id, status);
     `);
       const captureColumns = this.#db
         .query<{ name: string }, []>(
@@ -600,22 +591,34 @@ export class ExecutionDaemon {
           "UPDATE execution_jobs SET status = 'uncertain', finished_at = ?, error_code = 'interrupted_after_start' WHERE status = 'running'",
         )
         .run(new Date().toISOString());
-      this.#db
-        .query(
-          "UPDATE execution_rex_processes SET status = 'uncertain', updated_at = ?, error_code = 'interrupted_during_lifecycle' WHERE status IN ('starting', 'stopping')",
-        )
-        .run(new Date().toISOString());
-
       this.rex = new RexProcessManager({
         database: this.#db,
         nodeId: this.#nodeId,
         executable: options.rexExecutable ?? "rex",
+        server: options.rexServer,
         resolveWorkspace: (workspaceId) => this.#workspaceRoot(workspaceId),
         assertWorkspaceActive: (workspaceId, generation) =>
           this.#assertWorkspaceActive(workspaceId, generation),
         assertWorkspaceAdmission: (workspaceId) =>
           this.#assertWorkspaceAdmission(workspaceId),
       });
+      this.nativeAgents = options.nativeAgents
+        ? new NativeAgentLauncher({
+            database: this.#db,
+            processes: this.rex,
+            nodeId: this.#nodeId,
+            rexServer: options.rexServer ?? "",
+            rexExecutable: options.rexExecutable ?? "rex",
+            configuration: options.nativeAgents,
+            workspaceRoots: [...this.#workspaces.values()],
+            resolveWorkspace: (workspaceId) => this.#workspaceRoot(workspaceId),
+            assertWorkspaceAdmission: (workspaceId, generation) => {
+              this.#assertOpen();
+              this.#assertWorkspaceActive(workspaceId, generation);
+              this.#assertWorkspaceAdmission(workspaceId);
+            },
+          })
+        : undefined;
     } catch (error) {
       this.#db.close();
       this.#closed = true;
@@ -629,6 +632,9 @@ export class ExecutionDaemon {
 
   close(): void {
     if (this.#closed) return;
+    if (this.nativeAgents?.hasPendingOperations)
+      throw new ExecutionError("native_agent_operations_active");
+    void this.nativeAgents?.close();
     this.#db.close();
     this.#closed = true;
   }

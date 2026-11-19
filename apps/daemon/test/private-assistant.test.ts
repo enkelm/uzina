@@ -66,6 +66,100 @@ afterEach(async () => {
 });
 
 describe("owner-private Factory assistant production composition", () => {
+  test("wakes the real Pi Durable coordinator for a native worker question and delivers the owner's decision without a managed worker chat", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "uzina-worker-coordinator-"),
+    );
+    let settled!: () => void;
+    const modelObservedDecision = new Promise<void>((resolve) => {
+      settled = resolve;
+    });
+    const host = await createStandaloneFactoryServer({
+      databasePath: join(directory, "factory.sqlite"),
+      runtimeDirectory: join(directory, "runtime"),
+      ownerSignIn: true,
+      models: deterministicPrivateAssistantModels({
+        coordinationItemId: "question:coordinator",
+        onCoordinationSettled: settled,
+      }),
+      modelProvider: "uzina-test",
+      modelId: "fixed-model",
+      port: 0,
+    });
+    fixtures.push({ directory, close: () => host.close() });
+    const credential = (
+      await readFile(join(directory, "factory.sqlite.owner-token"), "utf8")
+    ).trim();
+    const owner = await host.factory.authenticate(credential);
+    host.factory.createProject(owner, "project:coordinator", "Coordinator");
+    await host.factory.provisionNode(
+      owner,
+      "node:coordinator",
+      "Coordinator node",
+    );
+    host.factory.createWorkspace(
+      owner,
+      "workspace:coordinator",
+      "node:coordinator",
+      "Coordinator workspace",
+    );
+    const workerCredential = "coordinator_worker_credential_0000000000000";
+    const client = new FactoryClient({ baseUrl: host.server.url, credential });
+    await client.registerNativeWorker({
+      workerId: "worker:coordinator",
+      projectId: "project:coordinator",
+      name: "Native Pi",
+      target: {
+        nodeId: "node:coordinator",
+        workspaceId: "workspace:coordinator",
+      },
+      ownershipGeneration: 0,
+      rex: { sessionId: "session:coordinator", blockId: "block:coordinator" },
+      credential: workerCredential,
+    });
+    const worker = new FactoryClient({
+      baseUrl: host.server.url,
+      credential: workerCredential,
+    });
+    const item = {
+      itemId: "question:coordinator",
+      kind: "question" as const,
+      title: "Compatibility decision",
+      text: "Should the native worker keep compatibility?",
+      blocking: true,
+    };
+    await worker.postWorkerItem(item);
+    await modelObservedDecision;
+    expect(await client.getCoordinationItem(item.itemId)).toMatchObject({
+      status: "needs_user",
+      escalation:
+        "Choose whether to preserve compatibility before the worker proceeds.",
+    });
+    await worker.postWorkerItem(item);
+    expect(
+      host.database.all<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM coordination_notifications",
+      )[0]!.count,
+    ).toBe(1);
+    expect(
+      host.database.all<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM threads",
+      )[0]!.count,
+    ).toBe(0);
+    await client.decideCoordinationItem(item.itemId, {
+      requestId: "answer:coordinator",
+      action: "answer",
+      text: "Keep compatibility.",
+    });
+    const mailbox = await worker.getWorkerMailbox();
+    expect(mailbox.messages).toMatchObject([
+      { text: "Keep compatibility.", acknowledgedAt: null },
+    ]);
+    await worker.acknowledgeWorkerMessage(mailbox.messages[0]!.messageId);
+    expect((await client.getCoordinationItem(item.itemId)).status).toBe(
+      "acknowledged",
+    );
+  });
   test("keeps baseline Factory work available while missing optional assistant identity is parked", async () => {
     const directory = await mkdtemp(
       join(tmpdir(), "uzina-private-assistant-unconfigured-"),

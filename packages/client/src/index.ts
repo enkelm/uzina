@@ -19,6 +19,26 @@ import {
   submitInputRequestSchema,
 } from "@uzina/contracts/factory";
 import { z } from "zod";
+import {
+  registerNativeWorkerSchema,
+  nativeWorkerSchema,
+  postCoordinationItemSchema,
+  coordinationItemSchema,
+  coordinationReceiptSchema,
+  decideCoordinationItemSchema,
+  sendWorkerMessageSchema,
+  workerMessageSchema,
+  workerListSchema,
+  coordinationListSchema,
+  workerMailboxSchema,
+  workerRuntimeSchema,
+} from "@uzina/contracts/coordination";
+
+import {
+  provisionNativeWorkerRequestSchema,
+  nativeProvisioningStatusSchema,
+  nativeProvisioningTargetsSchema,
+} from "@uzina/contracts/native-provisioning";
 
 const limitSchema = z.number().int().min(1).max(100);
 const cursorSchema = z.number().int().nonnegative().safe();
@@ -206,6 +226,165 @@ export class FactoryClient {
     return identity;
   }
 
+  listNativeWorkerTargets(projectId: string, options: RequestOptions = {}) {
+    return this.#get(
+      `/v1/native-worker-targets${query({ projectId })}`,
+      nativeProvisioningTargetsSchema,
+      options.signal,
+    );
+  }
+  provisionNativeWorker(
+    input: z.input<typeof provisionNativeWorkerRequestSchema>,
+    options: RequestOptions = {},
+  ) {
+    return this.#request(
+      "/v1/native-worker-provisionings",
+      "POST",
+      provisionNativeWorkerRequestSchema.parse(input),
+      nativeProvisioningStatusSchema,
+      options.signal,
+    );
+  }
+  getNativeWorkerProvisioning(requestId: string, options: RequestOptions = {}) {
+    return this.#get(
+      `/v1/native-worker-provisionings/${checkedIdentifier(requestId, "requestId")}`,
+      nativeProvisioningStatusSchema,
+      options.signal,
+    );
+  }
+  getWorkerRuntime(options: RequestOptions = {}) {
+    return this.#get("/v1/worker/runtime", workerRuntimeSchema, options.signal);
+  }
+  getWorkerStatus(options: RequestOptions = {}) {
+    return this.#get("/v1/worker/status", nativeWorkerSchema, options.signal);
+  }
+
+  async registerNativeWorker(
+    input: z.input<typeof registerNativeWorkerSchema>,
+    options: RequestOptions = {},
+  ) {
+    return this.#request(
+      "/v1/native-workers",
+      "POST",
+      registerNativeWorkerSchema.parse(input),
+      nativeWorkerSchema,
+      options.signal,
+    );
+  }
+  async revokeNativeWorker(workerId: string, options: RequestOptions = {}) {
+    return this.#request(
+      `/v1/native-workers/${checkedIdentifier(workerId, "workerId")}/revoke`,
+      "POST",
+      {},
+      z.object({ revoked: z.literal(true) }),
+      options.signal,
+    );
+  }
+
+  async getNativeWorker(workerId: string, options: RequestOptions = {}) {
+    return this.#get(
+      `/v1/native-workers/${checkedIdentifier(workerId, "workerId")}`,
+      nativeWorkerSchema,
+      options.signal,
+    );
+  }
+  async listNativeWorkers(
+    projectId: string,
+    options: RequestOptions & { limit?: number; offset?: number } = {},
+  ) {
+    checkedIdentifier(projectId, "projectId");
+    return this.#get(
+      `/v1/native-workers${query({ projectId, limit: limitSchema.parse(options.limit ?? 50), offset: cursorSchema.parse(options.offset ?? 0) })}`,
+      workerListSchema,
+      options.signal,
+    );
+  }
+  async listCoordinationItems(
+    projectId: string,
+    options: RequestOptions & { limit?: number; offset?: number } = {},
+  ) {
+    checkedIdentifier(projectId, "projectId");
+    return this.#get(
+      `/v1/coordination${query({ projectId, limit: limitSchema.parse(options.limit ?? 50), offset: cursorSchema.parse(options.offset ?? 0) })}`,
+      coordinationListSchema,
+      options.signal,
+    );
+  }
+  async getCoordinationItem(itemId: string, options: RequestOptions = {}) {
+    return this.#get(
+      `/v1/coordination/${checkedIdentifier(itemId, "itemId")}`,
+      coordinationItemSchema,
+      options.signal,
+    );
+  }
+  async decideCoordinationItem(
+    itemId: string,
+    input: z.input<typeof decideCoordinationItemSchema>,
+    options: RequestOptions = {},
+  ) {
+    return this.#request(
+      `/v1/coordination/${checkedIdentifier(itemId, "itemId")}/decisions`,
+      "POST",
+      decideCoordinationItemSchema.parse(input),
+      coordinationItemSchema,
+      options.signal,
+    );
+  }
+  async getCoordinationReceipt(
+    requestId: string,
+    options: RequestOptions = {},
+  ) {
+    return this.#get(
+      `/v1/coordination-commands/${checkedIdentifier(requestId, "requestId")}`,
+      coordinationReceiptSchema,
+      options.signal,
+    );
+  }
+  async messageNativeWorker(
+    workerId: string,
+    input: z.input<typeof sendWorkerMessageSchema>,
+    options: RequestOptions = {},
+  ) {
+    return this.#request(
+      `/v1/native-workers/${checkedIdentifier(workerId, "workerId")}/messages`,
+      "POST",
+      sendWorkerMessageSchema.parse(input),
+      workerMessageSchema,
+      options.signal,
+    );
+  }
+  async postWorkerItem(
+    input: z.input<typeof postCoordinationItemSchema>,
+    options: RequestOptions = {},
+  ) {
+    return this.#request(
+      "/v1/worker/items",
+      "POST",
+      postCoordinationItemSchema.parse(input),
+      coordinationItemSchema,
+      options.signal,
+    );
+  }
+  async getWorkerMailbox(options: RequestOptions & { limit?: number } = {}) {
+    return this.#get(
+      `/v1/worker/mailbox${query({ limit: limitSchema.parse(options.limit ?? 50) })}`,
+      workerMailboxSchema,
+      options.signal,
+    );
+  }
+  async acknowledgeWorkerMessage(
+    messageId: string,
+    options: RequestOptions = {},
+  ) {
+    checkedIdentifier(messageId, "messageId");
+    return this.#request(
+      "/v1/worker/acknowledgements",
+      "POST",
+      { messageId },
+      workerMessageSchema,
+      options.signal,
+    );
+  }
   async getPrivateAssistantStatus(options: RequestOptions = {}) {
     return this.#get(
       "/v1/private-assistant/status",
@@ -290,6 +469,13 @@ export class FactoryClient {
     );
   }
 
+  async getThread(threadId: string, options: RequestOptions = {}) {
+    return this.#get(
+      `/v1/threads/${checkedIdentifier(threadId, "threadId")}`,
+      factoryThreadSchema,
+      options.signal,
+    );
+  }
   async listThreads(
     options: RequestOptions & { projectId?: string; limit?: number } = {},
   ) {
@@ -404,7 +590,7 @@ export class FactoryClient {
 
   async #get<T>(
     path: string,
-    schema: z.ZodType<T>,
+    schema: z.ZodType<T, z.ZodTypeDef, unknown>,
     signal?: AbortSignal,
   ): Promise<T> {
     return this.#request(path, "GET", undefined, schema, signal);
@@ -414,7 +600,7 @@ export class FactoryClient {
     path: string,
     method: "GET" | "POST",
     body: unknown,
-    schema: z.ZodType<T>,
+    schema: z.ZodType<T, z.ZodTypeDef, unknown>,
     signal?: AbortSignal,
   ): Promise<T> {
     const url = new URL(path, this.#baseUrl);

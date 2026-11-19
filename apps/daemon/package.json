@@ -7,13 +7,12 @@
     "@earendil-works/chord": "1.5.2",
     "@earendil-works/pi-coding-agent": "1.5.2",
     "@earendil-works/pi-durable": "1.5.2",
+    "@modelcontextprotocol/sdk": "1.32.2",
     "@uzina/checkpoints": "workspace:*",
     "@uzina/client": "workspace:*",
     "@uzina/contracts": "workspace:*",
     "@uzina/core": "workspace:*",
-    "@uzina/pi-runtime": "workspace:*"
-  },
-  "devDependencies": {
-    "@modelcontextprotocol/sdk": "1.32.2"
+    "@uzina/pi-runtime": "workspace:*",
+    "zod": "^3.25.76"
   }
 }

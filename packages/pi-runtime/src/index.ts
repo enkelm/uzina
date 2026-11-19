@@ -241,6 +241,7 @@ export type {
   PrivateAssistantIdentityCheck,
   PrivateAssistantStore,
 } from "./private-assistant";
+export { createFactoryBotExtension } from "./factory-bot";
 export {
   createFactoryToolExtension,
   FACTORY_INPUT_REQUEST_MEMO,

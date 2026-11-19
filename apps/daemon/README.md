@@ -4,7 +4,7 @@ The daemon defaults to `UZINA_MODE=local`, which composes the standalone persist
 
 ## Standalone local Factory
 
-For separate environment files, the owner sign-in link, and node provisioning, follow [local setup](../../docs/local-setup.md). The repository-root `.env.example` configures the Factory; this directory's `.env.example` configures only an Execution node. They must not share credentials or the same listener port on one machine.
+For default startup, the owner sign-in link, optional overrides and additional nodes, follow [local setup](../../docs/local-setup.md). The repository-root `.env.example` configures the Factory; this directory's `.env.example` configures only an Execution node. They must not share credentials or the same listener port on one machine.
 
 Use Bun 1.4.4 and an existing Pi sign-in or provider environment credential, then run:
 
@@ -17,6 +17,12 @@ No Factory bootstrap secret or separate model key is required. The local host us
 `UZINA_FACTORY_DATABASE_PATH` defaults to `~/.local/share/uzina/factory.sqlite`; `UZINA_MANAGED_WORK_DIRECTORY` defaults to `~/.local/share/uzina/managed-work`. Both can be set to isolated paths for tests or an operator-selected data location. The service defaults to `http://127.0.0.1:8788`. Startup prints a private owner sign-in link for the default web UI port. Open it and confirm sign-in; browser sessions use HttpOnly cookies, not a pasted Factory secret. The protected `factory.sqlite.owner-token` file holds the local owner bearer; SQLite holds its hash. Existing owner identity and data are retained on restart. Legacy programmatic hosts can still opt into `bootstrapSecret` and `/v1/bootstrap`; the CLI no longer requires them.
 
 No paid/model request is made at startup. Missing usable credentials fail with a sign-in instruction; production never installs a dummy response model. Model credentials are not printed or placed in Factory events. The console's owner link is itself a credential and must remain private.
+
+## Local native-agent launch profiles
+
+A trusted programmatic composition can configure `ExecutionDaemon` with `rexServer`, an absolute `rexExecutable`, and `nativeAgents` profiles for Pi and Codex, then pass `executor.nativeAgents` as `createStandaloneFactoryServer({ nativeAgentLauncher })`. The host's `launchNativeAgent`/`inspectNativeAgent` methods are Owner-authorized; requests select a configured profile and workspace, never caller argv or credentials. The native CLI starts the shared Rex stdio MCP server through private per-launch configuration, with process receipts and observed MCP readiness kept separate. Build output includes `build/daemon/native-agent.js` for the private PTY bootstrap.
+
+Normal local startup owns a local executor, provisions/reuses its private node credential and cwd-bound workspace, and discovers installed Pi/Codex/Rex from the host PATH, excluding checkout-local executables. There is no native-worker opt-in variable or operator JSON. The existing execution loop registers and heartbeats that node. Project-authorized `factory_board` provisioning prepares a dedicated worker credential and both private `rex`/`factory` MCP connections; startup itself launches no worker. The raw Owner-only host launch method remains registration-free. New connected Pi workers also load the [safe delivery/lifecycle adapter](../../docs/native-pi-delivery.md); native admission/turn evidence is separately observed, not inferred from MCP readiness. Raw launches and Codex remain manual. Neither composition implements remote connected-executor provisioning claims. The CLI owns/drains its executor; programmatic callers supplying an executor must drain `executor.nativeAgents.close()` before `executor.close()`. See [connected worker defaults and recovery](../../docs/native-worker-provisioning.md) and [raw launch authority and installed Pi/Codex acceptance](../../docs/native-agent-launch.md).
 
 ## Owner-private Factory assistant
 

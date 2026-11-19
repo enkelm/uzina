@@ -17,7 +17,7 @@
     "build": "bun run build:daemon && bun run build:cloudflare && bun run build:web",
     "build:web": "bun run --cwd apps/web build",
     "dev:web": "bun run --cwd apps/web dev",
-    "build:daemon": "bun build apps/daemon/src/index.ts --target=bun --outdir=build/daemon",
+    "build:daemon": "bun build apps/daemon/src/index.ts apps/daemon/src/rex-tools.ts apps/daemon/src/native-agent.ts apps/daemon/src/factory-worker.ts apps/daemon/src/native-pi.ts --target=bun --outdir=build/daemon",
     "build:cloudflare": "bun apps/cloudflare/scripts/build-worker.ts && wrangler deploy --dry-run --config apps/cloudflare/wrangler.toml --outdir build/cloudflare",
     "dev:daemon": "bun --watch apps/daemon/src/index.ts",
     "dev:cloudflare": "wrangler dev --local --ip 127.0.0.1 --config apps/cloudflare/wrangler.toml"

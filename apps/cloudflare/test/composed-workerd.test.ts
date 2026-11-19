@@ -7,6 +7,7 @@ import { buildCloudflareWorkerArtifact } from "../scripts/build-worker";
 import { ExecutionDaemon } from "../../daemon/src/execution/daemon";
 import { HttpExecutionControllerConnector } from "../../daemon/src/execution/connector";
 import { ExecutionLoop } from "../../daemon/src/execution/loop";
+import { FactoryClient } from "@uzina/client";
 import {
   FACTORY_DURABLE_OBJECT_NAME,
   PRIVATE_ASSISTANT_DURABLE_OBJECT_NAME,
@@ -676,8 +677,53 @@ describe("production-shaped Cloudflare composition in Miniflare workerd", () => 
       const tools = JSON.stringify(body.tools);
       const input = JSON.stringify(body.input);
       let item: Record<string, unknown>;
-      if (tools.includes("factory_list_projects")) {
-        if (input.includes("factory_submit_input")) {
+      if (
+        input.includes(
+          "Factory coordination inbox item question:workerd-native",
+        )
+      ) {
+        if (input.includes("call_native_escalate")) {
+          item = {
+            id: "msg_native_final",
+            type: "message",
+            status: "completed",
+            role: "assistant",
+            content: [
+              {
+                type: "output_text",
+                annotations: [],
+                text: "Native worker escalated.",
+              },
+            ],
+          };
+        } else {
+          const inspected = input.includes("call_native_inspect");
+          item = {
+            id: inspected ? "fc_native_escalate" : "fc_native_inspect",
+            type: "function_call",
+            status: "completed",
+            call_id: inspected ? "call_native_escalate" : "call_native_inspect",
+            name: inspected ? "factory_board" : "factory_threads",
+            arguments: JSON.stringify(
+              inspected
+                ? {
+                    op: "decide",
+                    itemId: "question:workerd-native",
+                    action: "escalate",
+                    text: "Owner approval required.",
+                  }
+                : {
+                    op: "inspect",
+                    target: {
+                      kind: "coordination",
+                      itemId: "question:workerd-native",
+                    },
+                  },
+            ),
+          };
+        }
+      } else if (tools.includes("factory_board")) {
+        if (input.includes("call_private_submit")) {
           item = {
             id: "msg_private_assistant_final",
             type: "message",
@@ -691,15 +737,19 @@ describe("production-shaped Cloudflare composition in Miniflare workerd", () => 
               },
             ],
           };
-        } else if (input.includes("factory_list_projects")) {
+        } else if (input.includes("call_private_list")) {
           item = {
             id: "fc_private_submit",
             type: "function_call",
             status: "completed",
             call_id: "call_private_submit",
-            name: "factory_submit_input",
+            name: "factory_threads",
             arguments: JSON.stringify({
-              threadId: "thread:workerd-private-assistant",
+              op: "send",
+              target: {
+                kind: "work",
+                threadId: "thread:workerd-private-assistant",
+              },
               text: "BOUNDED-WORKER-EFFECT",
             }),
           };
@@ -709,8 +759,8 @@ describe("production-shaped Cloudflare composition in Miniflare workerd", () => 
             type: "function_call",
             status: "completed",
             call_id: "call_private_list",
-            name: "factory_list_projects",
-            arguments: JSON.stringify({ limit: 20 }),
+            name: "factory_board",
+            arguments: JSON.stringify({ op: "view", limit: 20 }),
           };
         }
       } else if (tools.includes("remote_write_file")) {
@@ -1002,7 +1052,7 @@ describe("production-shaped Cloudflare composition in Miniflare workerd", () => 
         ownerId: assistant.value.actor.ownerId,
       });
       const privateToolRequest = requestBodies.find((body) =>
-        JSON.stringify(body.tools).includes("factory_list_projects"),
+        JSON.stringify(body.tools).includes("factory_board"),
       );
       const workerToolRequest = requestBodies.find((body) =>
         JSON.stringify(body.tools).includes("remote_write_file"),
@@ -1014,11 +1064,78 @@ describe("production-shaped Cloudflare composition in Miniflare workerd", () => 
         "remote_run_command",
       );
       expect(JSON.stringify(workerToolRequest?.tools)).not.toContain(
-        "factory_list_projects",
+        "factory_board",
       );
       expect(JSON.stringify(requestBodies)).not.toContain(
         assistant.value.credential,
       );
+
+      const ownerClient = new FactoryClient({ baseUrl, credential: owner });
+      const nativeCredential = "workerd_native_credential_000000000000000000";
+      await ownerClient.registerNativeWorker({
+        workerId: "worker:workerd-native",
+        projectId: project.value.projectId,
+        name: "Native Rex worker",
+        target: {
+          nodeId: provisioned.value.node.nodeId,
+          workspaceId: workspace.value.workspaceId,
+        },
+        ownershipGeneration: 0,
+        rex: {
+          sessionId: "session:workerd-native",
+          blockId: "block:workerd-native",
+        },
+        credential: nativeCredential,
+      });
+      const nativeClient = new FactoryClient({
+        baseUrl,
+        credential: nativeCredential,
+      });
+      const nativeQuestion = {
+        itemId: "question:workerd-native",
+        kind: "question" as const,
+        title: "Approve compatibility change?",
+        text: "A native Rex worker needs owner approval.",
+        blocking: true,
+      };
+      await nativeClient.postWorkerItem(nativeQuestion);
+      await until(
+        async () =>
+          (await ownerClient.getCoordinationItem(nativeQuestion.itemId))
+            .status === "needs_user",
+      );
+      await until(async () =>
+        JSON.stringify(
+          (
+            await call(baseUrl, "/v1/private-assistant/context", {
+              credential: owner,
+            })
+          ).value,
+        ).includes("Native worker escalated."),
+      );
+      const factoryNamespace = (await miniflare.getDurableObjectNamespace(
+        "FACTORY",
+      )) as unknown as WorkerdNamespace;
+      await miniflare.unsafeEvictDurableObject("worker", "FactoryObject", {
+        id: factoryNamespace.idFromName(FACTORY_DURABLE_OBJECT_NAME).toString(),
+      });
+      await nativeClient.postWorkerItem(nativeQuestion);
+      await ownerClient.decideCoordinationItem(nativeQuestion.itemId, {
+        requestId: "answer:workerd-native",
+        action: "answer",
+        text: "Preserve compatibility.",
+      });
+      expect((await nativeClient.getWorkerMailbox()).messages).toMatchObject([
+        { messageId: "answer:workerd-native", text: "Preserve compatibility." },
+      ]);
+      await nativeClient.acknowledgeWorkerMessage("answer:workerd-native");
+      expect(
+        (await ownerClient.getCoordinationItem(nativeQuestion.itemId)).status,
+      ).toBe("acknowledged");
+      expect(
+        (await ownerClient.listThreads({ projectId: project.value.projectId }))
+          .threads,
+      ).toHaveLength(1);
 
       const privateNamespace = (await miniflare.getDurableObjectNamespace(
         "PRIVATE_ASSISTANT",

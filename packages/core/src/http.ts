@@ -1,5 +1,12 @@
 import { CONTRACT_VERSION } from "@uzina/contracts";
 import {
+  registerNativeWorkerSchema,
+  postCoordinationItemSchema,
+  decideCoordinationItemSchema,
+  sendWorkerMessageSchema,
+  acknowledgeWorkerMessageSchema,
+} from "@uzina/contracts/coordination";
+import {
   assertBrowserOrigin,
   browserAuth,
   requestCredential,
@@ -59,6 +66,13 @@ import {
   type WorkspaceSnapshotStorage,
 } from "./snapshot-storage";
 import type { ManagedWorkCheckpointPrivateStorage } from "./managed-work-checkpoint-verification";
+import {
+  provisionNativeWorkerRequestSchema,
+  type ProvisionNativeWorkerRequest,
+  type NativeProvisioningBinding,
+  type NativeProvisioningStatus,
+  type NativeProvisioningTargets,
+} from "@uzina/contracts/native-provisioning";
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -148,6 +162,35 @@ export interface ManagedWorkImportHost {
   ): Promise<void>;
 }
 
+import type { NativeActivityEvidence } from "@uzina/contracts/assignments";
+export interface NativeWorkerProvisioningJournal {
+  authorize(binding: NativeProvisioningBinding): void;
+  existing(): NativeProvisioningStatus | undefined;
+  admit(
+    binding: NativeProvisioningBinding,
+    credential: string,
+  ): Promise<NativeProvisioningStatus>;
+  assertAdmission(binding: NativeProvisioningBinding): void;
+  record(
+    evidence: Pick<NativeProvisioningStatus, "process" | "mcp" | "errorCode"> &
+      Partial<Pick<NativeProvisioningStatus, "nativeBinding">>,
+  ): NativeProvisioningStatus;
+}
+export interface NativeWorkerProvisioningHost {
+  observeActivity?(
+    status: NativeProvisioningStatus,
+  ): NativeActivityEvidence | null;
+  targets(projectId: string): NativeProvisioningTargets;
+  run(
+    request: ProvisionNativeWorkerRequest,
+    journal: NativeWorkerProvisioningJournal,
+  ): Promise<void>;
+  refresh(
+    status: NativeProvisioningStatus,
+    journal: NativeWorkerProvisioningJournal,
+  ): Promise<void>;
+}
+
 export interface PrivateAssistantQueries {
   context(): Promise<unknown>;
   status(): Promise<unknown>;
@@ -164,6 +207,7 @@ export function createFactoryHttpHandler(
     requestId: string,
   ) => Pick<ManagedWorkCheckpointPrivateStorage, "getBlobStream">,
   managedWorkImportHost?: ManagedWorkImportHost,
+  nativeWorkerProvisioningHost?: NativeWorkerProvisioningHost,
 ): (request: Request) => Promise<Response> {
   const mcp = createFactoryMcpHandler(factory, managedWork);
   return async (request) => {
@@ -171,7 +215,8 @@ export function createFactoryHttpHandler(
     if (request.method === "GET" && url.pathname === "/health") {
       return json({ contractVersion: CONTRACT_VERSION, status: "ok" });
     }
-    if (url.pathname === "/v1/mcp") return mcp(request);
+    if (url.pathname === "/v1/mcp" || url.pathname === "/v1/worker/mcp")
+      return mcp(request);
     try {
       const signIn = await browserAuth(factory, request);
       if (signIn) return signIn;
@@ -211,6 +256,51 @@ export function createFactoryHttpHandler(
           "unauthorized",
           "A valid active Bearer credential is required",
         );
+      if (url.pathname.startsWith("/v1/worker/")) {
+        const worker = await factory.coordination.authenticate(credential);
+        if (request.method === "GET" && url.pathname === "/v1/worker/runtime") {
+          const provisioning = factory.coordination.workerProvisioning(worker);
+          if (provisioning?.nativeBinding) {
+            let evidence: NativeActivityEvidence | null = null;
+            try {
+              evidence =
+                nativeWorkerProvisioningHost?.observeActivity?.(provisioning) ??
+                null;
+            } catch {
+              /* Unavailable evidence never becomes admission. */
+            }
+            await factory.coordination.recordNativeActivity(worker, evidence);
+          }
+          return json(factory.coordination.workerRuntime(worker));
+        }
+        if (request.method === "GET" && url.pathname === "/v1/worker/status")
+          return json(factory.coordination.workerStatus(worker));
+        if (request.method === "POST" && url.pathname === "/v1/worker/items")
+          return json(
+            factory.coordination.post(
+              worker,
+              await body(request, postCoordinationItemSchema),
+            ),
+            201,
+          );
+        if (request.method === "GET" && url.pathname === "/v1/worker/mailbox")
+          return json(
+            factory.coordination.mailbox(
+              worker,
+              numberParameter(url.searchParams.get("limit"), 50),
+            ),
+          );
+        if (
+          request.method === "POST" &&
+          url.pathname === "/v1/worker/acknowledgements"
+        ) {
+          const input = await body(request, acknowledgeWorkerMessageSchema);
+          return json(
+            factory.coordination.acknowledge(worker, input.messageId),
+          );
+        }
+        return json({ error: "not_found" }, 404);
+      }
       const session = await factory.authenticate(credential);
       const expectedSession = request.headers.get("x-uzina-session");
       if (
@@ -222,6 +312,172 @@ export function createFactoryHttpHandler(
       }
       const path = url.pathname;
 
+      const provisioningMatch = path.match(
+        /^\/v1\/native-worker-provisionings(?:\/([^/]+))?$/,
+      );
+      if (
+        (request.method === "POST" &&
+          path === "/v1/native-worker-provisionings") ||
+        (request.method === "GET" && provisioningMatch?.[1])
+      ) {
+        const input =
+          request.method === "POST"
+            ? await body(request, provisionNativeWorkerRequestSchema)
+            : undefined;
+        const requestId =
+          input?.requestId ?? decodeURIComponent(provisioningMatch![1]!);
+        const existing = () => {
+          try {
+            return factory.coordination.getProvisioning(session, requestId);
+          } catch (error) {
+            if (error instanceof FactoryError && error.status === 404)
+              return undefined;
+            throw error;
+          }
+        };
+        const journal: NativeWorkerProvisioningJournal = {
+          authorize: (binding) =>
+            factory.coordination.authorizeProvisioningBinding(
+              session,
+              binding,
+              requestId,
+            ),
+          existing,
+          admit: (binding, credential) =>
+            factory.coordination.admitProvisioning(
+              session,
+              input!,
+              binding,
+              credential,
+            ),
+          assertAdmission: (binding) =>
+            factory.coordination.assertProvisioningAdmission(
+              session,
+              requestId,
+              binding,
+            ),
+          record: (evidence) =>
+            factory.coordination.recordProvisioning(
+              session,
+              requestId,
+              evidence,
+            ),
+        };
+        if (input)
+          factory.coordination.authorizeProvisioningProject(
+            session,
+            input.projectId,
+          );
+        else if (!existing()) throw new FactoryError(404, "not_found");
+        if (!nativeWorkerProvisioningHost) {
+          if (!input) return json(existing());
+          throw new FactoryError(501, "native_provisioning_unavailable");
+        }
+        if (input) await nativeWorkerProvisioningHost.run(input, journal);
+        else await nativeWorkerProvisioningHost.refresh(existing()!, journal);
+        const retained = existing();
+        if (retained)
+          await factory.coordination.refreshWorkerActivity(
+            session,
+            retained.workerId,
+            (status) =>
+              nativeWorkerProvisioningHost.observeActivity?.(status) ?? null,
+          );
+        return json(existing(), input ? 202 : 200);
+      }
+      if (request.method === "GET" && path === "/v1/native-worker-targets") {
+        const projectId = url.searchParams.get("projectId") ?? "";
+        if (!projectId) throw new FactoryError(400, "project_id_required");
+        factory.coordination.authorizeProvisioningProject(session, projectId);
+        if (!nativeWorkerProvisioningHost)
+          throw new FactoryError(501, "native_provisioning_unavailable");
+        return json(nativeWorkerProvisioningHost.targets(projectId));
+      }
+
+      if (request.method === "POST" && path === "/v1/native-workers")
+        return json(
+          await factory.coordination.register(
+            session,
+            await body(request, registerNativeWorkerSchema),
+          ),
+          201,
+        );
+      if (
+        request.method === "GET" &&
+        (path === "/v1/native-workers" || path === "/v1/coordination")
+      ) {
+        const projectId = url.searchParams.get("projectId") ?? "";
+        if (!projectId) throw new FactoryError(400, "project_id_required");
+        const limit = numberParameter(url.searchParams.get("limit"), 50);
+        const offset = numberParameter(url.searchParams.get("offset"), 0);
+        return json(
+          path === "/v1/native-workers"
+            ? factory.coordination.listWorkers(
+                session,
+                projectId,
+                limit,
+                offset,
+              )
+            : factory.coordination.listItems(session, projectId, limit, offset),
+        );
+      }
+      const nativeWorkerMetadataMatch = path.match(
+        /^\/v1\/native-workers\/([^/]+)$/,
+      );
+      if (request.method === "GET" && nativeWorkerMetadataMatch) {
+        const workerId = decodeURIComponent(nativeWorkerMetadataMatch[1]!);
+        await factory.coordination.refreshWorkerActivity(
+          session,
+          workerId,
+          (status) =>
+            nativeWorkerProvisioningHost?.observeActivity?.(status) ?? null,
+        );
+        return json(factory.coordination.getWorker(session, workerId));
+      }
+      const workerMessageMatch = path.match(
+        /^\/v1\/native-workers\/([^/]+)\/(messages|revoke)$/,
+      );
+      if (request.method === "POST" && workerMessageMatch) {
+        const workerId = decodeURIComponent(workerMessageMatch[1]!);
+        if (workerMessageMatch[2] === "revoke") {
+          factory.coordination.revoke(session, workerId);
+          return json({ revoked: true });
+        }
+        return json(
+          factory.coordination.send(
+            session,
+            workerId,
+            await body(request, sendWorkerMessageSchema),
+          ),
+          202,
+        );
+      }
+      const coordinationReceipt = path.match(
+        /^\/v1\/coordination-commands\/([^/]+)$/,
+      );
+      if (request.method === "GET" && coordinationReceipt)
+        return json(
+          factory.coordination.getReceipt(
+            session,
+            decodeURIComponent(coordinationReceipt[1]!),
+          ),
+        );
+      const coordinationMatch = path.match(
+        /^\/v1\/coordination\/([^/]+)(\/decisions)?$/,
+      );
+      if (coordinationMatch) {
+        const itemId = decodeURIComponent(coordinationMatch[1]!);
+        if (request.method === "GET" && !coordinationMatch[2])
+          return json(factory.coordination.getItem(session, itemId));
+        if (request.method === "POST" && coordinationMatch[2])
+          return json(
+            factory.coordination.decide(
+              session,
+              itemId,
+              await body(request, decideCoordinationItemSchema),
+            ),
+          );
+      }
       if (request.method === "POST" && path === "/v1/managed-work-imports") {
         factory.authorizeManagedWorkImport(session);
         if (!managedWorkImportHost) {
@@ -409,6 +665,14 @@ export function createFactoryHttpHandler(
         const input = await body(request, createThreadRequestSchema);
         return json(factory.createThread(session, input), 201);
       }
+      const threadMetadataMatch = path.match(/^\/v1\/threads\/([^/]+)$/);
+      if (request.method === "GET" && threadMetadataMatch)
+        return json(
+          factory.getAuthorizedThread(
+            session,
+            decodeURIComponent(threadMetadataMatch[1]!),
+          ),
+        );
       const managedQueryMatch = path.match(
         /^\/v1\/threads\/([^/]+)\/(context|status)$/,
       );

@@ -116,6 +116,7 @@ import { MANAGED_WORK_RUNTIME_REQUIREMENTS } from "@uzina/checkpoints/managed-wo
 import type { FactoryDatabase } from "./database";
 import { initializeFactoryDatabase } from "./database";
 import { FactoryAccessPolicy, type StoredAccessPrincipal } from "./access";
+import { FactoryCoordination } from "./coordination";
 import { isVerifiedManagedWorkCheckpointClosure } from "./managed-work-checkpoint-verification";
 
 export class FactoryError extends Error {
@@ -709,10 +710,40 @@ export class FactoryService {
     this.database = database;
     this.#bootstrapSecret = bootstrapSecret;
     initializeFactoryDatabase(database);
+    this.coordination = new FactoryCoordination(database, {
+      authorize: (session, projectId, operation) => {
+        if (operation === "admin") this.#requireOwner(session);
+        const policy = this.#policy(session);
+        if (
+          projectId &&
+          (!policy.canReadProject(projectId) ||
+            !database.all(
+              "SELECT project_id FROM projects WHERE project_id = ?",
+              [projectId],
+            ).length)
+        )
+          throw notFound("Project");
+        if (
+          operation === "write" &&
+          !policy.isOwner &&
+          session.actor.kind !== "assistant"
+        )
+          throw forbidden();
+      },
+      assertTarget: ({ target, ownershipGeneration }) => {
+        this.#assertCurrentWorkspaceAssignment(
+          target.nodeId,
+          target.workspaceId,
+          ownershipGeneration,
+        );
+        this.#assertWorkspaceNotCapturing(target.workspaceId);
+      },
+    });
     this.#markInterruptedDispatchesUncertain();
   }
 
   readonly database: FactoryDatabase;
+  readonly coordination: FactoryCoordination;
 
   async bootstrap(secret: string, name: string): Promise<BootstrapResult> {
     if (
@@ -885,6 +916,94 @@ export class FactoryService {
         : undefined;
     if (grants) this.#validateAssistantGrantTargets(grants);
     return this.#insertCredential(session, actor, name, grants);
+  }
+
+  /** Idempotent trusted-host setup with a privately retained credential; not an HTTP operation. */
+  async ensureLocalExecutionTarget(
+    session: FactorySession,
+    input: {
+      nodeId: string;
+      workspaceId: string;
+      credential: string;
+      name: string;
+    },
+  ): Promise<void> {
+    this.#requireOwner(session);
+    const actor = actorIdentitySchema.parse({
+      contractVersion: CONTRACT_VERSION,
+      kind: "node",
+      nodeId: input.nodeId,
+    });
+    if (!/^[A-Za-z0-9_-]{32,256}$/.test(input.credential))
+      throw conflict("local_execution_binding_conflict");
+    const credential = {
+      credentialId: makeId("credential"),
+      credential: input.credential,
+      tokenHash: await sha256(input.credential),
+      actor,
+      name: "Local execution node",
+    };
+    this.database.transaction(() => {
+      this.#requireOwner(session);
+      const node = this.database.all(
+        "SELECT node_id FROM nodes WHERE node_id = ?",
+        [input.nodeId],
+      )[0];
+      const stored = this.database.all<CredentialRow>(
+        "SELECT credential_id, actor_json, revoked_at FROM credentials WHERE token_hash = ?",
+        [credential.tokenHash],
+      )[0];
+      if (node || stored) {
+        if (
+          !node ||
+          !stored ||
+          stored.revoked_at !== null ||
+          stored.actor_json !== encode(actor)
+        )
+          throw conflict("local_execution_binding_conflict");
+      } else {
+        this.database.exec(
+          "INSERT INTO nodes (node_id, name, availability, last_seen_at) VALUES (?, ?, 'offline', NULL)",
+          [input.nodeId, "Local execution node"],
+        );
+        this.#insertCredentialRows(credential, now());
+        this.#event(
+          "node.provisioned",
+          session.actor,
+          null,
+          null,
+          null,
+          {
+            nodeId: input.nodeId,
+            name: credential.name,
+            credentialId: credential.credentialId,
+          },
+          now(),
+        );
+      }
+      const workspace = this.database.all<{
+        node_id: string;
+        ownership_generation: number;
+      }>(
+        "SELECT node_id, ownership_generation FROM workspaces WHERE workspace_id = ?",
+        [input.workspaceId],
+      )[0];
+      if (workspace) {
+        // Startup is not permission to reclaim a transferred/fenced workspace.
+        if (
+          workspace.node_id !== input.nodeId ||
+          workspace.ownership_generation !== 0
+        )
+          throw conflict("local_execution_binding_conflict");
+      } else {
+        this.createWorkspace(
+          session,
+          input.workspaceId,
+          input.nodeId,
+          input.name,
+        );
+      }
+    });
   }
 
   async provisionNode(

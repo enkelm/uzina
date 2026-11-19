@@ -55,6 +55,7 @@ const hostname = Bun.env.HOST ?? "127.0.0.1";
 async function startLocalFactory(): Promise<void> {
   const { models, agent } = await createLocalRuntimeOptions();
   const server = await createStandaloneFactoryServer({
+    localExecution: { entryDirectory: import.meta.dir },
     databasePath: Bun.env.UZINA_FACTORY_DATABASE_PATH,
     runtimeDirectory: Bun.env.UZINA_MANAGED_WORK_DIRECTORY,
     managedWorkImportCatalogs: optionalPathMappings(
@@ -78,8 +79,13 @@ async function startLocalFactory(): Promise<void> {
     port,
     hostname,
   });
+  let closing: Promise<void> | undefined;
   const close = () => {
-    void server.close(false);
+    closing ??= server.close(false);
+    void closing.catch(() => {
+      console.error("Standalone Factory shutdown failed");
+      process.exitCode = 1;
+    });
   };
   process.once("SIGINT", close);
   process.once("SIGTERM", close);

@@ -1,0 +1,140 @@
+.factory-chat {
+  width: min(880px, calc(100vw - 32px));
+  height: min(820px, calc(100dvh - 48px));
+  padding: 24px;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  gap: 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--ui-foreground);
+  background: var(--surface);
+  overflow-wrap: anywhere;
+}
+.factory-chat-header,
+.factory-chat-state {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 16px;
+}
+.factory-chat-header > div {
+  min-width: 0;
+}
+.factory-chat-header h2 {
+  margin: 0 0 8px;
+  font-size: 24px;
+}
+.factory-chat-header p {
+  margin: 0;
+  max-width: 65ch;
+  color: var(--muted);
+  line-height: 1.5;
+}
+.factory-chat-header button,
+.factory-chat-state button {
+  flex-shrink: 0;
+}
+.factory-chat-state {
+  align-items: center;
+  border-block: 1px solid var(--line);
+  padding-block: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.factory-chat-conversation {
+  overflow-y: auto;
+  min-height: 0;
+  overscroll-behavior: contain;
+  padding: 0 8px;
+}
+.factory-chat-conversation:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+.factory-chat-empty {
+  max-width: 55ch;
+  padding: 32px 0;
+}
+.factory-chat-empty h3 {
+  font-size: 18px;
+  margin: 0 0 12px;
+}
+.factory-chat-empty p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.6;
+}
+.factory-chat-compose {
+  min-width: 0;
+  max-height: 55dvh;
+  overflow-y: auto;
+}
+.factory-chat .composer {
+  position: static;
+}
+.factory-chat .composer textarea {
+  min-height: 64px;
+  max-height: 20dvh;
+}
+.factory-chat .composer-footer {
+  gap: 12px;
+}
+.factory-chat .composer-footer button {
+  flex-shrink: 0;
+}
+.factory-chat .receipt {
+  max-width: none;
+  margin: 0 0 12px;
+}
+.factory-chat .receipt code {
+  overflow-wrap: anywhere;
+}
+.factory-chat-note {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--muted);
+  margin: 10px 0 0;
+}
+.factory-chat-trigger-short {
+  display: none;
+}
+.factory-chat-trigger {
+  white-space: nowrap;
+}
+@media (max-width: 600px) {
+  .factory-chat {
+    width: calc(100vw - 16px);
+    height: calc(100dvh - 16px);
+    padding: 16px;
+    gap: 12px;
+  }
+  .factory-chat-header h2 {
+    font-size: 21px;
+  }
+  .factory-chat-header {
+    gap: 8px;
+  }
+  .factory-chat .composer-footer > span {
+    max-width: 140px;
+  }
+  .factory-chat-trigger-full,
+  .topbar .brand > span:not(.brand-mark) {
+    display: none;
+  }
+  .factory-chat-trigger-short {
+    display: inline;
+  }
+  .top-right > .quiet {
+    padding-inline: 6px;
+  }
+  .top-right {
+    gap: 6px;
+  }
+  .factory-inbox-trigger {
+    max-width: 76px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+}

@@ -12,6 +12,9 @@ import { deterministicModels } from "../../../packages/pi-runtime/test-support/d
 import { verifyCatalogWithoutRuntime } from "./verify-catalog-browser";
 import { chooseSelect } from "./browser-controls";
 import { verifyUiSdk, sendWithUiSdk } from "./verify-ui-sdk";
+import { verifyCoordinationInbox } from "./verify-coordination-browser";
+import { verifyFactoryChat } from "./verify-factory-chat-browser";
+import { FactoryClient } from "@uzina/client";
 
 const output = resolve(".impeccable/review");
 const browserPath =
@@ -62,19 +65,17 @@ try {
   host = await createStandaloneFactoryServer({
     databasePath: join(directory, "factory.sqlite"),
     runtimeDirectory: join(directory, "managed-work"),
-    bootstrapSecret: "owned-browser-fixture-bootstrap",
+    ownerSignIn: true,
     models: models.models,
     modelProvider: "uzina-test",
     modelId: "fixed-model",
     port: 0,
     workspaceDirectories: { "workspace:browser": workspaceDirectory },
   });
-  const ownerCredential = (
-    await host.factory.bootstrap(
-      "owned-browser-fixture-bootstrap",
-      "Browser Owner",
-    )
-  ).credential;
+  const ownerCredential = new URL(
+    host.ownerSignInPath!,
+    host.server.url,
+  ).searchParams.get("token")!;
   const owner = await host.factory.authenticate(ownerCredential);
   const project = host.factory.createProject(
     owner,
@@ -380,6 +381,25 @@ try {
   }
 
   const uiSdk = await verifyUiSdk(page, output);
+  await verifyFactoryChat(
+    page,
+    output,
+    new FactoryClient({
+      baseUrl: host.server.url,
+      credential: ownerCredential,
+    }),
+    ownerCredential,
+    viewerCredential,
+  );
+  await verifyCoordinationInbox(
+    page,
+    output,
+    new FactoryClient({
+      baseUrl: host.server.url,
+      credential: ownerCredential,
+    }),
+    host.server.url,
+  );
 
   // Owner creates a real project and then a real Work item against the explicit existing target.
   await page

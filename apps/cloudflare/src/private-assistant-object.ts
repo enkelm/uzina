@@ -10,7 +10,7 @@ import {
   checkPrivateAssistantIdentity,
   PrivateAssistantError,
   PrivateAssistantRuntime,
-  createFactoryToolExtension,
+  createFactoryBotExtension,
   type PrivateAssistantAdmission,
   type PrivateAssistantIdentity,
   type PrivateAssistantStore,
@@ -335,7 +335,7 @@ export class PrivateAssistantObject
     const registry = createRegistry<ToolRegistration>();
     const factoryTools =
       client && environment.UZINA_PRIVATE_ASSISTANT_BEARER
-        ? createFactoryToolExtension(client, {
+        ? createFactoryBotExtension(client, {
             credentialToRedact: environment.UZINA_PRIVATE_ASSISTANT_BEARER,
           })
         : undefined;

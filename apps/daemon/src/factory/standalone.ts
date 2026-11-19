@@ -9,7 +9,7 @@ import {
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
-  createFactoryToolExtension,
+  createFactoryBotExtension,
   createManagedRemoteToolExecutor,
   checkPrivateAssistantIdentity,
   PrivateAssistantError,
@@ -32,12 +32,29 @@ import { openLocalManagedPiWork } from "../runtime/managed-work";
 import { assertLoopbackHostname } from "../loopback";
 import { BunPrivateAssistantStore } from "./private-assistant-store";
 import { createStandaloneManagedWorkImportHost } from "./managed-work-import";
+import type { NativeAgentLaunchInput } from "@uzina/contracts/native-agents";
+import type {
+  NativeAgentLauncher,
+  NativeAgentLaunchReceipt,
+} from "../execution/native-agents";
+
+import { NativeWorkerProvisioner } from "../execution/native-provisioning";
+import { openLocalNativeFactoryExecutor } from "../execution/local-native-factory";
 
 export interface StandaloneFactoryServer {
   server: ReturnType<typeof Bun.serve>;
   factory: FactoryService;
   database: BunFactoryDatabase;
   ownerSignInPath?: string;
+  launchNativeAgent(input: {
+    credential: string;
+    request: NativeAgentLaunchInput;
+    waitMs?: number;
+  }): Promise<NativeAgentLaunchReceipt>;
+  inspectNativeAgent(input: {
+    credential: string;
+    request: NativeAgentLaunchInput;
+  }): Promise<NativeAgentLaunchReceipt>;
   captureManagedWorkCheckpoint(input: {
     credential: string;
     threadId: string;
@@ -58,8 +75,17 @@ export type StandaloneFactoryOptions = {
   modelId: string;
   port?: number;
   hostname?: string;
+  /** CLI composition: automatically owns local setup and executor lifetime. No environment opt-in. */
+  localExecution?: { entryDirectory: string; directory?: string };
   /** Trusted local mappings; capture refuses ambiguous physical workspace aliases. */
   workspaceDirectories?: Readonly<Record<string, string>>;
+  /** Trusted local executor's launcher. Caller owns its lifetime; no remote/control route is added. */
+  nativeAgentLauncher?: NativeAgentLauncher;
+  /** Operator-configured local provisioning policies. Uses this Factory's actual loopback origin. */
+  nativeWorkerProvisioning?: Omit<
+    ConstructorParameters<typeof NativeWorkerProvisioner>[0],
+    "factoryBaseUrl" | "factoryScopeId"
+  >;
   /** Operator-configured offline content-addressed catalog IDs; never request paths. */
   managedWorkImportCatalogs?: Readonly<Record<string, string>>;
   /** Operator-configured inactive destination IDs; never request paths. */
@@ -142,9 +168,22 @@ export async function createStandaloneFactoryServer(
   const snapshotStorageDirectory = resolve(
     options.snapshotStorageDirectory ?? `${databasePath}.workspace-checkpoints`,
   );
-  const canonicalWorkspaces = Object.values(
-    options.workspaceDirectories ?? {},
-  ).map((mappedDirectory) => realpathSync(mappedDirectory));
+  if (
+    options.localExecution &&
+    (options.nativeAgentLauncher ||
+      options.nativeWorkerProvisioning ||
+      options.workspaceDirectories)
+  )
+    throw new Error(
+      "Automatic local execution cannot adopt an externally supplied executor or mappings",
+    );
+  let workspaceDirectories = options.workspaceDirectories;
+  const canonicalWorkspaces = [
+    ...Object.values(workspaceDirectories ?? {}),
+    ...(options.localExecution
+      ? [options.localExecution.directory ?? process.cwd()]
+      : []),
+  ].map((mappedDirectory) => realpathSync(mappedDirectory));
   if (
     canonicalWorkspaces.some((workspace) =>
       workspaceRootsOverlap(snapshotStorageDirectory, workspace),
@@ -194,7 +233,10 @@ export async function createStandaloneFactoryServer(
     runtimeDirectory,
     privateAssistantPath,
     snapshotStorageDirectory,
-    ...Object.values(options.workspaceDirectories ?? {}),
+    ...(options.nativeAgentLauncher?.protectedRoots ?? []),
+    ...(options.nativeWorkerProvisioning?.launcher.protectedRoots ?? []),
+    ...canonicalWorkspaces,
+    ...(options.localExecution ? [`${databasePath}.local-execution`] : []),
   ];
   const projectedLocalPaths = await Promise.all(
     configuredLocalPaths.map((path) => projectedPhysicalPath(path)),
@@ -327,6 +369,18 @@ export async function createStandaloneFactoryServer(
   let dispatching: Promise<void> | undefined;
   let drainRequested = false;
   let activeCaptures = 0;
+  const nativeOperations = new Set<Promise<unknown>>();
+  const nativeOperation = <T>(operation: () => Promise<T>): Promise<T> => {
+    if (closing)
+      return Promise.reject(new Error("Standalone Factory is closing"));
+    const pending = operation();
+    nativeOperations.add(pending);
+    void pending.then(
+      () => nativeOperations.delete(pending),
+      () => nativeOperations.delete(pending),
+    );
+    return pending;
+  };
   let closing = false;
   let closePromise: Promise<void> | undefined;
   const captureWaiters: Array<() => void> = [];
@@ -427,7 +481,7 @@ export async function createStandaloneFactoryServer(
       const registry = createRegistry<ToolRegistration>();
       const factoryTools =
         client && config?.bearer
-          ? createFactoryToolExtension(client, {
+          ? createFactoryBotExtension(client, {
               credentialToRedact: config.bearer,
             })
           : undefined;
@@ -477,6 +531,61 @@ export async function createStandaloneFactoryServer(
     }
   };
 
+  let coordinationDelivery: Promise<void> | undefined;
+  let coordinationRetry: ReturnType<typeof setTimeout> | undefined;
+  const deliverCoordination = () => {
+    if (
+      closing ||
+      coordinationDelivery ||
+      !factory.coordination.hasNotifications()
+    )
+      return;
+    if (coordinationRetry) clearTimeout(coordinationRetry);
+    coordinationRetry = undefined;
+    coordinationDelivery = factory.coordination
+      .dispatchNotifications(async (inputId, text) =>
+        (await openPrivateAssistant()).submit(inputId, text),
+      )
+      .catch(() => {
+        /* The persisted notification retains its original input identity. */
+      })
+      .finally(() => {
+        coordinationDelivery = undefined;
+        if (!closing && factory.coordination.hasNotifications())
+          coordinationRetry = setTimeout(deliverCoordination, 30_000);
+      });
+  };
+
+  let nativeProvisioner: NativeWorkerProvisioner | undefined;
+  let localExecutor:
+    | Awaited<ReturnType<typeof openLocalNativeFactoryExecutor>>
+    | undefined;
+  try {
+    if (options.localExecution) {
+      if (!ownerCredential)
+        throw new Error(
+          "Automatic local execution requires local Owner sign-in",
+        );
+      localExecutor = await openLocalNativeFactoryExecutor({
+        factory,
+        ownerCredential,
+        databasePath,
+        directory: options.localExecution.directory ?? process.cwd(),
+        entryDirectory: options.localExecution.entryDirectory,
+      });
+      workspaceDirectories = localExecutor.workspaceDirectories;
+    }
+    if (options.nativeWorkerProvisioning)
+      nativeProvisioner = new NativeWorkerProvisioner({
+        ...options.nativeWorkerProvisioning,
+        factoryBaseUrl: () => server.url.origin,
+        factoryScopeId: factory.coordination.provisioningScopeId,
+      });
+  } catch (error) {
+    await managedWorkImportHost?.close();
+    database.close();
+    throw error;
+  }
   const handler = createFactoryHttpHandler(
     factory,
     {
@@ -518,6 +627,7 @@ export async function createStandaloneFactoryServer(
     snapshotStorage,
     undefined,
     managedWorkImportHost,
+    nativeProvisioner ?? localExecutor?.host,
   );
 
   const dispatch = async (input: FactoryQueueJob) => {
@@ -590,6 +700,12 @@ export async function createStandaloneFactoryServer(
         if (
           response.ok &&
           request.method === "POST" &&
+          path.startsWith("/v1/worker/")
+        )
+          deliverCoordination();
+        if (
+          response.ok &&
+          request.method === "POST" &&
           /^\/v1\/nodes\/[^/]+\/(?:register|heartbeat)$/.test(path)
         ) {
           startDrain();
@@ -607,18 +723,26 @@ export async function createStandaloneFactoryServer(
         return response;
       },
     });
+    localExecutor?.start(server.url.origin);
   } catch (error) {
+    server?.stop(true);
+    await localExecutor?.close();
+    await nativeProvisioner?.close();
     await managedWorkImportHost?.close();
     database.close();
     throw error;
   }
 
+  const nativeAgentLauncher =
+    options.nativeAgentLauncher ?? localExecutor?.executor.nativeAgents;
   startDrain();
   try {
     await openPrivateAssistant();
   } catch {
     console.error("Private Factory assistant is parked and unavailable");
   }
+
+  deliverCoordination();
 
   return {
     server,
@@ -629,6 +753,45 @@ export async function createStandaloneFactoryServer(
           ownerSignInPath: `/login?token=${encodeURIComponent(ownerCredential)}`,
         }
       : {}),
+    launchNativeAgent({ credential, request, waitMs }) {
+      return nativeOperation(async () => {
+        const session = await factory.authenticate(credential);
+        const authorized = factory.coordination.authorizeNativeLaunch(
+          session,
+          request,
+          "launch",
+        );
+        if (!nativeAgentLauncher)
+          throw new Error(
+            "Native agent launch capability is unavailable on this host",
+          );
+        return nativeAgentLauncher.launch(authorized, waitMs, () => {
+          factory.coordination.authorizeNativeLaunch(
+            session,
+            authorized,
+            "launch",
+          );
+        });
+      });
+    },
+    inspectNativeAgent({ credential, request }) {
+      return nativeOperation(async () => {
+        const session = await factory.authenticate(credential);
+        const authorized = factory.coordination.authorizeNativeLaunch(
+          session,
+          request,
+          "inspect",
+        );
+        if (!nativeAgentLauncher)
+          throw new Error(
+            "Native agent launch capability is unavailable on this host",
+          );
+        const result = await nativeAgentLauncher.inspect(authorized.requestId);
+        if (JSON.stringify(result.request) !== JSON.stringify(authorized))
+          throw new Error("Native agent launch binding conflict");
+        return result;
+      });
+    },
     async captureManagedWorkCheckpoint({ credential, threadId, transport }) {
       if (closing) throw new Error("Standalone Factory is closing");
       activeCaptures += 1;
@@ -642,7 +805,7 @@ export async function createStandaloneFactoryServer(
         let releaseWorkspace: (() => void | Promise<void>) | undefined;
         try {
           const workspacePath =
-            options.workspaceDirectories?.[thread.target.workspaceId];
+            workspaceDirectories?.[thread.target.workspaceId];
           if (!workspacePath) {
             throw new Error(
               `No trusted local directory is configured for workspace ${thread.target.workspaceId}`,
@@ -650,7 +813,7 @@ export async function createStandaloneFactoryServer(
           }
           const physicalWorkspace = await realpath(workspacePath);
           for (const [workspaceId, mappedPath] of Object.entries(
-            options.workspaceDirectories ?? {},
+            workspaceDirectories ?? {},
           )) {
             if (workspaceId !== thread.target.workspaceId) {
               const mappedWorkspace = await realpath(mappedPath);
@@ -727,6 +890,11 @@ export async function createStandaloneFactoryServer(
       closing = true;
       closePromise = (async () => {
         server.stop(force);
+        if (coordinationRetry) clearTimeout(coordinationRetry);
+        await coordinationDelivery;
+        await Promise.allSettled(nativeOperations);
+        await nativeProvisioner?.close();
+        await localExecutor?.close();
         let importCloseError: unknown;
         try {
           await managedWorkImportHost?.close();
